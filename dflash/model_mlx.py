@@ -45,6 +45,108 @@ class DFlashConfig:
     sliding_window_size: Optional[int] = None
 
 
+def _resolve_local_or_hub_path(model_id_or_path: str, allow_patterns: Optional[List[str]] = None) -> Path:
+    path = Path(model_id_or_path).expanduser()
+    if path.exists():
+        return path
+    return Path(snapshot_download(model_id_or_path, allow_patterns=allow_patterns))
+
+
+def _infer_model_head_dim(model: Any) -> int:
+    candidates = [
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        args = getattr(candidate, "args", None)
+        if args is None:
+            continue
+        head_dim = getattr(args, "head_dim", None)
+        if isinstance(head_dim, int) and head_dim > 0:
+            return head_dim
+        hidden_size = getattr(args, "hidden_size", None)
+        num_attention_heads = getattr(args, "num_attention_heads", None)
+        if (
+            isinstance(hidden_size, int)
+            and isinstance(num_attention_heads, int)
+            and num_attention_heads > 0
+        ):
+            return hidden_size // num_attention_heads
+
+    for layer in _get_layers(model):
+        self_attn = getattr(layer, "self_attn", None)
+        head_dim = getattr(self_attn, "head_dim", None)
+        if isinstance(head_dim, int) and head_dim > 0:
+            return head_dim
+
+    raise ValueError(f"Could not infer attention head_dim for {type(model).__name__}")
+
+
+def _make_target_cache(
+    model: Any,
+    turboquant_bits: Optional[float] = None,
+):
+    cache = make_prompt_cache(model)
+    if turboquant_bits is None:
+        return cache
+
+    try:
+        from mlx_turboquant.cache import TurboQuantKVCache as _TurboQuantKVCache
+    except ImportError as exc:
+        raise RuntimeError(
+            "TurboQuant cache requested, but mlx-turboquant is not installed in the current environment."
+        ) from exc
+
+    class StableTurboQuantKVCache:
+        def __init__(self, **kwargs):
+            self._inner = _TurboQuantKVCache(**kwargs)
+
+        def update_and_fetch(self, keys, values):
+            deq_keys, deq_values = self._inner.update_and_fetch(keys, values)
+            return deq_keys.astype(keys.dtype), deq_values.astype(values.dtype)
+
+        @property
+        def state(self):
+            return self._inner.state
+
+        @state.setter
+        def state(self, value):
+            self._inner.state = value
+
+        @property
+        def meta_state(self):
+            return self._inner.meta_state
+
+        @meta_state.setter
+        def meta_state(self, value):
+            self._inner.meta_state = value
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    head_dim = _infer_model_head_dim(model)
+    replaced = 0
+    for idx, cache_entry in enumerate(cache):
+        if isinstance(cache_entry, KVCache):
+            cache[idx] = StableTurboQuantKVCache(
+                bits=float(turboquant_bits),
+                head_dim=head_dim,
+                key_seed=42 + idx * 2,
+                value_seed=43 + idx * 2,
+            )
+            replaced += 1
+
+    if replaced == 0:
+        raise RuntimeError(
+            "TurboQuant cache requested, but no compatible KVCache layers were found in the target model."
+        )
+
+    return cache
+
+
 def _build_rope(
     head_dim: int,
     rope_theta: float,
@@ -167,7 +269,7 @@ def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFla
         raise ValueError(
             f"sliding_window_size must be positive or None, got {sliding_window_size}"
         )
-    path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
+    path = _resolve_local_or_hub_path(draft_id, allow_patterns=["*.safetensors", "*.json"])
     cfg = json.loads((path / "config.json").read_text())
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"],
@@ -354,6 +456,7 @@ def _make_response(text, tokens, accepted, prompt_size, prompt_tps, n, tic, fini
 def stream_generate(
     model, draft, tokenizer, prompt,
     block_size=None, max_tokens=256, temperature=0.0, sampler=None,
+    target_turboquant_bits: Optional[float] = None,
 ):
     _patch_model(model, draft.config.target_layer_ids)
     block_size = block_size if block_size is not None else int(draft.config.block_size)
@@ -372,7 +475,7 @@ def stream_generate(
     mask_id = int(draft.config.mask_token_id)
     tokens = prompt.tolist()
 
-    target_cache = make_prompt_cache(model)
+    target_cache = _make_target_cache(model, turboquant_bits=target_turboquant_bits)
     draft_cache = make_prompt_cache(draft)
     draft.bind(model)
     _target_can_trim = can_trim_prompt_cache(target_cache)

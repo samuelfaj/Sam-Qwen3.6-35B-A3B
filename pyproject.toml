@@ -35,4 +35,5 @@ vllm = [
 mlx = [
     "mlx",
     "mlx-lm>=0.31.2",
+    "mlx-turboquant @ git+https://github.com/rachittshah/mlx-turboquant.git",
 ]

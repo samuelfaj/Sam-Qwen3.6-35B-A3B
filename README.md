@@ -1,167 +1,332 @@
-# DFlash: Block Diffusion for Flash Speculative Decoding
-[**Paper**](https://arxiv.org/abs/2602.06036) | [**Blog**](https://z-lab.ai/projects/dflash/) | [**Models**](https://huggingface.co/collections/z-lab/dflash)
+# Sam Qwen3.6-35B-A3B
 
-**DFlash** is a lightweight **block diffusion** model designed for speculative decoding. It enables efficient and high-quality parallel drafting.
+This repository is a practical local-serving fork of `z-lab/dflash`, tuned for an Apple Silicon workflow around:
 
-![DFlash Architecture](https://raw.githubusercontent.com/jianc99/jianc99.github.io/master/images/dflash_system.png)
+- Target model: `mlx-community/Qwen3.6-35B-A3B-4bit`
+- Draft model: `z-lab/Qwen3.6-35B-A3B-DFlash`
+- Backend: `MLX`
+- Primary use case: local agentic coding assistants such as Codex and OpenCode
 
-https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
+The goal of this fork is not to be a generic serving stack. It is a stable local setup for running the 35B 4-bit target with DFlash enabled, exposing a local API that feels close to hosted coding models while avoiding unnecessary always-on memory usage.
 
-## Supported Models
+## What Was Added In This Fork
 
-| Model | DFlash Draft |
-|---|---|
-| Qwen3.6-35B-A3B (Preview) | [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) |
-| Kimi-K2.5 | [z-lab/Kimi-K2.5-DFlash](https://huggingface.co/z-lab/Kimi-K2.5-DFlash) |
-| Qwen3.5-4B | [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) |
-| Qwen3.5-9B | [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) |
-| Qwen3.5-27B | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) |
-| Qwen3.5-35B-A3B | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) |
-| Qwen3-Coder-Next | [z-lab/Qwen3-Coder-Next-DFlash](https://huggingface.co/z-lab/Qwen3-Coder-Next-DFlash) |
-| Qwen3-Coder-30B-A3B | [z-lab/Qwen3-Coder-30B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3-Coder-30B-A3B-DFlash) |
-| gpt-oss-20b | [z-lab/gpt-oss-20b-DFlash](https://huggingface.co/z-lab/gpt-oss-20b-DFlash) |
-| gpt-oss-120b | [z-lab/gpt-oss-120b-DFlash](https://huggingface.co/z-lab/gpt-oss-120b-DFlash) |
-| Qwen3-4B (non-thinking) | [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) |
-| Qwen3-8B (non-thinking) | [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) |
-| Llama-3.1-8B-Instruct | [z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat](https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat) |
-| Qwen3.5-122B-A10B | Coming soon |
-| Qwen3.5-397B-A17B | Coming soon |
-| GLM-5.1 | Coming soon |
+Compared with upstream `dflash`, this repo now includes:
 
-> Feel free to open a GitHub issue to request support for additional models. We will also open-source the training recipe soon, so you can train your own DFlash draft model to accelerate any LLM.
+- A local MLX API wrapper exposing:
+  - `POST /v1/responses`
+  - `POST /v1/chat/completions`
+  - `POST /v1/messages`
+  - `POST /v1/messages/count_tokens`
+  - `GET /v1/models`
+  - `GET /health`
+- Compatibility wrappers for:
+  - Codex via `scripts/run_codex_local.sh`
+  - OpenCode via `scripts/run_opencode_local.sh`
+- A dedicated local launch script:
+  - `scripts/start_local_wrapper.sh`
+- A direct local test script:
+  - `scripts/test_qwen36_dflash_mlx.py`
+- TurboQuant support for the target-model KV cache in `dflash/model_mlx.py`
+- Support for loading models from either a local directory or Hugging Face repo ID
+- Streaming improvements so clients receive output earlier instead of waiting for the full generation
+- SSE heartbeat comments during long prefills or reasoning pauses so agent clients appear alive while the model is still working
+- Hardened tool-call parsing for multiple formats used by agent frameworks
+- Lazy loading and automatic unload controls so the model does not stay resident in memory when idle
 
-## 📦 Installation
+## Current Tuned Profile
 
-Use a separate virtual environment for each to avoid conflict.
+The current default profile is optimized for local agentic use, not for benchmarking maximum context length at any cost.
 
-| Backend | Install command |
-|---|---|
-| **Transformers** | `uv pip install -e ".[transformers]"` |
-| **SGLang** | `uv pip install -e ".[sglang]"` |
-| **vLLM** | See below |
-| **MLX** (Apple Silicon) | `pip install -e ".[mlx]"` |
+- Base model: `mlx-community/Qwen3.6-35B-A3B-4bit`
+- Draft model: `z-lab/Qwen3.6-35B-A3B-DFlash`
+- DFlash speculative decoding: `ON`
+- Speculative block size: `15`
+- Context window: `65536`
+- Output limit: `8192`
+- Draft sliding window: `4096`
+- Qwen thinking mode: `disabled` by default for faster, cleaner agent behavior
+- TurboQuant target KV cache: `4-bit`
+- Keep-alive: `0`
+- Preload at startup: `disabled`
+- Heartbeat interval while streaming: `2s`
 
-**vLLM:** DFlash support requires the nightly build:
+This profile was chosen because it is materially more stable for real local coding-agent use than trying to force a much larger context window such as `256k` on this setup.
+
+## Why This Setup Exists
+
+The main requirements behind this fork were:
+
+- Keep DFlash enabled
+- Run the 35B target in 4-bit mode
+- Preserve strong local quality for coding-agent tasks
+- Make Codex and OpenCode work against the local model with minimal friction
+- Avoid keeping 100+ GB allocated when the model is idle
+- Keep the system agentic: tool calls, long-running turns, streaming, and visible progress
+
+That is why the wrapper is designed to behave more like a serving product and less like a one-off test script.
+
+## Repository Layout
+
+- `dflash/model_mlx.py`
+  - MLX DFlash generation path
+  - local-path-or-Hub loading
+  - TurboQuant KV cache integration for the target model
+- `scripts/local_api_server.py`
+  - local OpenAI/Anthropic-compatible API wrapper
+  - streaming, heartbeats, tool parsing, lazy load/unload
+- `scripts/start_local_wrapper.sh`
+  - convenient launcher with the tuned default profile
+- `scripts/run_codex_local.sh`
+  - writes a local Codex config and points Codex at this server
+- `scripts/run_opencode_local.sh`
+  - runs OpenCode against this local model
+- `scripts/test_qwen36_dflash_mlx.py`
+  - minimal direct MLX test path without the HTTP wrapper
+
+## Installation
+
+Use a fresh virtual environment.
+
 ```bash
-uv pip install -e ".[vllm]"
-uv pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly
+git clone git@github.com:samuelfaj/Sam-Qwen3.6-35B-A3B.git
+cd Sam-Qwen3.6-35B-A3B
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e ".[mlx]"
 ```
 
-## 🚀 Quick Start
+The MLX extra in this fork also installs `mlx-turboquant`.
 
-### vLLM
+## Download The Models
+
+Example using local directories:
 
 ```bash
-vllm serve Qwen/Qwen3.5-27B \
-  --speculative-config '{"method": "dflash", "model": "z-lab/Qwen3.5-27B-DFlash", "num_speculative_tokens": 15}' \
-  --attention-backend flash_attn \
-  --max-num-batched-tokens 32768
+huggingface-cli download mlx-community/Qwen3.6-35B-A3B-4bit \
+  --local-dir ~/models/Qwen3.6-35B-A3B-4bit
+
+huggingface-cli download z-lab/Qwen3.6-35B-A3B-DFlash \
+  --local-dir ~/models/Qwen3.6-35B-A3B-DFlash
 ```
 
-### SGLang
+The launcher scripts default to the following paths:
+
+- Base model: `/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit`
+- Draft model: `/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-DFlash`
+
+Override them with environment variables if your paths differ:
 
 ```bash
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-
-# Optional: enable schedule overlapping (experimental, may not be stable)
-# export SGLANG_ENABLE_SPEC_V2=1
-# export SGLANG_ENABLE_DFLASH_SPEC_V2=1
-# export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-
-python -m sglang.launch_server \
-    --model-path Qwen/Qwen3.5-35B-A3B \
-    --speculative-algorithm DFLASH \
-    --speculative-draft-model-path z-lab/Qwen3.5-35B-A3B-DFlash \
-    --speculative-num-draft-tokens 16 \
-    --tp-size 1 \
-    --attention-backend trtllm_mha \
-    --speculative-draft-attention-backend fa4 \
-    --mem-fraction-static 0.75 \
-    --mamba-scheduler-strategy extra_buffer \
-    --trust-remote-code
+export LOCAL_DFLASH_MODEL_PATH=~/models/Qwen3.6-35B-A3B-4bit
+export LOCAL_DFLASH_DRAFT_PATH=~/models/Qwen3.6-35B-A3B-DFlash
 ```
 
-### Transformers
+## Quick Local MLX Test
 
-Only Qwen3 and LLaMA-3.1 models support the Transformers backend.
+This bypasses the HTTP server and tests direct MLX generation:
 
-```python
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-
-draft = AutoModel.from_pretrained("z-lab/Qwen3-8B-DFlash-b16", trust_remote_code=True, dtype="auto", device_map="cuda:0").eval()
-target = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype="auto", device_map="cuda:0").eval()
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-
-messages = [{"role": "user", "content": "How many positive whole-number divisors does 196 have?"}]
-input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True, enable_thinking=False).to(draft.device)
-
-output = draft.spec_generate(input_ids=input_ids, max_new_tokens=2048, temperature=0.0, target=target, stop_token_ids=[tokenizer.eos_token_id])
-print(tokenizer.decode(output[0], skip_special_tokens=False))
-```
-
-### MLX (Apple Silicon)
-
-There have been many great community DFlash implementations on MLX; we provide a simple and efficient one here, tested on an Apple M5 Pro with Qwen3 and Qwen3.5 models.
-
-```python
-from dflash.model_mlx import load, load_draft, stream_generate
-
-model, tokenizer = load("Qwen/Qwen3.5-4B")
-# Experimental: bound the committed draft KV history to a sliding window.
-draft = load_draft("z-lab/Qwen3.5-4B-DFlash", sliding_window_size=None)
-
-messages = [{"role": "user", "content": "How many positive whole-number divisors does 196 have?"}]
-prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-tps = 0.0
-for r in stream_generate(model, draft, tokenizer, prompt, block_size=16, max_tokens=2048, temperature=0.6):
-    print(r.text, end="", flush=True)
-    tps = r.generation_tps
-print(f"\nThroughput: {tps:.2f} tok/s")
-```
-
-For ultra-long-context or agentic use cases, consider trying the experimental
-`sliding_window_size` / `--draft-sliding-window-size` option to bound draft KV
-growth.
-
-## 📊 Evaluation
-
-All benchmarks share the same datasets (gsm8k, math500, humaneval, mbpp, mt-bench). Datasets are automatically downloaded and cached as JSONL in `cache/` on first run.
-
-**vLLM**:
 ```bash
-python -m dflash.benchmark --backend vllm \
-    --base-url http://127.0.0.1:8000 --model Qwen/Qwen3.5-27B \
-    --dataset gsm8k --num-prompts 128 --concurrency 1 --enable-thinking
+python scripts/test_qwen36_dflash_mlx.py \
+  --disable-thinking \
+  --block-size 15 \
+  --target-turboquant-bits 4
 ```
 
-**SGLang**:
+Useful flags:
+
+- `--prompt "..."` to change the input
+- `--max-tokens 256` to cap generation
+- `--sliding-window-size 4096` to limit draft KV growth
+- `--target-turboquant-bits 0` to disable TurboQuant for comparison
+
+## Start The Local API Server
+
 ```bash
-python -m dflash.benchmark --backend sglang \
-    --base-url http://127.0.0.1:30000 --model Qwen/Qwen3.5-35B-A3B \
-    --dataset gsm8k --num-prompts 128 --concurrency 1 --enable-thinking
+./scripts/start_local_wrapper.sh
 ```
 
-**Transformers** (Qwen3 and LLaMA only):
+The wrapper exposes a local server on `127.0.0.1:8010` by default.
+
+Health check:
+
 ```bash
-torchrun --nproc_per_node=8 -m dflash.benchmark --backend transformers \
-    --model Qwen/Qwen3-8B --draft-model z-lab/Qwen3-8B-DFlash-b16 \
-    --dataset gsm8k --max-samples 128
+curl http://127.0.0.1:8010/health
 ```
 
-**MLX**:
+Typical health response fields include:
+
+- `loaded`
+- `context_window`
+- `block_size`
+- `disable_thinking`
+- `keep_alive_seconds`
+- `stream_heartbeat_seconds`
+- `target_turboquant_bits`
+- `active_memory_gb`
+- `cache_memory_gb`
+- `peak_memory_gb`
+
+## Run With Codex
+
 ```bash
-python -m dflash.benchmark --backend mlx \
-    --model Qwen/Qwen3.5-4B --draft-model z-lab/Qwen3.5-4B-DFlash \
-    --dataset gsm8k --max-samples 128 --enable-thinking \
-    --draft-sliding-window-size 4096
+./scripts/run_codex_local.sh
 ```
 
-## Acknowledgement
+This script writes a local `config.toml` for Codex and points it at:
 
-Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the team at [@modal-labs](https://github.com/modal-labs) for their fast, high-quality support in bringing DFlash to SGLang. And huge thanks as well to [@benchislett](https://github.com/benchislett) at NVIDIA for his work in bringing DFlash to vLLM and helping make it available to the broader serving community.
+- provider name: `localdflash`
+- base URL: `http://127.0.0.1:8010/v1`
+- wire API: `responses`
+
+The Codex wrapper is configured for:
+
+- `approval_policy = "never"`
+- `sandbox_mode = "danger-full-access"`
+- no reasoning summary requirement
+- long stream idle timeout for agentic turns
+
+## Run With OpenCode
+
+Interactive mode:
+
+```bash
+./scripts/run_opencode_local.sh
+```
+
+One-shot mode:
+
+```bash
+./scripts/run_opencode_local.sh run --print-logs --format json --dir /tmp/test-run "Build a calculator in html, css, and js."
+```
+
+This fork was tuned specifically so OpenCode behaves in a more agentic way:
+
+- tool calls are parsed more reliably
+- streaming starts earlier
+- heartbeat events make the run feel active during heavy prefills
+- the wrapper stays compatible with long tool-heavy turns
+
+## API Compatibility Notes
+
+The local wrapper is meant to make local MLX serving usable by real agent clients, not only by simple text-generation demos.
+
+Supported API surfaces:
+
+- OpenAI-style chat completions
+- OpenAI-style responses API
+- Anthropic-style messages API
+- tool calling
+- streaming
+- token counting for Anthropic-compatible clients
+
+Tool-call parsing was expanded beyond a single XML format and now accepts multiple patterns commonly produced by agent frameworks, including:
+
+- XML-style function blocks
+- tagged JSON payloads
+- tagged tool-call lists
+- fenced tool-call blocks
+- payloads with keys such as `function`, `tool_calls`, `function_calls`, `input`, `parameters`, `tool_use`, and `recipient_name`
+
+## Memory Behavior
+
+One of the main changes in this fork is that the model should not remain loaded forever unless you explicitly want that behavior.
+
+Default memory policy:
+
+- preload on startup: `off`
+- keep-alive after request: `0`
+- unload as soon as the request finishes
+
+That means:
+
+- memory is allocated when a request needs the model
+- memory is released when the request is done
+- idle RAM pressure is drastically lower than an always-loaded setup like Ollama-style serving
+
+Relevant environment variables:
+
+```bash
+export LOCAL_DFLASH_KEEP_ALIVE=0
+export LOCAL_DFLASH_NO_PRELOAD=1
+export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
+export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
+```
+
+If you want the model to remain warm for a short period after each request, set a positive keep-alive value:
+
+```bash
+export LOCAL_DFLASH_KEEP_ALIVE=60
+```
+
+## Tuning Knobs
+
+The main configuration knobs exposed by `scripts/start_local_wrapper.sh` are:
+
+```bash
+export LOCAL_DFLASH_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-4bit
+export LOCAL_DFLASH_DRAFT_PATH=/path/to/Qwen3.6-35B-A3B-DFlash
+export LOCAL_DFLASH_BLOCK_SIZE=15
+export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=4096
+export LOCAL_DFLASH_DISABLE_THINKING=1
+export LOCAL_DFLASH_MAX_TOKENS=8192
+export LOCAL_DFLASH_CONTEXT_RESERVE=256
+export LOCAL_DFLASH_CONTEXT_WINDOW=65536
+export LOCAL_DFLASH_KEEP_ALIVE=0
+export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=2
+export LOCAL_DFLASH_TURBOQUANT_BITS=4
+export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
+export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
+export LOCAL_DFLASH_NO_PRELOAD=1
+```
+
+## TurboQuant
+
+This fork adds TurboQuant KV cache support for the target model in the MLX path.
+
+What changed:
+
+- target prompt cache creation can replace compatible KV layers with TurboQuant-backed caches
+- the bit width is configurable
+- returned keys and values are cast back to the original dtype for stability
+
+Current default:
+
+- `LOCAL_DFLASH_TURBOQUANT_BITS=4`
+
+To disable TurboQuant:
+
+```bash
+export LOCAL_DFLASH_TURBOQUANT_BITS=0
+```
+
+## Notes On Context Length
+
+The wrapper is currently tuned to `64k` context by default.
+
+That was an intentional choice. For this local MLX setup, forcing much larger contexts can increase latency, memory pressure, and instability without producing a better agent experience. If you want to experiment, you can raise:
+
+```bash
+export LOCAL_DFLASH_CONTEXT_WINDOW=131072
+```
+
+But the default `65536` is the balanced profile that was selected for actual local coding-agent use.
+
+## Upstream
+
+This repository is based on:
+
+- Upstream project: `https://github.com/z-lab/dflash`
+- DFlash paper: `https://arxiv.org/abs/2602.06036`
+- DFlash models: `https://huggingface.co/collections/z-lab/dflash`
+
+The core speculative decoding work belongs to the original DFlash authors. This fork focuses on the Apple Silicon MLX path and the local agent-serving workflow built around it.
 
 ## Citation
-If you find DFlash useful, please cite our work. To share feedback on DFlash or request new model support, please fill out this form: [DFlash Feedback](https://forms.gle/4YNwfqb4nJdqn6hq9).
+
+If you use DFlash in research, cite the original work:
 
 ```bibtex
 @article{chen2026dflash,
