@@ -118,6 +118,13 @@ STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SE
 RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
 GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 16)
+MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
+RESPONSES_CONTINUE_PROMPT = (
+    "[System: Continue the previous incomplete response now. "
+    "Do not repeat prior acknowledgements, summaries, or bullet lists. "
+    "Execute the required tool call immediately. "
+    "If a tool call was cut off, re-emit it in full.]"
+)
 
 
 class OpenAIMessage(BaseModel):
@@ -181,6 +188,11 @@ class ResponsesRequest(BaseModel):
     temperature: float = 0.0
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
+    prompt_cache_key: str | None = None
+    store: bool | None = None
+    service_tier: str | None = None
     previous_response_id: str | None = None
     include: list[str] | None = None
     reasoning: dict[str, Any] | None = None
@@ -613,6 +625,51 @@ def _response_metrics(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _has_unterminated_tool_call_markup(text: str) -> bool:
+    cleaned = _clean_output_text(text)
+
+    if not cleaned:
+        return False
+
+    paired_markers = (
+        ("<tool_call>", "</tool_call>"),
+        ("<tool_calls>", "</tool_calls>"),
+        ("<function_call>", "</function_call>"),
+        ("<function_calls>", "</function_calls>"),
+    )
+    for start_marker, end_marker in paired_markers:
+        if cleaned.count(start_marker) > cleaned.count(end_marker):
+            return True
+
+    if len(re.findall(r"<function=[^>\n]+>", cleaned)) > cleaned.count("</function>"):
+        return True
+
+    if len(re.findall(r"<parameter=[^>\n]+>", cleaned)) > cleaned.count("</parameter>"):
+        return True
+
+    fenced_tags = ("tool_call", "tool_calls", "function_call", "function_calls")
+    for tag in fenced_tags:
+        start_marker = f"```{tag}"
+        start_idx = cleaned.rfind(start_marker)
+        if start_idx == -1:
+            continue
+        if cleaned.find("```", start_idx + 3) == -1:
+            return True
+
+    return False
+
+
+def _response_completion_state(result: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    if _has_unterminated_tool_call_markup(result.get("text", "")):
+        return "incomplete", {"reason": "truncated_tool_call"}
+
+    finish_reason = _coerce_text(result.get("finish_reason")).strip().lower()
+    if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+        return "incomplete", {"reason": "max_output_tokens"}
+
+    return "completed", None
+
+
 def _make_message_item(text: str) -> dict[str, Any]:
     return {
         "id": f"msg_{uuid.uuid4().hex}",
@@ -713,11 +770,46 @@ def _merge_message_context(
     return merged
 
 
+def _massage_responses_continuation_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not messages or messages[-1].get("role") != "assistant":
+        return messages
+
+    trailing_start = len(messages) - 1
+    while trailing_start > 0:
+        candidate = messages[trailing_start - 1]
+        if candidate.get("role") != "assistant":
+            break
+        if candidate.get("tool_calls"):
+            break
+        trailing_start -= 1
+
+    trailing_assistants = messages[trailing_start:]
+    if not trailing_assistants:
+        return messages
+
+    if any(message.get("tool_calls") for message in trailing_assistants):
+        return messages
+
+    last_assistant = copy.deepcopy(trailing_assistants[-1])
+    continue_message = {
+        "role": "user",
+        "content": RESPONSES_CONTINUE_PROMPT,
+    }
+    return [*messages[:trailing_start], last_assistant, continue_message]
+
+
 def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     idx = 0
     while idx < len(messages) and messages[idx].get("role") == "system":
         idx += 1
     return messages[:idx]
+
+
+def _responses_max_tokens(requested_max_tokens: int | None, tools: list[dict[str, Any]] | None) -> int:
+    max_tokens = requested_max_tokens or 512
+    if tools:
+        max_tokens = max(max_tokens, MIN_TOOL_RESPONSE_MAX_TOKENS)
+    return max_tokens
 
 
 def _longest_common_prefix_tokens(left: list[int], right: list[int]) -> tuple[int, ...]:
@@ -897,8 +989,9 @@ def _build_response_payload(
     output_items: list[dict[str, Any]],
     status: str,
     previous_response_id: str | None = None,
+    incomplete_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "id": response_id,
         "object": "response",
         "created_at": int(time.time()),
@@ -909,6 +1002,73 @@ def _build_response_payload(
         "previous_response_id": previous_response_id,
         "usage": _response_usage(result),
         "metrics": _response_metrics(result),
+    }
+    if incomplete_details is not None:
+        payload["incomplete_details"] = incomplete_details
+    return payload
+
+
+def _model_detail_payload(server: "LocalModelServer") -> dict[str, Any]:
+    context_length = server.context_window
+    max_tokens = server.max_tokens_limit
+    return {
+        "id": server.model_name,
+        "object": "model",
+        "owned_by": "local",
+        "context_length": context_length,
+        "max_model_len": context_length,
+        "max_tokens": max_tokens,
+    }
+
+
+def _lm_studio_model_payload(server: "LocalModelServer") -> dict[str, Any]:
+    context_length = server.context_window
+    model = _model_detail_payload(server)
+    return {
+        "id": server.model_name,
+        "key": server.model_name,
+        "context_length": context_length,
+        "max_context_length": context_length,
+        "loaded_instances": [
+            {
+                "identifier": server.model_name,
+                "config": {
+                    "context_length": context_length,
+                },
+            }
+        ],
+        **model,
+    }
+
+
+def _ollama_model_payload(server: "LocalModelServer") -> dict[str, Any]:
+    context_length = server.context_window
+    return {
+        "name": server.model_name,
+        "model": server.model_name,
+        "modified_at": None,
+        "size": 0,
+        "digest": "local-dflash",
+        "details": {
+            "context_length": context_length,
+            "max_model_len": context_length,
+        },
+    }
+
+
+def _llamacpp_props_payload(server: "LocalModelServer") -> dict[str, Any]:
+    context_length = server.context_window
+    max_tokens = server.max_tokens_limit
+    return {
+        "model_path": server.model_path,
+        "model": server.model_name,
+        "default_generation_settings": {
+            "n_ctx": context_length,
+            "context_length": context_length,
+            "n_predict": max_tokens,
+        },
+        "context_length": context_length,
+        "chat_template": "qwen-tool-use",
     }
 
 
@@ -2177,16 +2337,18 @@ class LocalModelServer:
             )
             next_output_index += 1
 
-        completed_payload = _build_response_payload(
+        response_status, incomplete_details = _response_completion_state(result)
+        terminal_payload = _build_response_payload(
             response_id=response_id,
             model_name=self.model_name,
             result=result,
             output_items=output_items,
-            status="completed",
+            status=response_status,
             previous_response_id=previous_response_id,
+            incomplete_details=incomplete_details,
         )
         _trace_event(
-            "responses.completed",
+            f"responses.{response_status}",
             {
                 "response_id": response_id,
                 "previous_response_id": previous_response_id,
@@ -2194,16 +2356,33 @@ class LocalModelServer:
                 "temperature": temperature,
                 "request_messages": effective_request_messages,
                 "tools": tools or [],
-                "response": completed_payload,
+                "raw_text": result["text"],
+                "response": terminal_payload,
             },
         )
-        yield _json_line(
-            "response.completed",
-            {
-                "type": "response.completed",
-                "response": completed_payload,
-            },
-        )
+        if response_status == "incomplete":
+            yield _json_line(
+                "response.incomplete",
+                {
+                    "type": "response.incomplete",
+                    "response": terminal_payload,
+                },
+            )
+            yield _json_line(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": terminal_payload,
+                },
+            )
+        else:
+            yield _json_line(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": terminal_payload,
+                },
+            )
         yield _done_line()
 
     def stream_anthropic_events(
@@ -2519,14 +2698,36 @@ def create_app(server: LocalModelServer) -> FastAPI:
     def list_models() -> dict[str, Any]:
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": server.model_name,
-                    "object": "model",
-                    "owned_by": "local",
-                }
-            ],
+            "data": [_model_detail_payload(server)],
         }
+
+    @app.get("/v1/models/{model_id}")
+    def get_model(model_id: str) -> dict[str, Any]:
+        if model_id != server.model_name:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+        return _model_detail_payload(server)
+
+    @app.get("/api/v1/models")
+    def lm_studio_models() -> dict[str, Any]:
+        return {
+            "models": [_lm_studio_model_payload(server)],
+            "data": [_model_detail_payload(server)],
+        }
+
+    @app.get("/api/tags")
+    def ollama_tags() -> dict[str, Any]:
+        return {
+            "models": [_ollama_model_payload(server)],
+        }
+
+    @app.get("/v1/props")
+    @app.get("/props")
+    def llamacpp_props() -> dict[str, Any]:
+        return _llamacpp_props_payload(server)
+
+    @app.get("/version")
+    def version() -> dict[str, Any]:
+        return {"version": "local-dflash/0.2.0"}
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: OpenAIChatRequest) -> dict[str, Any]:
@@ -2583,6 +2784,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
                 "total_tokens": result["prompt_tokens"] + result["generated_tokens"],
             },
             "metrics": _response_metrics(result),
+            "raw_text": result["text"],
         }
         _trace_event("chat_completions.completed", payload)
         return payload
@@ -2618,7 +2820,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             result=result,
             content_blocks=content_blocks,
         )
-        _trace_event("messages.completed", payload)
+        _trace_event("messages.completed", {"raw_text": result["text"], "response": payload})
         return payload
 
     @app.post("/v1/messages/count_tokens")
@@ -2644,7 +2846,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             )
         except UnknownPreviousResponseError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        max_tokens = req.max_output_tokens or 512
+        messages = _massage_responses_continuation_messages(messages)
+        max_tokens = _responses_max_tokens(req.max_output_tokens, tools)
 
         if req.stream:
             return StreamingResponse(
@@ -2687,16 +2890,18 @@ def create_app(server: LocalModelServer) -> FastAPI:
             output_items=output_items,
             prompt_cache_state=result.get("prompt_cache_state"),
         )
+        response_status, incomplete_details = _response_completion_state(result)
         payload = _build_response_payload(
             response_id=response_id,
             model_name=server.model_name,
             result=result,
             output_items=output_items,
-            status="completed",
+            status=response_status,
             previous_response_id=req.previous_response_id,
+            incomplete_details=incomplete_details,
         )
         _trace_event(
-            "responses.completed",
+            f"responses.{response_status}",
             {
                 "response_id": response_id,
                 "previous_response_id": req.previous_response_id,
@@ -2704,6 +2909,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
                 "temperature": req.temperature,
                 "request_messages": request_messages,
                 "tools": tools,
+                "raw_text": result["text"],
                 "response": payload,
             },
         )

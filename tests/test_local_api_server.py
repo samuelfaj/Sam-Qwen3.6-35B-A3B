@@ -55,6 +55,71 @@ class FakeStreamingServer(local_api_server.LocalModelServer):
         queue.put(("done", None))
 
 
+class FakeTruncatedToolCallServer(local_api_server.LocalModelServer):
+    @staticmethod
+    def _result():
+        return {
+            "text": (
+                "I'll create the file now.\n\n"
+                "<tool_call>\n"
+                "<function=write_file>\n"
+                "<parameter=path>\n"
+                "\"index.html\"\n"
+                "</parameter>\n"
+                "<parameter=content>\n"
+                "<!DOCTYPE html>\n"
+                "<html>"
+            ),
+            "finish_reason": "length",
+            "prompt_tokens": 12,
+            "prefill_seconds": 0.1,
+            "prompt_tps": 10.0,
+            "reused_prefix_tokens": 4,
+            "decode_seconds": 0.2,
+            "generation_tps": 9.0,
+            "generated_tokens": 8,
+            "speculative_steps": 3,
+            "proposed_tokens": 9,
+            "accepted_tokens": 7,
+            "avg_acceptance_length": 2.33,
+            "avg_acceptance_ratio": 0.77,
+            "acceptance_lengths": [2, 2, 3],
+            "acceptance_ratios": [0.66, 0.66, 1.0],
+            "block_size_history": [3, 3, 3],
+            "adaptive_block_size": True,
+            "prefix_cache_source": "global",
+            "peak_memory_gb": 1.0,
+            "elapsed": 0.5,
+            "prompt_cache_state": None,
+        }
+
+    def _generation_worker(
+        self,
+        queue: Queue,
+        messages,
+        requested_max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ) -> None:
+        queue.put(("result", self._result()))
+        queue.put(("done", None))
+
+    def generate(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ):
+        return self._result()
+
+
 class FakeChatStreamingServer(local_api_server.LocalModelServer):
     def _generation_worker(
         self,
@@ -153,6 +218,13 @@ class LocalApiServerTests(unittest.TestCase):
                 return route.endpoint
         self.fail("Health endpoint not found")
 
+    def _get_endpoint(self, server, path):
+        app = local_api_server.create_app(server)
+        for route in app.routes:
+            if getattr(route, "path", None) == path:
+                return route.endpoint
+        self.fail(f"Endpoint not found: {path}")
+
     def test_previous_response_id_restores_context_and_tools(self):
         server = self._make_server()
         tools = [
@@ -202,6 +274,47 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(merged_messages[4], {"role": "tool", "content": '[{"path":"README.md"}]'})
         self.assertEqual(merged_tools, tools)
 
+    def test_massage_responses_continuation_messages_adds_explicit_continue_prompt(self):
+        messages = [
+            {"role": "user", "content": "Build the app."},
+            {"role": "assistant", "content": "I'll build it now."},
+            {"role": "assistant", "content": "I'll create the file next."},
+        ]
+
+        massaged = local_api_server._massage_responses_continuation_messages(messages)
+
+        self.assertEqual(len(massaged), 3)
+        self.assertEqual(massaged[0], messages[0])
+        self.assertEqual(massaged[1], messages[-1])
+        self.assertEqual(massaged[2]["role"], "user")
+        self.assertEqual(massaged[2]["content"], local_api_server.RESPONSES_CONTINUE_PROMPT)
+
+    def test_massage_responses_continuation_messages_leaves_user_turn_unchanged(self):
+        messages = [
+            {"role": "user", "content": "Build the app."},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "Now add tests."},
+        ]
+
+        self.assertEqual(
+            local_api_server._massage_responses_continuation_messages(messages),
+            messages,
+        )
+
+    def test_responses_max_tokens_raises_floor_when_tools_are_available(self):
+        self.assertEqual(
+            local_api_server._responses_max_tokens(512, [{"type": "function"}]),
+            local_api_server.MIN_TOOL_RESPONSE_MAX_TOKENS,
+        )
+        self.assertEqual(
+            local_api_server._responses_max_tokens(8192, [{"type": "function"}]),
+            8192,
+        )
+        self.assertEqual(
+            local_api_server._responses_max_tokens(512, None),
+            512,
+        )
+
     def test_stream_response_events_emit_standard_function_call_events(self):
         server = self._make_server(FakeStreamingServer)
         events = "".join(
@@ -228,6 +341,81 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("event: response.function_call_arguments.delta", events)
         self.assertIn("event: response.function_call_arguments.done", events)
         self.assertIn("event: response.completed", events)
+
+    def test_stream_response_events_mark_truncated_tool_call_as_incomplete(self):
+        server = self._make_server(FakeTruncatedToolCallServer)
+        events = "".join(
+            server.stream_response_events(
+                messages=[{"role": "user", "content": "Create index.html"}],
+                max_tokens=128,
+                temperature=0.0,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                request_messages=[{"role": "user", "content": "Create index.html"}],
+            )
+        )
+
+        self.assertIn("event: response.incomplete", events)
+        self.assertIn("event: response.completed", events)
+        self.assertIn('"reason": "truncated_tool_call"', events)
+        self.assertIn('"status": "incomplete"', events)
+
+    def test_responses_endpoint_marks_truncated_tool_call_as_incomplete(self):
+        server = self._make_server(FakeTruncatedToolCallServer)
+        endpoint = self._get_endpoint(server, "/v1/responses")
+
+        class FakeResponsesRequest(SimpleNamespace):
+            def model_dump(self, mode="json"):
+                return {
+                    "model": self.model,
+                    "input": self.input,
+                    "instructions": self.instructions,
+                    "max_output_tokens": self.max_output_tokens,
+                    "temperature": self.temperature,
+                    "stream": self.stream,
+                    "tools": self.tools,
+                    "tool_choice": self.tool_choice,
+                    "parallel_tool_calls": self.parallel_tool_calls,
+                    "prompt_cache_key": self.prompt_cache_key,
+                    "store": self.store,
+                    "service_tier": self.service_tier,
+                    "previous_response_id": self.previous_response_id,
+                    "include": self.include,
+                    "reasoning": self.reasoning,
+                    "keep_alive": self.keep_alive,
+                }
+
+        payload = endpoint(
+            FakeResponsesRequest(
+                model="local-test-model",
+                input="Create index.html",
+                instructions=None,
+                max_output_tokens=128,
+                temperature=0.0,
+                stream=False,
+                tools=None,
+                tool_choice=None,
+                parallel_tool_calls=None,
+                prompt_cache_key=None,
+                store=None,
+                service_tier=None,
+                previous_response_id=None,
+                include=None,
+                reasoning=None,
+                keep_alive=None,
+            )
+        )
+
+        self.assertEqual(payload["status"], "incomplete")
+        self.assertEqual(payload["incomplete_details"], {"reason": "truncated_tool_call"})
+        self.assertEqual(payload["output_text"], "I'll create the file now.")
 
     def test_stream_chat_completions_emits_openai_chunks(self):
         server = self._make_server(FakeChatStreamingServer)
@@ -372,6 +560,41 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(before["response_history_entries"], 0)
         self.assertEqual(before["active_generation_requests"], 0)
         self.assertEqual(before["queued_generation_requests"], 0)
+
+    def test_compatibility_endpoints_expose_model_metadata(self):
+        server = self._make_server()
+        list_models = self._get_endpoint(server, "/v1/models")
+        get_model = self._get_endpoint(server, "/v1/models/{model_id}")
+        lm_studio_models = self._get_endpoint(server, "/api/v1/models")
+        ollama_tags = self._get_endpoint(server, "/api/tags")
+        llamacpp_props = self._get_endpoint(server, "/v1/props")
+        version = self._get_endpoint(server, "/version")
+
+        list_payload = list_models()
+        detail_payload = get_model(server.model_name)
+        lm_studio_payload = lm_studio_models()
+        ollama_payload = ollama_tags()
+        props_payload = llamacpp_props()
+        version_payload = version()
+
+        self.assertEqual(list_payload["data"][0]["id"], server.model_name)
+        self.assertEqual(detail_payload["max_model_len"], server.context_window)
+        self.assertEqual(detail_payload["context_length"], server.context_window)
+        self.assertEqual(lm_studio_payload["models"][0]["id"], server.model_name)
+        self.assertEqual(
+            lm_studio_payload["models"][0]["loaded_instances"][0]["config"]["context_length"],
+            server.context_window,
+        )
+        self.assertEqual(ollama_payload["models"][0]["name"], server.model_name)
+        self.assertEqual(
+            ollama_payload["models"][0]["details"]["context_length"],
+            server.context_window,
+        )
+        self.assertEqual(
+            props_payload["default_generation_settings"]["n_ctx"],
+            server.context_window,
+        )
+        self.assertEqual(version_payload["version"], "local-dflash/0.2.0")
 
     def test_remember_response_keeps_only_recent_prefix_cache_states(self):
         server = self._make_server()
