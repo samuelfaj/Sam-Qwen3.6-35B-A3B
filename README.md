@@ -77,6 +77,8 @@ That is why the wrapper is designed to behave more like a serving product and le
   - streaming, heartbeats, tool parsing, lazy load/unload
 - `scripts/start_local_wrapper.sh`
   - convenient launcher with the tuned default profile
+- `scripts/dflash.sh`
+  - service helper with `start`/`stop`/`restart`/`status`/`kill`/`logs` subcommands
 - `scripts/run_codex_local.sh`
   - writes a local Codex config and points Codex at this server
 - `scripts/run_opencode_local.sh`
@@ -144,13 +146,39 @@ Useful flags:
 
 ## Start The Local API Server
 
+Foreground (logs in the terminal, Ctrl+C to stop):
+
 ```bash
 ./scripts/start_local_wrapper.sh
 ```
 
 The wrapper exposes a local server on `127.0.0.1:8010` by default.
 
-Health check:
+### Managing The Server As A Background Service
+
+For long-running agent sessions, use the `dflash.sh` helper, which runs the server in the background, tracks the PID, and waits for `/health` to be ready:
+
+```bash
+./scripts/dflash.sh start      # start in background, wait for /health (up to 120s)
+./scripts/dflash.sh status     # check running process + /health
+./scripts/dflash.sh logs       # tail -f dflash.log
+./scripts/dflash.sh stop       # graceful SIGTERM, wait up to 30s
+./scripts/dflash.sh restart    # stop then start
+./scripts/dflash.sh kill       # SIGKILL the process group, clear port squatters
+./scripts/dflash.sh opencode   # launch OpenCode against the local server
+./scripts/dflash.sh codex      # launch Codex against the local server
+```
+
+The `opencode` and `codex` subcommands wrap `run_opencode_local.sh` and `run_codex_local.sh` respectively. Any extra arguments are forwarded, so you can do things like `./scripts/dflash.sh opencode run --print-logs "..."` or `./scripts/dflash.sh codex exec "..."`.
+
+Paths used:
+
+- PID file: `.dflash.pid` at the repo root
+- Log file: `dflash.log` at the repo root
+
+Any extra arguments after `start` or `restart` are forwarded to `start_local_wrapper.sh` (and from there to `local_api_server.py`).
+
+Health check directly:
 
 ```bash
 curl http://127.0.0.1:8010/health

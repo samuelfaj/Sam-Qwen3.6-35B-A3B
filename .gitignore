@@ -7,3 +7,4 @@ cache/
 .env.*
 *.log
 *.trace.jsonl
+.dflash.pid

@@ -554,9 +554,6 @@ def stream_generate(
             tokens.extend(new_tokens)
             n += len(new_tokens)
 
-            if n % 256 == 0:
-                mx.clear_cache()
-
             yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic)
 
             trim = bs - accepted - 1
