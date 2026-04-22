@@ -258,6 +258,8 @@ Tool-call parsing was expanded beyond a single XML format and now accepts multip
 - fenced tool-call blocks
 - payloads with keys such as `function`, `tool_calls`, `function_calls`, `input`, `parameters`, `tool_use`, and `recipient_name`
 
+The Responses API wrapper also keeps an in-process response history so clients that send `previous_response_id` plus incremental tool outputs can continue multi-step agent loops without replaying the full transcript on every turn.
+
 ## Memory Behavior
 
 One of the main changes in this fork is that the model should not remain loaded forever unless you explicitly want that behavior.
@@ -308,6 +310,7 @@ export LOCAL_DFLASH_TURBOQUANT_BITS=4
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
 export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
 export LOCAL_DFLASH_NO_PRELOAD=1
+export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=1024
 ```
 
 ## TurboQuant

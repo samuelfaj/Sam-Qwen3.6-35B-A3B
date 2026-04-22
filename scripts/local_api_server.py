@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 import os
+from collections import deque
 from queue import Empty, Queue
 import re
 import time
@@ -70,7 +72,19 @@ def _env_positive_float(name: str, default: float) -> float:
     return default if value <= 0 else value
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return default if value <= 0 else value
+
+
 STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 2.0)
+RESPONSE_HISTORY_LIMIT = _env_positive_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
 
 
 class OpenAIMessage(BaseModel):
@@ -142,6 +156,10 @@ class ResponsesRequest(BaseModel):
 
 
 class PromptTooLargeError(ValueError):
+    pass
+
+
+class UnknownPreviousResponseError(LookupError):
     pass
 
 
@@ -492,6 +510,64 @@ def _build_output_items(full_text: str) -> list[dict[str, Any]]:
     return items
 
 
+def _messages_from_output_items(output_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for item in output_items:
+        item_type = item.get("type")
+        if item_type == "message":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": _extract_text_from_content(item.get("content")),
+                }
+            )
+            continue
+
+        if item_type == "function_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": item.get("name") or "tool",
+                                "arguments": _coerce_tool_arguments(item.get("arguments")),
+                            }
+                        }
+                    ],
+                }
+            )
+
+    return messages
+
+
+def _merge_message_context(
+    base_messages: list[dict[str, Any]],
+    new_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    base = copy.deepcopy(base_messages)
+    new = copy.deepcopy(new_messages)
+    system_parts: list[str] = []
+
+    while base and base[0].get("role") == "system":
+        content = _coerce_text(base.pop(0).get("content")).strip()
+        if content:
+            system_parts.append(content)
+
+    while new and new[0].get("role") == "system":
+        content = _coerce_text(new.pop(0).get("content")).strip()
+        if content:
+            system_parts.append(content)
+
+    merged: list[dict[str, Any]] = []
+    if system_parts:
+        merged.append({"role": "system", "content": "\n\n".join(system_parts)})
+    merged.extend(base)
+    merged.extend(new)
+    return merged
+
+
 def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for tool in tools or []:
@@ -654,6 +730,7 @@ def _build_response_payload(
     result: dict[str, Any],
     output_items: list[dict[str, Any]],
     status: str,
+    previous_response_id: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": response_id,
@@ -663,6 +740,7 @@ def _build_response_payload(
         "model": model_name,
         "output": output_items,
         "output_text": _output_text_from_items(output_items),
+        "previous_response_id": previous_response_id,
         "usage": _response_usage(result),
         "metrics": _response_metrics(result),
     }
@@ -844,6 +922,26 @@ class LocalModelServer:
         self._tokenizer = None
         self._unload_timer: Timer | None = None
         self._last_used_at: float | None = None
+        self._response_states: dict[str, dict[str, Any]] = {}
+        self._response_order: deque[str] = deque()
+
+    def _clear_hidden_states_locked(self) -> None:
+        hidden_states = getattr(self._model, "_hidden_states", None)
+        if isinstance(hidden_states, list):
+            hidden_states[:] = [None] * len(hidden_states)
+
+    def _clear_request_state_locked(self) -> None:
+        self._clear_hidden_states_locked()
+        gc.collect()
+        mx.clear_cache()
+
+    def _reset_loaded_state_locked(self) -> None:
+        self._clear_hidden_states_locked()
+        self._model = None
+        self._draft = None
+        self._tokenizer = None
+        gc.collect()
+        mx.clear_cache()
 
     def _cancel_unload_timer_locked(self) -> None:
         if self._unload_timer is not None:
@@ -853,11 +951,7 @@ class LocalModelServer:
     def unload(self) -> None:
         with self._lock:
             self._cancel_unload_timer_locked()
-            self._model = None
-            self._draft = None
-            self._tokenizer = None
-            gc.collect()
-            mx.clear_cache()
+            self._reset_loaded_state_locked()
 
     def _schedule_unload_locked(self, keep_alive_seconds: float | None) -> None:
         self._cancel_unload_timer_locked()
@@ -866,11 +960,7 @@ class LocalModelServer:
         if keep_alive_seconds is None:
             return
         if keep_alive_seconds <= 0:
-            self._model = None
-            self._draft = None
-            self._tokenizer = None
-            gc.collect()
-            mx.clear_cache()
+            self._reset_loaded_state_locked()
             return
 
         timer = Timer(keep_alive_seconds, self.unload)
@@ -884,14 +974,93 @@ class LocalModelServer:
         )
         with self._lock:
             self._last_used_at = time.time()
+            if keep_alive_seconds is None or keep_alive_seconds > 0:
+                # Keep the warm model resident, but drop per-request tensors and free-list
+                # allocations so memory returns close to the loaded baseline after each turn.
+                self._clear_request_state_locked()
             self._schedule_unload_locked(keep_alive_seconds)
 
     def ensure_loaded(self) -> None:
         self._cancel_unload_timer_locked()
-        if self._model is not None:
+        if self._model is not None and self._draft is not None and self._tokenizer is not None:
             return
         self._model, self._tokenizer = load(self.model_path)
         self._draft = load_draft(self.draft_path, sliding_window_size=self.sliding_window_size)
+
+    def _prune_response_states_locked(self) -> None:
+        while len(self._response_order) > RESPONSE_HISTORY_LIMIT:
+            stale_response_id = self._response_order.popleft()
+            self._response_states.pop(stale_response_id, None)
+
+    def _conversation_from_response_locked(
+        self,
+        response_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        states: list[dict[str, Any]] = []
+        cursor = response_id
+        seen: set[str] = set()
+
+        while cursor:
+            if cursor in seen:
+                raise UnknownPreviousResponseError(f"Response history loop detected for {response_id}")
+            seen.add(cursor)
+
+            state = self._response_states.get(cursor)
+            if state is None:
+                raise UnknownPreviousResponseError(
+                    f"Unknown previous_response_id: {response_id}. "
+                    "This local server only remembers in-process response history."
+                )
+
+            states.append(state)
+            cursor = state.get("previous_response_id")
+
+        states.reverse()
+
+        messages: list[dict[str, Any]] = []
+        tools: list[dict[str, Any]] = []
+        for state in states:
+            messages = _merge_message_context(messages, state.get("input_messages", []))
+            messages.extend(_messages_from_output_items(state.get("output_items", [])))
+            state_tools = state.get("tools") or []
+            if state_tools:
+                tools = copy.deepcopy(state_tools)
+
+        return messages, tools
+
+    def resolve_responses_context(
+        self,
+        request_messages: list[dict[str, Any]],
+        request_tools: list[dict[str, Any]],
+        previous_response_id: str | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not previous_response_id:
+            return copy.deepcopy(request_messages), copy.deepcopy(request_tools)
+
+        with self._lock:
+            base_messages, inherited_tools = self._conversation_from_response_locked(previous_response_id)
+
+        messages = _merge_message_context(base_messages, request_messages)
+        tools = copy.deepcopy(request_tools or inherited_tools)
+        return messages, tools
+
+    def remember_response(
+        self,
+        response_id: str,
+        previous_response_id: str | None,
+        request_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        output_items: list[dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            self._response_states[response_id] = {
+                "previous_response_id": previous_response_id,
+                "input_messages": copy.deepcopy(request_messages),
+                "tools": copy.deepcopy(tools),
+                "output_items": copy.deepcopy(output_items),
+            }
+            self._response_order.append(response_id)
+            self._prune_response_states_locked()
 
     def build_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
         kwargs: dict[str, Any] = {
@@ -1057,34 +1226,31 @@ class LocalModelServer:
         max_tokens: int,
         temperature: float,
         tools: list[dict[str, Any]] | None = None,
+        request_messages: list[dict[str, Any]] | None = None,
+        previous_response_id: str | None = None,
         keep_alive_override: Any = None,
     ) -> Iterator[str]:
         response_id = f"resp_{uuid.uuid4().hex}"
+        created_response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "in_progress",
+            "model": self.model_name,
+            "output": [],
+            "output_text": "",
+            "previous_response_id": previous_response_id,
+        }
         created = {
             "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": int(time.time()),
-                "status": "in_progress",
-                "model": self.model_name,
-            },
+            "response": created_response,
         }
         yield _json_line("response.created", created)
         yield _json_line(
-            "response.server_model",
+            "response.in_progress",
             {
-                "type": "response.server_model",
-                "response_id": response_id,
-                "model": self.model_name,
-            },
-        )
-        yield _json_line(
-            "response.server_reasoning_included",
-            {
-                "type": "response.server_reasoning_included",
-                "response_id": response_id,
-                "included": False,
+                "type": "response.in_progress",
+                "response": created_response,
             },
         )
         event_queue: Queue = Queue()
@@ -1138,6 +1304,21 @@ class LocalModelServer:
                                         "logprobs": [],
                                     }
                                 ],
+                            },
+                        },
+                    )
+                    yield _json_line(
+                        "response.content_part.added",
+                        {
+                            "type": "response.content_part.added",
+                            "response_id": response_id,
+                            "output_index": 0,
+                            "item_id": message_item_id,
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": "",
+                                "annotations": [],
                             },
                         },
                     )
@@ -1202,6 +1383,14 @@ class LocalModelServer:
             return
 
         output_items = _build_output_items(full_text)
+        effective_request_messages = request_messages or messages
+        self.remember_response(
+            response_id=response_id,
+            previous_response_id=previous_response_id,
+            request_messages=effective_request_messages,
+            tools=tools or [],
+            output_items=output_items,
+        )
 
         next_output_index = 0
         for item in output_items:
@@ -1217,9 +1406,64 @@ class LocalModelServer:
                                 "item": item,
                             },
                         )
+                        yield _json_line(
+                            "response.content_part.added",
+                            {
+                                "type": "response.content_part.added",
+                                "response_id": response_id,
+                                "output_index": next_output_index,
+                                "item_id": item["id"],
+                                "content_index": 0,
+                                "part": item["content"][0],
+                            },
+                        )
+                        yield _json_line(
+                            "response.output_text.done",
+                            {
+                                "type": "response.output_text.done",
+                                "response_id": response_id,
+                                "output_index": next_output_index,
+                                "item_id": item["id"],
+                                "content_index": 0,
+                                "text": _output_text_from_items([item]),
+                            },
+                        )
+                        yield _json_line(
+                            "response.content_part.done",
+                            {
+                                "type": "response.content_part.done",
+                                "response_id": response_id,
+                                "output_index": next_output_index,
+                                "item_id": item["id"],
+                                "content_index": 0,
+                                "part": item["content"][0],
+                            },
+                        )
                         next_output_index += 1
                 else:
                     item["id"] = message_item_id
+                    yield _json_line(
+                        "response.output_text.done",
+                        {
+                            "type": "response.output_text.done",
+                            "response_id": response_id,
+                            "output_index": 0,
+                            "item_id": message_item_id,
+                            "content_index": 0,
+                            "text": _output_text_from_items([item]),
+                        },
+                    )
+                    yield _json_line(
+                        "response.content_part.done",
+                        {
+                            "type": "response.content_part.done",
+                            "response_id": response_id,
+                            "output_index": 0,
+                            "item_id": message_item_id,
+                            "content_index": 0,
+                            "part": item["content"][0],
+                        },
+                    )
                     yield _json_line(
                         "response.output_item.done",
                         {
@@ -1232,24 +1476,38 @@ class LocalModelServer:
                     next_output_index = 1
                 continue
 
+            pending_item = copy.deepcopy(item)
+            if pending_item["type"] == "function_call":
+                pending_item["status"] = "in_progress"
+                pending_item["arguments"] = ""
             yield _json_line(
                 "response.output_item.added",
                 {
                     "type": "response.output_item.added",
                     "response_id": response_id,
                     "output_index": next_output_index,
-                    "item": item,
+                    "item": pending_item,
                 },
             )
             if item["type"] == "function_call" and item.get("arguments"):
                 yield _json_line(
-                    "response.tool_call_input.delta",
+                    "response.function_call_arguments.delta",
                     {
-                        "type": "response.tool_call_input.delta",
+                        "type": "response.function_call_arguments.delta",
                         "response_id": response_id,
                         "output_index": next_output_index,
                         "item_id": item["id"],
                         "delta": item["arguments"],
+                    },
+                )
+                yield _json_line(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "response_id": response_id,
+                        "output_index": next_output_index,
+                        "item_id": item["id"],
+                        "arguments": item["arguments"],
                     },
                 )
             yield _json_line(
@@ -1269,6 +1527,7 @@ class LocalModelServer:
             result=result,
             output_items=output_items,
             status="completed",
+            previous_response_id=previous_response_id,
         )
         yield _json_line(
             "response.completed",
@@ -1656,12 +1915,28 @@ def create_app(server: LocalModelServer) -> FastAPI:
         if req.model != server.model_name:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
-        messages, tools = _normalize_responses_input(req)
+        request_messages, request_tools = _normalize_responses_input(req)
+        try:
+            messages, tools = server.resolve_responses_context(
+                request_messages=request_messages,
+                request_tools=request_tools,
+                previous_response_id=req.previous_response_id,
+            )
+        except UnknownPreviousResponseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         max_tokens = req.max_output_tokens or 512
 
         if req.stream:
             return StreamingResponse(
-                server.stream_response_events(messages, max_tokens, req.temperature, tools=tools, keep_alive_override=req.keep_alive),
+                server.stream_response_events(
+                    messages,
+                    max_tokens,
+                    req.temperature,
+                    tools=tools,
+                    request_messages=request_messages,
+                    previous_response_id=req.previous_response_id,
+                    keep_alive_override=req.keep_alive,
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1675,12 +1950,21 @@ def create_app(server: LocalModelServer) -> FastAPI:
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         output_items = _build_output_items(result["text"])
+        response_id = f"resp_{uuid.uuid4().hex}"
+        server.remember_response(
+            response_id=response_id,
+            previous_response_id=req.previous_response_id,
+            request_messages=request_messages,
+            tools=tools,
+            output_items=output_items,
+        )
         return _build_response_payload(
-            response_id=f"resp_{uuid.uuid4().hex}",
+            response_id=response_id,
             model_name=server.model_name,
             result=result,
             output_items=output_items,
             status="completed",
+            previous_response_id=req.previous_response_id,
         )
 
     return app
