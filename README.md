@@ -298,6 +298,34 @@ One-shot mode:
 
 The wrapper auto-checks `/health` and can restart the main API if needed.
 
+Supervised autonomous mode for long-running tasks:
+
+```bash
+./scripts/run_opencode_local.sh run-auto --dir /tmp/test-run "Build a calculator in HTML, CSS, and JS."
+```
+
+Or through the helper:
+
+```bash
+./scripts/dflash.sh opencode-auto --dir /tmp/test-run "Build a calculator in HTML, CSS, and JS."
+```
+
+The watchdog mode adds:
+
+- Stall detection based on missing progress events
+- Loop detection based on repeated assistant text or repeated tool calls
+- Persistent checkpoints in `.opencode-watchdog/`
+- Automatic restart with a resume prompt that tells the agent to continue from the current filesystem state
+
+Relevant knobs:
+
+- `LOCAL_DFLASH_OPENCODE_AUTOPILOT=1` to route `run` through the watchdog automatically
+- `LOCAL_DFLASH_OPENCODE_STALL_TIMEOUT_SECONDS=900`
+- `LOCAL_DFLASH_OPENCODE_MAX_RESTARTS=12`
+- `LOCAL_DFLASH_OPENCODE_RESTART_DELAY_SECONDS=5`
+- `LOCAL_DFLASH_OPENCODE_LOOP_REPEAT_THRESHOLD=3`
+- `LOCAL_DFLASH_OPENCODE_CHECKPOINT_DIR=.opencode-watchdog`
+
 ### Distill
 
 Wrapper-based usage:
@@ -400,7 +428,7 @@ export LOCAL_DFLASH_MAX_TOKENS=4096
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
 export LOCAL_DFLASH_CONTEXT_WINDOW=49152
 export LOCAL_DFLASH_KEEP_ALIVE=60
-export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=2
+export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=1
 export LOCAL_DFLASH_TURBOQUANT_BITS=3.5
 export LOCAL_DFLASH_DRAFT_TURBOQUANT_BITS=3.5
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=28

@@ -151,6 +151,11 @@ cmd_opencode() {
   exec "${SCRIPT_DIR}/run_opencode_local.sh" "$@"
 }
 
+cmd_opencode_auto() {
+  warn_if_not_ready
+  exec "${SCRIPT_DIR}/run_opencode_local.sh" run-auto "$@"
+}
+
 cmd_codex() {
   warn_if_not_ready
   exec "${SCRIPT_DIR}/run_codex_local.sh" "$@"
@@ -170,6 +175,7 @@ server commands:
 
 client commands:
   opencode  launch OpenCode against the local server (forwards extra args)
+  opencode-auto  launch supervised OpenCode one-shot mode with watchdog/restarts
   codex     launch Codex against the local server (forwards extra args)
 
 env:
@@ -193,6 +199,7 @@ main() {
     kill)              cmd_kill ;;
     logs)              cmd_logs ;;
     opencode)          cmd_opencode "$@" ;;
+    opencode-auto)     cmd_opencode_auto "$@" ;;
     codex)             cmd_codex "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "unknown command: ${cmd}" >&2; usage >&2; exit 2 ;;

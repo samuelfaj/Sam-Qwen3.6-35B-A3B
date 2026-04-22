@@ -115,11 +115,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 2.0)
+STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 1.0)
 RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
 GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 16)
 MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
+RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 2)
 RESPONSES_CONTINUE_PROMPT = (
     "[System: Continue the previous incomplete response now. "
     "Do not repeat prior acknowledgements, summaries, or bullet lists. "
@@ -131,6 +132,17 @@ RESPONSES_TOOL_RESULT_PROMPT = (
     "Use that result to continue. "
     "Do not immediately repeat the exact same tool call with identical arguments unless the tool output "
     "explicitly shows a failure, truncation, or asks for a retry.]"
+)
+RESPONSES_ACTION_PROMPT = (
+    "[System: You just stated the next action but did not actually do it. "
+    "Do not repeat the plan. "
+    "If a tool is needed, call it now. "
+    "If no tool is needed, provide the final answer now. "
+    "Do not stop after saying what you will do next.]"
+)
+RESPONSES_ACTION_INTENT_RE = re.compile(
+    r"\b(?:i['’]ll|i will|let me|now i['’]ll|next[, ]+i['’]ll|vou|agora vou|deixa eu)\b",
+    re.IGNORECASE,
 )
 
 
@@ -694,6 +706,28 @@ def _response_completion_state(result: dict[str, Any]) -> tuple[str, dict[str, A
         return "incomplete", {"reason": "max_output_tokens"}
 
     return "completed", None
+
+
+def _response_requires_action_followup(
+    result: dict[str, Any],
+    output_items: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> bool:
+    if not tools:
+        return False
+
+    response_status, _ = _response_completion_state(result)
+    if response_status != "completed":
+        return False
+
+    if any(item.get("type") == "function_call" for item in output_items):
+        return False
+
+    assistant_text = _output_text_from_items(output_items).strip()
+    if not assistant_text:
+        return False
+
+    return bool(RESPONSES_ACTION_INTENT_RE.search(assistant_text))
 
 
 def _make_message_item(text: str) -> dict[str, Any]:
@@ -1934,6 +1968,97 @@ class LocalModelServer:
         finally:
             self._release_generation_turn(generation_ticket)
 
+    def _generate_response_locked(
+        self,
+        messages: list[dict[str, Any]],
+        requested_max_tokens: int,
+        temperature: float,
+        tools: list[dict[str, Any]] | None = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        current_messages = list(messages)
+        current_previous_response_id = previous_response_id
+
+        for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
+            _, result = self._generate_locked(
+                current_messages,
+                requested_max_tokens,
+                temperature,
+                tools=tools,
+                previous_response_id=current_previous_response_id,
+                capture_prompt_cache_state=capture_prompt_cache_state,
+            )
+            output_items = _build_output_items(result["text"])
+            if not _response_requires_action_followup(result, output_items, tools):
+                return result, output_items
+
+            current_messages = [
+                *current_messages,
+                *_messages_from_output_items(output_items),
+                {
+                    "role": "user",
+                    "content": RESPONSES_ACTION_PROMPT,
+                },
+            ]
+            current_previous_response_id = None
+
+        return result, output_items
+
+    def _responses_generation_worker(
+        self,
+        queue: Queue,
+        messages: list[dict[str, Any]],
+        requested_max_tokens: int,
+        temperature: float,
+        tools: list[dict[str, Any]] | None = None,
+        keep_alive_override: Any = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
+    ) -> None:
+        try:
+            result, output_items = self.generate_response(
+                messages,
+                requested_max_tokens,
+                temperature,
+                tools=tools,
+                keep_alive_override=keep_alive_override,
+                previous_response_id=previous_response_id,
+                capture_prompt_cache_state=capture_prompt_cache_state,
+            )
+            queue.put(("result", (result, output_items)))
+        except Exception as exc:
+            queue.put(("error", str(exc)))
+        finally:
+            queue.put(("done", None))
+
+    def generate_response(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        tools: list[dict[str, Any]] | None = None,
+        keep_alive_override: Any = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        generation_ticket = self._acquire_generation_turn()
+        try:
+            with self._lock:
+                return self._generate_response_locked(
+                    messages,
+                    max_tokens,
+                    temperature,
+                    tools=tools,
+                    previous_response_id=previous_response_id,
+                    capture_prompt_cache_state=capture_prompt_cache_state,
+                )
+        finally:
+            try:
+                self.finish_request(keep_alive_override)
+            finally:
+                self._release_generation_turn(generation_ticket)
+
     def stream_chat_completions(
         self,
         messages: list[dict[str, Any]],
@@ -2113,7 +2238,7 @@ class LocalModelServer:
         )
         event_queue: Queue = Queue()
         worker = Thread(
-            target=self._generation_worker,
+            target=self._responses_generation_worker,
             args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override, previous_response_id, True),
             daemon=True,
         )
@@ -2121,6 +2246,7 @@ class LocalModelServer:
 
         message_item_id: str | None = None
         result: dict[str, Any] | None = None
+        output_items: list[dict[str, Any]] | None = None
         done = False
 
         while not done:
@@ -2134,7 +2260,7 @@ class LocalModelServer:
                 continue
 
             if kind == "result":
-                result = payload
+                result, output_items = payload
                 continue
 
             if kind == "error":
@@ -2178,7 +2304,7 @@ class LocalModelServer:
             yield _done_line()
             return
 
-        output_items = _build_output_items(result["text"])
+        assert output_items is not None
         final_output_text = _output_text_from_items(output_items)
         if final_output_text:
             if message_item_id is None:
@@ -2909,7 +3035,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             )
 
         try:
-            result = server.generate(
+            result, output_items = server.generate_response(
                 messages,
                 max_tokens,
                 req.temperature,
@@ -2920,7 +3046,6 @@ def create_app(server: LocalModelServer) -> FastAPI:
             )
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        output_items = _build_output_items(result["text"])
         response_id = f"resp_{uuid.uuid4().hex}"
         server.remember_response(
             response_id=response_id,

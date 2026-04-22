@@ -26,6 +26,20 @@ ensure_local_server() {
 
 ensure_local_server
 
+run_watchdog() {
+  exec python3 "${SCRIPT_DIR}/opencode_watchdog.py" --model "${OPEN_CODE_MODEL}" -- "$@"
+}
+
+if [[ "${1:-}" == "run-auto" || "${1:-}" == "run-supervised" ]]; then
+  shift
+  run_watchdog "$@"
+fi
+
+if [[ "${1:-}" == "run" && "${LOCAL_DFLASH_OPENCODE_AUTOPILOT:-0}" == "1" ]]; then
+  shift
+  run_watchdog "$@"
+fi
+
 if [[ "${1:-}" == "run" ]]; then
   shift
   exec opencode run -m "${OPEN_CODE_MODEL}" --dangerously-skip-permissions "$@"

@@ -19,18 +19,9 @@ SPEC.loader.exec_module(local_api_server)
 
 
 class FakeStreamingServer(local_api_server.LocalModelServer):
-    def _generation_worker(
-        self,
-        queue: Queue,
-        messages,
-        requested_max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ) -> None:
-        result = {
+    @staticmethod
+    def _result():
+        return {
             "text": '<function_call>{"name":"write_file","arguments":{"path":"index.html","content":"ok"}}</function_call>',
             "finish_reason": "stop",
             "prompt_tokens": 12,
@@ -53,8 +44,32 @@ class FakeStreamingServer(local_api_server.LocalModelServer):
             "peak_memory_gb": 1.0,
             "elapsed": 0.5,
         }
-        queue.put(("result", result))
+
+    def _generation_worker(
+        self,
+        queue: Queue,
+        messages,
+        requested_max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ) -> None:
+        queue.put(("result", self._result()))
         queue.put(("done", None))
+
+    def generate_response(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ):
+        return self._result(), local_api_server._build_output_items(self._result()["text"])
 
 
 class FakeTruncatedToolCallServer(local_api_server.LocalModelServer):
@@ -121,6 +136,19 @@ class FakeTruncatedToolCallServer(local_api_server.LocalModelServer):
     ):
         return self._result()
 
+    def generate_response(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ):
+        result = self._result()
+        return result, local_api_server._build_output_items(result["text"])
+
 
 class FakeChatStreamingServer(local_api_server.LocalModelServer):
     def _generation_worker(
@@ -164,20 +192,9 @@ class FakeChatStreamingServer(local_api_server.LocalModelServer):
 
 
 class FakeReasoningResponsesServer(local_api_server.LocalModelServer):
-    def _generation_worker(
-        self,
-        queue: Queue,
-        messages,
-        requested_max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ) -> None:
-        queue.put(("text", "The user wants me to inspect the repo. "))
-        queue.put(("text", "I'll plan the work carefully.</think>Visible answer."))
-        result = {
+    @staticmethod
+    def _result():
+        return {
             "text": "The user wants me to inspect the repo. I'll plan the work carefully.</think>Visible answer.",
             "finish_reason": "stop",
             "prompt_tokens": 8,
@@ -201,8 +218,35 @@ class FakeReasoningResponsesServer(local_api_server.LocalModelServer):
             "elapsed": 0.2,
             "prompt_cache_state": None,
         }
-        queue.put(("result", result))
+
+    def _generation_worker(
+        self,
+        queue: Queue,
+        messages,
+        requested_max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ) -> None:
+        queue.put(("text", "The user wants me to inspect the repo. "))
+        queue.put(("text", "I'll plan the work carefully.</think>Visible answer."))
+        queue.put(("result", self._result()))
         queue.put(("done", None))
+
+    def generate_response(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ):
+        result = self._result()
+        return result, local_api_server._build_output_items(result["text"])
 
 
 class FakeTimer:
@@ -536,6 +580,101 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("event: response.function_call_arguments.delta", events)
         self.assertIn("event: response.function_call_arguments.done", events)
         self.assertIn("event: response.completed", events)
+
+    def test_generate_response_auto_continues_after_action_only_stop(self):
+        server = self._make_server()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        planning_result = {
+            "text": "The test file has a module resolution issue. Let me fix the import path and run the tests again.",
+            "finish_reason": "stop",
+            "prompt_tokens": 12,
+            "prefill_seconds": 0.1,
+            "prompt_tps": 10.0,
+            "reused_prefix_tokens": 0,
+            "decode_seconds": 0.2,
+            "generation_tps": 9.0,
+            "generated_tokens": 8,
+            "speculative_steps": 1,
+            "proposed_tokens": 8,
+            "accepted_tokens": 8,
+            "avg_acceptance_length": 8.0,
+            "avg_acceptance_ratio": 1.0,
+            "acceptance_lengths": [8],
+            "acceptance_ratios": [1.0],
+            "block_size_history": [8],
+            "adaptive_block_size": False,
+            "prefix_cache_source": "none",
+            "peak_memory_gb": 1.0,
+            "elapsed": 0.2,
+            "prompt_cache_state": None,
+        }
+        tool_result = {
+            "text": '<function_call>{"name":"edit","arguments":{"filePath":"tests.js","oldString":"../index.js","newString":"./index.js"}}</function_call>',
+            "finish_reason": "stop",
+            "prompt_tokens": 24,
+            "prefill_seconds": 0.1,
+            "prompt_tps": 10.0,
+            "reused_prefix_tokens": 0,
+            "decode_seconds": 0.2,
+            "generation_tps": 9.0,
+            "generated_tokens": 8,
+            "speculative_steps": 1,
+            "proposed_tokens": 8,
+            "accepted_tokens": 8,
+            "avg_acceptance_length": 8.0,
+            "avg_acceptance_ratio": 1.0,
+            "acceptance_lengths": [8],
+            "acceptance_ratios": [1.0],
+            "block_size_history": [8],
+            "adaptive_block_size": False,
+            "prefix_cache_source": "none",
+            "peak_memory_gb": 1.0,
+            "elapsed": 0.2,
+            "prompt_cache_state": None,
+        }
+
+        with mock.patch.object(
+            server,
+            "_generate_locked",
+            side_effect=[
+                (["The test file has a module resolution issue."], planning_result),
+                (['<function_call>{"name":"edit"}</function_call>'], tool_result),
+            ],
+        ) as generate_locked_mock:
+            result, output_items = server.generate_response(
+                messages=[{"role": "user", "content": "Fix until all tests pass."}],
+                max_tokens=128,
+                temperature=0.0,
+                tools=tools,
+                keep_alive_override=None,
+                previous_response_id="resp_1",
+                capture_prompt_cache_state=True,
+            )
+
+        self.assertEqual(generate_locked_mock.call_count, 2)
+        first_call = generate_locked_mock.call_args_list[0]
+        second_call = generate_locked_mock.call_args_list[1]
+        self.assertEqual(first_call.kwargs["previous_response_id"], "resp_1")
+        self.assertIsNone(second_call.kwargs["previous_response_id"])
+        second_messages = second_call.args[0]
+        self.assertEqual(second_messages[-2]["role"], "assistant")
+        self.assertEqual(
+            second_messages[-2]["content"],
+            "The test file has a module resolution issue. Let me fix the import path and run the tests again.",
+        )
+        self.assertEqual(second_messages[-1]["role"], "user")
+        self.assertEqual(second_messages[-1]["content"], local_api_server.RESPONSES_ACTION_PROMPT)
+        self.assertEqual(result["text"], tool_result["text"])
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(output_items[0]["name"], "edit")
 
     def test_stream_response_events_do_not_leak_reasoning_text(self):
         server = self._make_server(FakeReasoningResponsesServer)
