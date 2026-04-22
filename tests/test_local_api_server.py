@@ -367,6 +367,8 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertTrue(loaded["loaded"])
         self.assertFalse(after["loaded"])
         self.assertEqual(before["keep_alive_seconds"], 300)
+        self.assertEqual(before["response_history_limit"], server.response_history_limit)
+        self.assertEqual(before["response_history_entries"], 0)
 
     def test_remember_response_keeps_only_recent_prefix_cache_states(self):
         server = self._make_server()
@@ -404,6 +406,35 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIsNone(server._response_states["resp_1"]["prompt_cache_state"])
         self.assertEqual(server._response_states["resp_2"]["prompt_cache_state"], second_state)
         self.assertEqual(list(server._prefix_state_order), ["resp_2"])
+
+    def test_remember_response_discards_history_when_limit_is_zero(self):
+        server = self._make_server()
+        server.response_history_limit = 0
+
+        server.remember_response(
+            response_id="resp_1",
+            previous_response_id=None,
+            request_messages=[{"role": "user", "content": "one"}],
+            tools=[],
+            output_items=[],
+        )
+
+        self.assertEqual(server._response_states, {})
+        self.assertEqual(list(server._response_order), [])
+
+    def test_stable_prefix_tokens_are_disabled_when_global_cache_limit_is_zero(self):
+        server = self._make_server()
+        server.global_prefix_cache_limit = 0
+
+        with mock.patch.object(server, "build_prompt") as build_prompt_mock:
+            tokens = server._stable_prefix_tokens_locked(
+                messages=[{"role": "system", "content": "You are a coding agent."}],
+                tools=[],
+            )
+
+        self.assertEqual(tokens, ())
+        self.assertEqual(server._stable_prefix_tokens_by_key, {})
+        build_prompt_mock.assert_not_called()
 
     def test_generate_reuses_previous_response_prefix_cache(self):
         server = self._make_server(TrackingServer)

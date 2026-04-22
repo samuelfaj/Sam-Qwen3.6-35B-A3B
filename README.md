@@ -23,8 +23,10 @@ Compared with upstream `dflash`, this repo now includes:
 - Compatibility wrappers for:
   - Codex via `scripts/run_codex_local.sh`
   - OpenCode via `scripts/run_opencode_local.sh`
+  - Distill via `scripts/run_distill_local.sh`
 - A dedicated local launch script:
   - `scripts/start_local_wrapper.sh`
+  - `scripts/start_distill_wrapper.sh`
 - A direct local test script:
   - `scripts/test_qwen36_dflash_mlx.py`
 - TurboQuant support for the target-model KV cache in `dflash/model_mlx.py`
@@ -47,7 +49,7 @@ The current default profile is optimized for local agentic use, not for benchmar
 - Draft sliding window: `4096`
 - Qwen thinking mode: `disabled` by default for faster, cleaner agent behavior
 - TurboQuant target KV cache: `4-bit`
-- Keep-alive: `0`
+- Keep-alive: `60`
 - Preload at startup: `disabled`
 - Heartbeat interval while streaming: `2s`
 
@@ -77,12 +79,18 @@ That is why the wrapper is designed to behave more like a serving product and le
   - streaming, heartbeats, tool parsing, lazy load/unload
 - `scripts/start_local_wrapper.sh`
   - convenient launcher with the tuned default profile
+- `scripts/start_distill_wrapper.sh`
+  - separate stateless launcher for Distill on its own port
 - `scripts/dflash.sh`
   - service helper with `start`/`stop`/`restart`/`status`/`kill`/`logs` subcommands
+- `scripts/dflash_distill.sh`
+  - service helper for the dedicated Distill API
 - `scripts/run_codex_local.sh`
   - writes a local Codex config and points Codex at this server
 - `scripts/run_opencode_local.sh`
   - runs OpenCode against this local model
+- `scripts/run_distill_local.sh`
+  - runs Distill against the stateless local model API without mutating Distill config
 - `scripts/test_qwen36_dflash_mlx.py`
   - minimal direct MLX test path without the HTTP wrapper
 
@@ -193,11 +201,50 @@ Typical health response fields include:
 - `block_size`
 - `disable_thinking`
 - `keep_alive_seconds`
+- `response_history_limit`
 - `stream_heartbeat_seconds`
 - `target_turboquant_bits`
 - `active_memory_gb`
 - `cache_memory_gb`
 - `peak_memory_gb`
+
+## Start The Distill API
+
+Foreground (logs in the terminal, Ctrl+C to stop):
+
+```bash
+./scripts/start_distill_wrapper.sh
+```
+
+The Distill-only API is separate from the main local API and listens on `127.0.0.1:8011` by default.
+
+Its default profile is intentionally stateless between requests:
+
+- context window: `8192`
+- keep-alive after request: `0`
+- response history limit: `0`
+- response prefix cache limit: `0`
+- global prefix cache limit: `0`
+- MLX allocator cache limit: `0`
+
+Background service commands:
+
+```bash
+./scripts/dflash_distill.sh start
+./scripts/dflash_distill.sh status
+./scripts/dflash_distill.sh logs
+./scripts/dflash_distill.sh stop
+./scripts/dflash_distill.sh restart
+./scripts/dflash_distill.sh distill "Summarize this build log"
+```
+
+The Distill launcher passes `--provider dflash --model ... --host http://127.0.0.1:8011/v1` directly to `distill`, so it does not modify Distill's saved config.
+
+Health check directly:
+
+```bash
+curl http://127.0.0.1:8011/health
+```
 
 ## Run With Codex
 
@@ -269,21 +316,21 @@ One of the main changes in this fork is that the model should not remain loaded 
 Default memory policy:
 
 - preload on startup: `off`
-- keep-alive after request: `300`
-- unload after `5 minutes` idle
+- keep-alive after request: `60`
+- unload after `1 minute` idle
 
 That means:
 
 - memory is allocated when a request needs the model
 - the API can stay online while the model is unloaded
 - the model stays warm briefly after each request
-- memory is released again after about five minutes with no traffic
+- memory is released again after about one minute with no traffic
 - idle RAM pressure is drastically lower than an always-loaded setup like Ollama-style serving
 
 Relevant environment variables:
 
 ```bash
-export LOCAL_DFLASH_KEEP_ALIVE=300
+export LOCAL_DFLASH_KEEP_ALIVE=60
 export LOCAL_DFLASH_NO_PRELOAD=1
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
 export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
@@ -296,7 +343,7 @@ If you launch OpenCode through `scripts/run_opencode_local.sh`, the script also 
 If you want a different warm window after each request, set a positive keep-alive value:
 
 ```bash
-export LOCAL_DFLASH_KEEP_ALIVE=60
+export LOCAL_DFLASH_KEEP_ALIVE=30
 ```
 
 ## Tuning Knobs
@@ -312,7 +359,7 @@ export LOCAL_DFLASH_DISABLE_THINKING=1
 export LOCAL_DFLASH_MAX_TOKENS=8192
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
 export LOCAL_DFLASH_CONTEXT_WINDOW=65536
-export LOCAL_DFLASH_KEEP_ALIVE=300
+export LOCAL_DFLASH_KEEP_ALIVE=60
 export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=2
 export LOCAL_DFLASH_TURBOQUANT_BITS=4
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=

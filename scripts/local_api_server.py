@@ -115,7 +115,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 2.0)
-RESPONSE_HISTORY_LIMIT = _env_positive_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
+RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
 GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 16)
 
@@ -1098,6 +1098,7 @@ class LocalModelServer:
         self._response_states: dict[str, dict[str, Any]] = {}
         self._response_order: deque[str] = deque()
         self._prefix_state_order: deque[str] = deque()
+        self.response_history_limit = RESPONSE_HISTORY_LIMIT
         self.prefix_cache_state_limit = PREFIX_CACHE_STATE_LIMIT
         self.global_prefix_cache_limit = global_prefix_cache_limit
         self._global_prefix_states: dict[str, PromptPrefillState] = {}
@@ -1194,7 +1195,7 @@ class LocalModelServer:
             self._stable_prefix_tokens_by_key.pop(stale_key, None)
 
     def _prune_response_states_locked(self) -> None:
-        while len(self._response_order) > RESPONSE_HISTORY_LIMIT:
+        while len(self._response_order) > self.response_history_limit:
             stale_response_id = self._response_order.popleft()
             self._response_states.pop(stale_response_id, None)
             try:
@@ -1333,6 +1334,8 @@ class LocalModelServer:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> tuple[int, ...]:
+        if self.global_prefix_cache_limit <= 0:
+            return ()
         stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
         if stable_prefix_key is None:
             return ()
@@ -2452,6 +2455,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "keep_alive_seconds": server.keep_alive_seconds,
             "stream_heartbeat_seconds": STREAM_HEARTBEAT_SECONDS,
             "target_turboquant_bits": server.target_turboquant_bits,
+            "response_history_limit": server.response_history_limit,
+            "response_history_entries": len(server._response_order),
             "prefix_cache_state_limit": server.prefix_cache_state_limit,
             "prefix_cache_entries": len(server._prefix_state_order),
             "global_prefix_cache_limit": server.global_prefix_cache_limit,

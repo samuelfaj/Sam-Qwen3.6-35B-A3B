@@ -8,3 +8,4 @@ cache/
 *.log
 *.trace.jsonl
 .dflash.pid
+.dflash-distill.pid
