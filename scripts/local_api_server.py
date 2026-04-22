@@ -2119,7 +2119,6 @@ class LocalModelServer:
         )
         worker.start()
 
-        visible_stream = _IncrementalVisibleTextStream(strip_edges=False)
         message_item_id: str | None = None
         result: dict[str, Any] | None = None
         done = False
@@ -2132,59 +2131,6 @@ class LocalModelServer:
                 continue
 
             if kind == "text":
-                delta = visible_stream.feed(payload)
-                if not delta:
-                    continue
-                if message_item_id is None:
-                    message_item_id = f"msg_{uuid.uuid4().hex}"
-                    yield _json_line(
-                        "response.output_item.added",
-                        {
-                            "type": "response.output_item.added",
-                            "response_id": response_id,
-                            "output_index": 0,
-                            "item": {
-                                "id": message_item_id,
-                                "type": "message",
-                                "status": "in_progress",
-                                "role": "assistant",
-                                "content": [
-                                    {
-                                        "type": "output_text",
-                                        "text": "",
-                                        "annotations": [],
-                                        "logprobs": [],
-                                    }
-                                ],
-                            },
-                        },
-                    )
-                    yield _json_line(
-                        "response.content_part.added",
-                        {
-                            "type": "response.content_part.added",
-                            "response_id": response_id,
-                            "output_index": 0,
-                            "item_id": message_item_id,
-                            "content_index": 0,
-                            "part": {
-                                "type": "output_text",
-                                "text": "",
-                                "annotations": [],
-                            },
-                        },
-                    )
-                yield _json_line(
-                    "response.output_text.delta",
-                    {
-                        "type": "response.output_text.delta",
-                        "response_id": response_id,
-                        "output_index": 0,
-                        "item_id": message_item_id,
-                        "content_index": 0,
-                        "delta": delta,
-                    },
-                )
                 continue
 
             if kind == "result":
@@ -2232,8 +2178,9 @@ class LocalModelServer:
             yield _done_line()
             return
 
-        final_delta = visible_stream.feed("", final=True)
-        if final_delta:
+        output_items = _build_output_items(result["text"])
+        final_output_text = _output_text_from_items(output_items)
+        if final_output_text:
             if message_item_id is None:
                 message_item_id = f"msg_{uuid.uuid4().hex}"
                 yield _json_line(
@@ -2281,11 +2228,10 @@ class LocalModelServer:
                     "output_index": 0,
                     "item_id": message_item_id,
                     "content_index": 0,
-                    "delta": final_delta,
+                    "delta": final_output_text,
                 },
             )
 
-        output_items = _build_output_items(result["text"])
         effective_request_messages = request_messages or messages
         self.remember_response(
             response_id=response_id,

@@ -163,6 +163,48 @@ class FakeChatStreamingServer(local_api_server.LocalModelServer):
         queue.put(("done", None))
 
 
+class FakeReasoningResponsesServer(local_api_server.LocalModelServer):
+    def _generation_worker(
+        self,
+        queue: Queue,
+        messages,
+        requested_max_tokens,
+        temperature,
+        tools=None,
+        keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
+    ) -> None:
+        queue.put(("text", "The user wants me to inspect the repo. "))
+        queue.put(("text", "I'll plan the work carefully.</think>Visible answer."))
+        result = {
+            "text": "The user wants me to inspect the repo. I'll plan the work carefully.</think>Visible answer.",
+            "finish_reason": "stop",
+            "prompt_tokens": 8,
+            "prefill_seconds": 0.05,
+            "prompt_tps": 10.0,
+            "reused_prefix_tokens": 0,
+            "decode_seconds": 0.15,
+            "generation_tps": 9.0,
+            "generated_tokens": 2,
+            "speculative_steps": 1,
+            "proposed_tokens": 2,
+            "accepted_tokens": 2,
+            "avg_acceptance_length": 2.0,
+            "avg_acceptance_ratio": 1.0,
+            "acceptance_lengths": [2],
+            "acceptance_ratios": [1.0],
+            "block_size_history": [2],
+            "adaptive_block_size": False,
+            "prefix_cache_source": "none",
+            "peak_memory_gb": 1.0,
+            "elapsed": 0.2,
+            "prompt_cache_state": None,
+        }
+        queue.put(("result", result))
+        queue.put(("done", None))
+
+
 class FakeTimer:
     def __init__(self, interval, func) -> None:
         self.interval = interval
@@ -494,6 +536,21 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("event: response.function_call_arguments.delta", events)
         self.assertIn("event: response.function_call_arguments.done", events)
         self.assertIn("event: response.completed", events)
+
+    def test_stream_response_events_do_not_leak_reasoning_text(self):
+        server = self._make_server(FakeReasoningResponsesServer)
+        events = "".join(
+            server.stream_response_events(
+                messages=[{"role": "user", "content": "Inspect the repository."}],
+                max_tokens=64,
+                temperature=0.0,
+                request_messages=[{"role": "user", "content": "Inspect the repository."}],
+            )
+        )
+
+        self.assertIn('"delta": "Visible answer."', events)
+        self.assertNotIn("The user wants me to inspect the repo.", events)
+        self.assertNotIn("</think>", events)
 
     def test_stream_response_events_mark_truncated_tool_call_as_incomplete(self):
         server = self._make_server(FakeTruncatedToolCallServer)
