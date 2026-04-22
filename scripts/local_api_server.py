@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 from dflash.model_mlx import (
     AdaptiveBlockSizeConfig,
     PromptPrefillState,
+    clone_prefill_state_for_reuse,
     derive_prefill_prefix_state,
     load,
     load_draft,
@@ -68,6 +69,9 @@ TOOL_BLOCK_MARKERS = (
     ("```function_call", "```"),
     ("```function_calls", "```"),
 )
+VISIBLE_HIDDEN_MARKERS = (("<think>", "</think>"), *TOOL_BLOCK_MARKERS)
+VISIBLE_START_MARKERS = tuple(marker for marker, _ in VISIBLE_HIDDEN_MARKERS)
+VISIBLE_PARTIAL_MARKERS = (*SPECIAL_TOKENS, *VISIBLE_START_MARKERS)
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -289,45 +293,133 @@ def _clean_output_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _longest_partial_marker_suffix(text: str, markers: tuple[str, ...]) -> int:
+    best = 0
+    for marker in markers:
+        upper = min(len(text), len(marker) - 1)
+        for size in range(upper, 0, -1):
+            if size <= best:
+                break
+            if text.endswith(marker[:size]):
+                best = size
+                break
+    return best
+
+
+def _next_visible_marker(text: str) -> tuple[int, str, str | None] | None:
+    best: tuple[int, str, str | None] | None = None
+
+    for marker in SPECIAL_TOKENS:
+        idx = text.find(marker)
+        if idx != -1 and (best is None or idx < best[0]):
+            best = (idx, marker, None)
+
+    for marker, end_marker in VISIBLE_HIDDEN_MARKERS:
+        idx = text.find(marker)
+        if idx != -1 and (best is None or idx < best[0]):
+            best = (idx, marker, end_marker)
+
+    return best
+
+
+class _IncrementalVisibleTextExtractor:
+    def __init__(self) -> None:
+        self._visible_buffer = ""
+        self._hidden_buffer = ""
+        self._hidden_end_marker: str | None = None
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        if text:
+            if self._hidden_end_marker is None:
+                self._visible_buffer += text
+            else:
+                self._hidden_buffer += text
+
+        visible_parts: list[str] = []
+
+        while True:
+            if self._hidden_end_marker is not None:
+                end_idx = self._hidden_buffer.find(self._hidden_end_marker)
+                if end_idx == -1:
+                    keep = 0 if final else _longest_partial_marker_suffix(
+                        self._hidden_buffer,
+                        (self._hidden_end_marker,),
+                    )
+                    self._hidden_buffer = self._hidden_buffer[-keep:] if keep > 0 else ""
+                    break
+
+                self._hidden_buffer = self._hidden_buffer[end_idx + len(self._hidden_end_marker):]
+                self._hidden_end_marker = None
+                self._visible_buffer = self._hidden_buffer + self._visible_buffer
+                self._hidden_buffer = ""
+                continue
+
+            match = _next_visible_marker(self._visible_buffer)
+            if match is None:
+                keep = 0 if final else _longest_partial_marker_suffix(
+                    self._visible_buffer,
+                    VISIBLE_PARTIAL_MARKERS,
+                )
+                if keep > 0:
+                    visible_parts.append(self._visible_buffer[:-keep])
+                    self._visible_buffer = self._visible_buffer[-keep:]
+                else:
+                    visible_parts.append(self._visible_buffer)
+                    self._visible_buffer = ""
+                break
+
+            idx, marker, end_marker = match
+            if idx > 0:
+                visible_parts.append(self._visible_buffer[:idx])
+            self._visible_buffer = self._visible_buffer[idx + len(marker):]
+            if end_marker is None:
+                continue
+            self._hidden_end_marker = end_marker
+            self._hidden_buffer = self._visible_buffer
+            self._visible_buffer = ""
+
+        return "".join(visible_parts)
+
+
+class _IncrementalVisibleTextStream:
+    def __init__(self, *, strip_edges: bool) -> None:
+        self._extractor = _IncrementalVisibleTextExtractor()
+        self._strip_edges = strip_edges
+        self._emitted_non_whitespace = False
+        self._trailing_whitespace = ""
+
+    def _strip_delta(self, text: str) -> str:
+        if not text:
+            return ""
+
+        if not self._emitted_non_whitespace:
+            text = text.lstrip()
+            if not text:
+                return ""
+            self._emitted_non_whitespace = True
+
+        if self._trailing_whitespace:
+            text = self._trailing_whitespace + text
+            self._trailing_whitespace = ""
+
+        stripped = text.rstrip()
+        trailing_len = len(text) - len(stripped)
+        if trailing_len > 0:
+            self._trailing_whitespace = text[-trailing_len:]
+            text = stripped
+
+        return text
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        delta = self._extractor.feed(text, final=final)
+        if not self._strip_edges:
+            return delta
+        return self._strip_delta(delta)
+
+
 def _extract_visible_text(text: str) -> str:
-    cleaned = text
-    for token in SPECIAL_TOKENS:
-        cleaned = cleaned.replace(token, "")
-
-    visible_parts: list[str] = []
-    cursor = 0
-    while cursor < len(cleaned):
-        think_idx = cleaned.find("<think>", cursor)
-        next_idx = len(cleaned)
-        next_end: str | None = None
-        next_start_len = 0
-        next_is_think = False
-
-        if think_idx != -1 and think_idx < next_idx:
-            next_idx = think_idx
-            next_end = "</think>"
-            next_start_len = len("<think>")
-            next_is_think = True
-
-        for start_marker, end_marker in TOOL_BLOCK_MARKERS:
-            marker_idx = cleaned.find(start_marker, cursor)
-            if marker_idx != -1 and marker_idx < next_idx:
-                next_idx = marker_idx
-                next_end = end_marker
-                next_start_len = len(start_marker)
-                next_is_think = False
-
-        if next_end is None:
-            visible_parts.append(cleaned[cursor:])
-            break
-
-        visible_parts.append(cleaned[cursor:next_idx])
-        end_idx = cleaned.find(next_end, next_idx + next_start_len)
-        if end_idx == -1:
-            break
-        cursor = end_idx + len(next_end)
-
-    return "".join(visible_parts)
+    extractor = _IncrementalVisibleTextExtractor()
+    return extractor.feed(text, final=True)
 
 
 def _strip_reasoning_blocks(text: str) -> tuple[str, str]:
@@ -597,35 +689,35 @@ def _merge_message_context(
     base_messages: list[dict[str, Any]],
     new_messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    base = copy.deepcopy(base_messages)
-    new = copy.deepcopy(new_messages)
     system_parts: list[str] = []
 
-    while base and base[0].get("role") == "system":
-        content = _coerce_text(base.pop(0).get("content")).strip()
+    base_idx = 0
+    while base_idx < len(base_messages) and base_messages[base_idx].get("role") == "system":
+        content = _coerce_text(base_messages[base_idx].get("content")).strip()
         if content:
             system_parts.append(content)
+        base_idx += 1
 
-    while new and new[0].get("role") == "system":
-        content = _coerce_text(new.pop(0).get("content")).strip()
+    new_idx = 0
+    while new_idx < len(new_messages) and new_messages[new_idx].get("role") == "system":
+        content = _coerce_text(new_messages[new_idx].get("content")).strip()
         if content:
             system_parts.append(content)
+        new_idx += 1
 
     merged: list[dict[str, Any]] = []
     if system_parts:
         merged.append({"role": "system", "content": "\n\n".join(system_parts)})
-    merged.extend(base)
-    merged.extend(new)
+    merged.extend(base_messages[base_idx:])
+    merged.extend(new_messages[new_idx:])
     return merged
 
 
 def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    stable_messages: list[dict[str, Any]] = []
-    for message in messages:
-        if message.get("role") != "system":
-            break
-        stable_messages.append(copy.deepcopy(message))
-    return stable_messages
+    idx = 0
+    while idx < len(messages) and messages[idx].get("role") == "system":
+        idx += 1
+    return messages[:idx]
 
 
 def _longest_common_prefix_tokens(left: list[int], right: list[int]) -> tuple[int, ...]:
@@ -1099,6 +1191,7 @@ class LocalModelServer:
         while len(self._global_prefix_order) > self.global_prefix_cache_limit:
             stale_key = self._global_prefix_order.popleft()
             self._global_prefix_states.pop(stale_key, None)
+            self._stable_prefix_tokens_by_key.pop(stale_key, None)
 
     def _prune_response_states_locked(self) -> None:
         while len(self._response_order) > RESPONSE_HISTORY_LIMIT:
@@ -1141,7 +1234,7 @@ class LocalModelServer:
             messages.extend(_messages_from_output_items(state.get("output_items", [])))
             state_tools = state.get("tools") or []
             if state_tools:
-                tools = copy.deepcopy(state_tools)
+                tools = state_tools
 
         return messages, tools
 
@@ -1152,13 +1245,13 @@ class LocalModelServer:
         previous_response_id: str | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if not previous_response_id:
-            return copy.deepcopy(request_messages), copy.deepcopy(request_tools)
+            return request_messages, request_tools
 
         with self._lock:
             base_messages, inherited_tools = self._conversation_from_response_locked(previous_response_id)
 
         messages = _merge_message_context(base_messages, request_messages)
-        tools = copy.deepcopy(request_tools or inherited_tools)
+        tools = request_tools or inherited_tools
         return messages, tools
 
     def remember_response(
@@ -1174,9 +1267,9 @@ class LocalModelServer:
             stored_prompt_cache_state = prompt_cache_state if self.prefix_cache_state_limit > 0 else None
             self._response_states[response_id] = {
                 "previous_response_id": previous_response_id,
-                "input_messages": copy.deepcopy(request_messages),
-                "tools": copy.deepcopy(tools),
-                "output_items": copy.deepcopy(output_items),
+                "input_messages": list(request_messages),
+                "tools": list(tools),
+                "output_items": list(output_items),
                 "prompt_cache_state": stored_prompt_cache_state,
             }
             self._response_order.append(response_id)
@@ -1194,7 +1287,7 @@ class LocalModelServer:
         prompt_cache_state = state.get("prompt_cache_state")
         if prompt_cache_state is None:
             return None
-        return copy.deepcopy(prompt_cache_state)
+        return clone_prefill_state_for_reuse(prompt_cache_state)
 
     def build_prompt(
         self,
@@ -1265,7 +1358,7 @@ class LocalModelServer:
         state = self._global_prefix_states.get(stable_prefix_key)
         if state is None:
             return None
-        return copy.deepcopy(state)
+        return clone_prefill_state_for_reuse(state)
 
     def _select_prefix_state_locked(
         self,
@@ -1324,7 +1417,7 @@ class LocalModelServer:
         if derived_state is None:
             return
 
-        self._global_prefix_states[stable_prefix_key] = copy.deepcopy(derived_state)
+        self._global_prefix_states[stable_prefix_key] = derived_state
         try:
             self._global_prefix_order.remove(stable_prefix_key)
         except ValueError:
@@ -1575,8 +1668,7 @@ class LocalModelServer:
         )
         worker.start()
 
-        full_text = ""
-        streamed_visible = ""
+        visible_stream = _IncrementalVisibleTextStream(strip_edges=True)
         emitted_role = False
         result: dict[str, Any] | None = None
         done = False
@@ -1589,16 +1681,10 @@ class LocalModelServer:
                 continue
 
             if kind == "text":
-                full_text += payload
-                current_visible = _clean_output_text(_extract_visible_text(full_text))
-                if current_visible.startswith(streamed_visible):
-                    delta = current_visible[len(streamed_visible):]
-                else:
-                    delta = current_visible
+                delta = visible_stream.feed(payload)
                 if not delta:
                     continue
 
-                streamed_visible = current_visible
                 chunk_delta: dict[str, Any] = {"content": delta}
                 if not emitted_role:
                     chunk_delta = {"role": "assistant", "content": delta}
@@ -1623,7 +1709,6 @@ class LocalModelServer:
 
             if kind == "result":
                 result = payload
-                full_text = result["text"]
                 continue
 
             if kind == "error":
@@ -1650,6 +1735,28 @@ class LocalModelServer:
             )
             yield _done_line()
             return
+
+        final_delta = visible_stream.feed("", final=True)
+        if final_delta:
+            chunk_delta: dict[str, Any] = {"content": final_delta}
+            if not emitted_role:
+                chunk_delta = {"role": "assistant", "content": final_delta}
+                emitted_role = True
+            yield _data_line(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": chunk_delta,
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
 
         if not emitted_role:
             yield _data_line(
@@ -1729,8 +1836,7 @@ class LocalModelServer:
         )
         worker.start()
 
-        full_text = ""
-        streamed_visible = ""
+        visible_stream = _IncrementalVisibleTextStream(strip_edges=False)
         message_item_id: str | None = None
         result: dict[str, Any] | None = None
         done = False
@@ -1743,12 +1849,7 @@ class LocalModelServer:
                 continue
 
             if kind == "text":
-                full_text += payload
-                current_visible = _extract_visible_text(full_text)
-                if current_visible.startswith(streamed_visible):
-                    delta = current_visible[len(streamed_visible):]
-                else:
-                    delta = current_visible
+                delta = visible_stream.feed(payload)
                 if not delta:
                     continue
                 if message_item_id is None:
@@ -1790,7 +1891,6 @@ class LocalModelServer:
                             },
                         },
                     )
-                streamed_visible = current_visible
                 yield _json_line(
                     "response.output_text.delta",
                     {
@@ -1806,7 +1906,6 @@ class LocalModelServer:
 
             if kind == "result":
                 result = payload
-                full_text = result["text"]
                 continue
 
             if kind == "error":
@@ -1850,7 +1949,60 @@ class LocalModelServer:
             yield _done_line()
             return
 
-        output_items = _build_output_items(full_text)
+        final_delta = visible_stream.feed("", final=True)
+        if final_delta:
+            if message_item_id is None:
+                message_item_id = f"msg_{uuid.uuid4().hex}"
+                yield _json_line(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "response_id": response_id,
+                        "output_index": 0,
+                        "item": {
+                            "id": message_item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "",
+                                    "annotations": [],
+                                    "logprobs": [],
+                                }
+                            ],
+                        },
+                    },
+                )
+                yield _json_line(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "response_id": response_id,
+                        "output_index": 0,
+                        "item_id": message_item_id,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                )
+            yield _json_line(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "response_id": response_id,
+                    "output_index": 0,
+                    "item_id": message_item_id,
+                    "content_index": 0,
+                    "delta": final_delta,
+                },
+            )
+
+        output_items = _build_output_items(result["text"])
         effective_request_messages = request_messages or messages
         self.remember_response(
             response_id=response_id,
@@ -2055,8 +2207,7 @@ class LocalModelServer:
         )
         worker.start()
 
-        full_text = ""
-        streamed_visible = ""
+        visible_stream = _IncrementalVisibleTextStream(strip_edges=False)
         text_block_open = False
         result: dict[str, Any] | None = None
         done = False
@@ -2069,12 +2220,7 @@ class LocalModelServer:
                 continue
 
             if kind == "text":
-                full_text += payload
-                current_visible = _extract_visible_text(full_text)
-                if current_visible.startswith(streamed_visible):
-                    delta = current_visible[len(streamed_visible):]
-                else:
-                    delta = current_visible
+                delta = visible_stream.feed(payload)
                 if not delta:
                     continue
                 if not text_block_open:
@@ -2090,7 +2236,6 @@ class LocalModelServer:
                         },
                     )
                     text_block_open = True
-                streamed_visible = current_visible
                 yield _json_line(
                     "content_block_delta",
                     {
@@ -2106,7 +2251,6 @@ class LocalModelServer:
 
             if kind == "result":
                 result = payload
-                full_text = result["text"]
                 continue
 
             if kind == "error":
@@ -2138,7 +2282,34 @@ class LocalModelServer:
             )
             return
 
-        content_blocks = _build_anthropic_content_blocks(full_text)
+        final_delta = visible_stream.feed("", final=True)
+        if final_delta:
+            if not text_block_open:
+                yield _json_line(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "text",
+                            "text": "",
+                        },
+                    },
+                )
+                text_block_open = True
+            yield _json_line(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": final_delta,
+                    },
+                },
+            )
+
+        content_blocks = _build_anthropic_content_blocks(result["text"])
         stop_reason = _anthropic_stop_reason(result, content_blocks)
 
         next_index = 0

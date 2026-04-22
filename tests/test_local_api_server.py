@@ -244,6 +244,42 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn('"finish_reason": "stop"', events)
         self.assertTrue(events.rstrip().endswith("data: [DONE]"))
 
+    def test_incremental_visible_text_stream_matches_full_visible_output(self):
+        stream = local_api_server._IncrementalVisibleTextStream(strip_edges=False)
+        chunks = [
+            "  <thi",
+            "nk>hidden</think>He",
+            "llo<tool_",
+            'call>{"name":"write_file"',
+            '}</tool_call> world<|im_',
+            "end|>",
+        ]
+
+        emitted = "".join(stream.feed(chunk) for chunk in chunks)
+        emitted += stream.feed("", final=True)
+
+        self.assertEqual(
+            emitted,
+            local_api_server._extract_visible_text("".join(chunks)),
+        )
+
+    def test_incremental_visible_text_stream_matches_chat_strip_behavior(self):
+        stream = local_api_server._IncrementalVisibleTextStream(strip_edges=True)
+        chunks = [
+            "  Hello",
+            " ",
+            "<think>hidden</think>",
+            "world  ",
+        ]
+
+        emitted = "".join(stream.feed(chunk) for chunk in chunks)
+        emitted += stream.feed("", final=True)
+
+        self.assertEqual(
+            emitted,
+            local_api_server._clean_output_text(local_api_server._extract_visible_text("".join(chunks))),
+        )
+
     def test_parse_keep_alive_accepts_five_minutes(self):
         self.assertEqual(local_api_server._parse_keep_alive("5m"), 300.0)
 
@@ -465,6 +501,36 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertEqual(source, "global")
         self.assertEqual(selected, global_state)
+
+    def test_prune_global_prefix_states_also_prunes_stable_prefix_tokens(self):
+        server = self._make_server()
+        server.global_prefix_cache_limit = 1
+        server._global_prefix_states = {
+            "stale": local_api_server.PromptPrefillState(
+                prompt_tokens=(1, 2),
+                target_cache=["stale-cache"],
+                hidden="stale-hidden",
+                last_logits="stale-logits",
+            ),
+            "fresh": local_api_server.PromptPrefillState(
+                prompt_tokens=(1, 2, 3),
+                target_cache=["fresh-cache"],
+                hidden="fresh-hidden",
+                last_logits="fresh-logits",
+            ),
+        }
+        server._global_prefix_order.extend(["stale", "fresh"])
+        server._stable_prefix_tokens_by_key = {
+            "stale": (1, 2),
+            "fresh": (1, 2, 3),
+        }
+
+        server._prune_global_prefix_states_locked()
+
+        self.assertNotIn("stale", server._global_prefix_states)
+        self.assertNotIn("stale", server._stable_prefix_tokens_by_key)
+        self.assertIn("fresh", server._global_prefix_states)
+        self.assertIn("fresh", server._stable_prefix_tokens_by_key)
 
 
 if __name__ == "__main__":

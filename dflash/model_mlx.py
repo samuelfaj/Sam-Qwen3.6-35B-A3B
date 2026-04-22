@@ -520,6 +520,7 @@ def _make_response(
     acceptance_ratios=(),
     block_size_history=(),
     adaptive_block_size=False,
+    snapshot_histories=True,
 ):
     decode_seconds = max(time.perf_counter() - tic, 1e-9)
     generation_tps = n / decode_seconds
@@ -546,9 +547,9 @@ def _make_response(
         accepted_tokens=accepted_tokens,
         avg_acceptance_length=avg_acceptance_length,
         avg_acceptance_ratio=avg_acceptance_ratio,
-        acceptance_lengths=tuple(acceptance_lengths),
-        acceptance_ratios=tuple(acceptance_ratios),
-        block_size_history=tuple(block_size_history),
+        acceptance_lengths=tuple(acceptance_lengths) if snapshot_histories else (),
+        acceptance_ratios=tuple(acceptance_ratios) if snapshot_histories else (),
+        block_size_history=tuple(block_size_history) if snapshot_histories else (),
         adaptive_block_size=adaptive_block_size,
         finish_reason=finish_reason,
         prefill_state=prefill_state,
@@ -569,11 +570,20 @@ def tokenize_prompt(tokenizer, prompt):
     return mx.array(prompt)
 
 
+def clone_prefill_state_for_reuse(prefill_state: PromptPrefillState) -> PromptPrefillState:
+    return PromptPrefillState(
+        prompt_tokens=tuple(prefill_state.prompt_tokens),
+        target_cache=copy.deepcopy(prefill_state.target_cache),
+        hidden=prefill_state.hidden,
+        last_logits=prefill_state.last_logits,
+    )
+
+
 def _snapshot_prefill_state(prompt_tokens, target_cache, hidden, logits):
     return PromptPrefillState(
         prompt_tokens=tuple(prompt_tokens),
         target_cache=copy.deepcopy(target_cache),
-        hidden=copy.deepcopy(hidden),
+        hidden=hidden,
         last_logits=None if logits is None else copy.deepcopy(logits[:, -1:]),
     )
 
@@ -588,7 +598,7 @@ def derive_prefill_prefix_state(
     if prefix_length > total_tokens:
         raise ValueError(f"prefix_length={prefix_length} exceeds prompt length={total_tokens}")
     if prefix_length == total_tokens:
-        return copy.deepcopy(prefill_state)
+        return clone_prefill_state_for_reuse(prefill_state)
 
     target_cache = copy.deepcopy(prefill_state.target_cache)
     if not can_trim_prompt_cache(target_cache):
@@ -618,7 +628,7 @@ def _match_reusable_prefix(
         return None, 0
     if cached_len == len(prompt_tokens) and prefix_state.last_logits is None:
         return None, 0
-    return copy.deepcopy(prefix_state), cached_len
+    return clone_prefill_state_for_reuse(prefix_state), cached_len
 
 
 def prefill_prompt(
@@ -681,6 +691,15 @@ def prefill_prompt(
 
 def _clamp_block_size(value: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
+
+
+def _acceptance_prefix_length(draft_tokens: mx.array, target_tokens: mx.array) -> int:
+    if draft_tokens.shape[-1] == 0:
+        return 0
+    matches = (draft_tokens[0] == target_tokens[0, :-1]).astype(mx.int32)
+    accepted = mx.sum(mx.cumprod(matches, axis=0))
+    mx.eval(accepted)
+    return int(accepted.item())
 
 
 def next_adaptive_block_size(
@@ -792,6 +811,7 @@ def stream_generate(
                 acceptance_ratios=(),
                 block_size_history=(),
                 adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+                snapshot_histories=True,
             )
             return
 
@@ -814,6 +834,7 @@ def stream_generate(
             acceptance_ratios=acceptance_ratios,
             block_size_history=proposal_history,
             adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+            snapshot_histories=False,
         )
 
         while n < max_tokens:
@@ -842,9 +863,9 @@ def stream_generate(
                 target_tokens = sampler(logits)
             mx.async_eval(target_tokens, hidden)
 
-            d_list, t_list = draft_tokens[0].tolist(), target_tokens[0].tolist()
-            accepted = next((i for i in range(len(d_list)) if d_list[i] != t_list[i]), len(d_list))
-            new_tokens = d_list[:accepted] + [t_list[accepted]]
+            accepted = _acceptance_prefix_length(draft_tokens, target_tokens)
+            accepted_prefix = draft_tokens[0, :accepted].tolist() if accepted > 0 else []
+            new_tokens = accepted_prefix + [int(target_tokens[0, accepted].item())]
             new_tokens = new_tokens[:max_tokens - n]
             accepted_length = len(new_tokens)
             speculative_steps += 1
@@ -880,6 +901,7 @@ def stream_generate(
                     acceptance_ratios=acceptance_ratios,
                     block_size_history=proposal_history,
                     adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+                    snapshot_histories=True,
                 )
                 return
 
@@ -906,6 +928,7 @@ def stream_generate(
                 acceptance_ratios=acceptance_ratios,
                 block_size_history=proposal_history,
                 adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+                snapshot_histories=False,
             )
 
             trim = bs - accepted - 1
@@ -942,6 +965,7 @@ def stream_generate(
             acceptance_ratios=acceptance_ratios,
             block_size_history=proposal_history,
             adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+            snapshot_histories=True,
         )
     finally:
         if _capture is not None:
