@@ -171,6 +171,8 @@ For long-running agent sessions, use the `dflash.sh` helper, which runs the serv
 
 The `opencode` and `codex` subcommands wrap `run_opencode_local.sh` and `run_codex_local.sh` respectively. Any extra arguments are forwarded, so you can do things like `./scripts/dflash.sh opencode run --print-logs "..."` or `./scripts/dflash.sh codex exec "..."`.
 
+The background service is supervised. If the underlying MLX/Metal process aborts, `dflash.sh start` now keeps a lightweight shell supervisor alive and restarts the wrapper automatically after a short delay.
+
 Paths used:
 
 - PID file: `.dflash.pid` at the repo root
@@ -267,25 +269,31 @@ One of the main changes in this fork is that the model should not remain loaded 
 Default memory policy:
 
 - preload on startup: `off`
-- keep-alive after request: `0`
-- unload as soon as the request finishes
+- keep-alive after request: `300`
+- unload after `5 minutes` idle
 
 That means:
 
 - memory is allocated when a request needs the model
-- memory is released when the request is done
+- the API can stay online while the model is unloaded
+- the model stays warm briefly after each request
+- memory is released again after about five minutes with no traffic
 - idle RAM pressure is drastically lower than an always-loaded setup like Ollama-style serving
 
 Relevant environment variables:
 
 ```bash
-export LOCAL_DFLASH_KEEP_ALIVE=0
+export LOCAL_DFLASH_KEEP_ALIVE=300
 export LOCAL_DFLASH_NO_PRELOAD=1
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
 export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
 ```
 
-If you want the model to remain warm for a short period after each request, set a positive keep-alive value:
+With these defaults, `/health` continues to respond even after the model unloads, and the next generation request reloads it automatically.
+
+If you launch OpenCode through `scripts/run_opencode_local.sh`, the script also checks `/health` before starting the client and auto-restarts the local wrapper when the API is down.
+
+If you want a different warm window after each request, set a positive keep-alive value:
 
 ```bash
 export LOCAL_DFLASH_KEEP_ALIVE=60
@@ -304,7 +312,7 @@ export LOCAL_DFLASH_DISABLE_THINKING=1
 export LOCAL_DFLASH_MAX_TOKENS=8192
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
 export LOCAL_DFLASH_CONTEXT_WINDOW=65536
-export LOCAL_DFLASH_KEEP_ALIVE=0
+export LOCAL_DFLASH_KEEP_ALIVE=300
 export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=2
 export LOCAL_DFLASH_TURBOQUANT_BITS=4
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=

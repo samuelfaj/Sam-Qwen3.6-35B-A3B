@@ -58,7 +58,7 @@ cmd_start() {
     return 0
   fi
   echo "dflash: starting, logging to ${LOG_FILE}"
-  nohup "${SCRIPT_DIR}/start_local_wrapper.sh" "$@" >"${LOG_FILE}" 2>&1 &
+  nohup "${SCRIPT_DIR}/start_local_wrapper_supervised.sh" "$@" >"${LOG_FILE}" 2>&1 &
   local new_pid=$!
   echo "${new_pid}" > "${PID_FILE}"
   disown "${new_pid}" 2>/dev/null || true

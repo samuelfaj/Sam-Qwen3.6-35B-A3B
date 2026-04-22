@@ -180,6 +180,11 @@ def _json_line(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {body}\n\n"
 
 
+def _data_line(payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, ensure_ascii=False)
+    return f"data: {body}\n\n"
+
+
 def _done_line() -> str:
     return "data: [DONE]\n\n"
 
@@ -1220,6 +1225,136 @@ class LocalModelServer:
         self.finish_request(keep_alive_override)
         return result
 
+    def stream_chat_completions(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        keep_alive_override: Any = None,
+    ) -> Iterator[str]:
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        event_queue: Queue = Queue()
+        worker = Thread(
+            target=self._generation_worker,
+            args=(event_queue, messages, max_tokens, temperature, None, keep_alive_override),
+            daemon=True,
+        )
+        worker.start()
+
+        full_text = ""
+        streamed_visible = ""
+        emitted_role = False
+        result: dict[str, Any] | None = None
+        done = False
+
+        while not done:
+            try:
+                kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
+            except Empty:
+                yield _comment_line()
+                continue
+
+            if kind == "text":
+                full_text += payload
+                current_visible = _clean_output_text(_extract_visible_text(full_text))
+                if current_visible.startswith(streamed_visible):
+                    delta = current_visible[len(streamed_visible):]
+                else:
+                    delta = current_visible
+                if not delta:
+                    continue
+
+                streamed_visible = current_visible
+                chunk_delta: dict[str, Any] = {"content": delta}
+                if not emitted_role:
+                    chunk_delta = {"role": "assistant", "content": delta}
+                    emitted_role = True
+
+                yield _data_line(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": self.model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": chunk_delta,
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                continue
+
+            if kind == "result":
+                result = payload
+                full_text = result["text"]
+                continue
+
+            if kind == "error":
+                yield _data_line(
+                    {
+                        "error": {
+                            "message": payload,
+                        }
+                    }
+                )
+                yield _done_line()
+                return
+
+            if kind == "done":
+                done = True
+
+        if result is None:
+            yield _data_line(
+                {
+                    "error": {
+                        "message": "Generation completed without a final result",
+                    }
+                }
+            )
+            yield _done_line()
+            return
+
+        if not emitted_role:
+            yield _data_line(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": "",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+
+        yield _data_line(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": self.model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": result["finish_reason"],
+                    }
+                ],
+            }
+        )
+        yield _done_line()
+
     def stream_response_events(
         self,
         messages: list[dict[str, Any]],
@@ -1831,7 +1966,23 @@ def create_app(server: LocalModelServer) -> FastAPI:
     @app.post("/v1/chat/completions")
     def chat_completions(req: OpenAIChatRequest) -> dict[str, Any]:
         if req.stream:
-            raise HTTPException(status_code=400, detail="Chat Completions streaming is not implemented")
+            if req.model != server.model_name:
+                raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
+            max_tokens = req.max_completion_tokens or req.max_tokens or 512
+            return StreamingResponse(
+                server.stream_chat_completions(
+                    [m.model_dump() for m in req.messages],
+                    max_tokens,
+                    req.temperature,
+                    keep_alive_override=req.keep_alive,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         if req.model != server.model_name:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
