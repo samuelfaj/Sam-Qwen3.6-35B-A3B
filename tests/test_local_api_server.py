@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
 from types import SimpleNamespace
 import unittest
 from pathlib import Path
@@ -369,6 +370,8 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(before["keep_alive_seconds"], 300)
         self.assertEqual(before["response_history_limit"], server.response_history_limit)
         self.assertEqual(before["response_history_entries"], 0)
+        self.assertEqual(before["active_generation_requests"], 0)
+        self.assertEqual(before["queued_generation_requests"], 0)
 
     def test_remember_response_keeps_only_recent_prefix_cache_states(self):
         server = self._make_server()
@@ -435,6 +438,37 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(tokens, ())
         self.assertEqual(server._stable_prefix_tokens_by_key, {})
         build_prompt_mock.assert_not_called()
+
+    def test_generation_requests_wait_in_fifo_order(self):
+        server = self._make_server()
+        first_ticket = server._acquire_generation_turn()
+        self.assertEqual(server._active_generation_ticket, first_ticket)
+        self.assertEqual(len(server._queued_generation_tickets), 0)
+
+        second_ticket_holder = {}
+        second_acquired = threading.Event()
+
+        def acquire_second() -> None:
+            second_ticket_holder["ticket"] = server._acquire_generation_turn()
+            second_acquired.set()
+
+        worker = threading.Thread(target=acquire_second, daemon=True)
+        worker.start()
+
+        self.assertFalse(second_acquired.wait(0.05))
+        self.assertEqual(len(server._queued_generation_tickets), 1)
+        self.assertEqual(server._queued_generation_tickets[0], first_ticket + 1)
+
+        server._release_generation_turn(first_ticket)
+
+        self.assertTrue(second_acquired.wait(1.0))
+        self.assertEqual(server._active_generation_ticket, second_ticket_holder["ticket"])
+        self.assertEqual(len(server._queued_generation_tickets), 0)
+
+        server._release_generation_turn(second_ticket_holder["ticket"])
+        worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(server._active_generation_ticket)
 
     def test_generate_reuses_previous_response_prefix_cache(self):
         server = self._make_server(TrackingServer)

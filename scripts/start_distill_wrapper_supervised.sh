@@ -13,7 +13,7 @@ forward_stop() {
   fi
 }
 
-trap forward_stop INT TERM HUP
+trap forward_stop INT TERM
 
 while true; do
   "${SCRIPT_DIR}/start_distill_wrapper.sh" "$@" &

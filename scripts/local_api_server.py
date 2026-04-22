@@ -11,7 +11,7 @@ from queue import Empty, Queue
 import re
 import time
 import uuid
-from threading import RLock, Thread, Timer
+from threading import Condition, RLock, Thread, Timer
 from typing import Any, Iterator, Literal
 
 import mlx.core as mx
@@ -1106,11 +1106,34 @@ class LocalModelServer:
         self._stable_prefix_tokens_by_key: dict[str, tuple[int, ...]] = {}
         self._global_prefix_cache_hits = 0
         self._global_prefix_cache_misses = 0
+        self._generation_turn = Condition()
+        self._next_generation_ticket = 0
+        self._active_generation_ticket: int | None = None
+        self._queued_generation_tickets: deque[int] = deque()
 
     def _clear_hidden_states_locked(self) -> None:
         hidden_states = getattr(self._model, "_hidden_states", None)
         if isinstance(hidden_states, list):
             hidden_states[:] = [None] * len(hidden_states)
+
+    def _acquire_generation_turn(self) -> int:
+        with self._generation_turn:
+            ticket = self._next_generation_ticket
+            self._next_generation_ticket += 1
+            self._queued_generation_tickets.append(ticket)
+            while self._active_generation_ticket is not None or self._queued_generation_tickets[0] != ticket:
+                self._generation_turn.wait()
+            self._queued_generation_tickets.popleft()
+            self._active_generation_ticket = ticket
+            return ticket
+
+    def _release_generation_turn(self, ticket: int | None) -> None:
+        if ticket is None:
+            return
+        with self._generation_turn:
+            if self._active_generation_ticket == ticket:
+                self._active_generation_ticket = None
+            self._generation_turn.notify_all()
 
     def _clear_request_state_locked(self) -> None:
         self._clear_hidden_states_locked()
@@ -1568,6 +1591,7 @@ class LocalModelServer:
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
     ) -> None:
+        generation_ticket: int | None = None
         text_parts: list[str] = []
         final = None
         prompt_tokens = 0
@@ -1576,6 +1600,7 @@ class LocalModelServer:
         stable_prefix_tokens: tuple[int, ...] = ()
         prefix_cache_source = "none"
         try:
+            generation_ticket = self._acquire_generation_turn()
             with self._lock:
                 iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source = self._stream_generate_locked(
                     messages,
@@ -1629,7 +1654,10 @@ class LocalModelServer:
         except Exception as exc:
             queue.put(("error", str(exc)))
         finally:
-            self.finish_request(keep_alive_override)
+            try:
+                self.finish_request(keep_alive_override)
+            finally:
+                self._release_generation_turn(generation_ticket)
             queue.put(("done", None))
 
     def generate(
@@ -1642,17 +1670,21 @@ class LocalModelServer:
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
     ) -> dict[str, Any]:
-        with self._lock:
-            _, result = self._generate_locked(
-                messages,
-                max_tokens,
-                temperature,
-                tools=tools,
-                previous_response_id=previous_response_id,
-                capture_prompt_cache_state=capture_prompt_cache_state,
-            )
-        self.finish_request(keep_alive_override)
-        return result
+        generation_ticket = self._acquire_generation_turn()
+        try:
+            with self._lock:
+                _, result = self._generate_locked(
+                    messages,
+                    max_tokens,
+                    temperature,
+                    tools=tools,
+                    previous_response_id=previous_response_id,
+                    capture_prompt_cache_state=capture_prompt_cache_state,
+                )
+            self.finish_request(keep_alive_override)
+            return result
+        finally:
+            self._release_generation_turn(generation_ticket)
 
     def stream_chat_completions(
         self,
@@ -2457,6 +2489,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "target_turboquant_bits": server.target_turboquant_bits,
             "response_history_limit": server.response_history_limit,
             "response_history_entries": len(server._response_order),
+            "active_generation_requests": 1 if server._active_generation_ticket is not None else 0,
+            "queued_generation_requests": len(server._queued_generation_tickets),
             "prefix_cache_state_limit": server.prefix_cache_state_limit,
             "prefix_cache_entries": len(server._prefix_state_order),
             "global_prefix_cache_limit": server.global_prefix_cache_limit,

@@ -1,98 +1,61 @@
-# Sam Qwen3.6-35B-A3B
+# DFlash MLX Local Serving Fork
 
-This repository is a practical local-serving fork of `z-lab/dflash`, tuned for an Apple Silicon workflow around:
+This repository is a practical Apple Silicon fork of `z-lab/dflash`.
+
+It is focused on running the MLX path locally with:
 
 - Target model: `mlx-community/Qwen3.6-35B-A3B-4bit`
 - Draft model: `z-lab/Qwen3.6-35B-A3B-DFlash`
 - Backend: `MLX`
-- Primary use case: local agentic coding assistants such as Codex and OpenCode
+- Main use case: local coding agents and tool-using assistants
 
-The goal of this fork is not to be a generic serving stack. It is a stable local setup for running the 35B 4-bit target with DFlash enabled, exposing a local API that feels close to hosted coding models while avoiding unnecessary always-on memory usage.
+The goal is not to be a generic inference stack. The goal is to make the DFlash MLX path usable as a local serving system for real agent workflows, with good streaming behavior, controllable memory usage, and compatibility with Codex, OpenCode, and Distill.
 
-## What Was Added In This Fork
+## What This Fork Adds
 
-Compared with upstream `dflash`, this repo now includes:
+Compared with upstream `dflash`, this fork includes:
 
-- A local MLX API wrapper exposing:
-  - `POST /v1/responses`
-  - `POST /v1/chat/completions`
-  - `POST /v1/messages`
-  - `POST /v1/messages/count_tokens`
-  - `GET /v1/models`
-  - `GET /health`
-- Compatibility wrappers for:
-  - Codex via `scripts/run_codex_local.sh`
-  - OpenCode via `scripts/run_opencode_local.sh`
-  - Distill via `scripts/run_distill_local.sh`
-- A dedicated local launch script:
-  - `scripts/start_local_wrapper.sh`
-  - `scripts/start_distill_wrapper.sh`
-- A direct local test script:
-  - `scripts/test_qwen36_dflash_mlx.py`
-- TurboQuant support for the target-model KV cache in `dflash/model_mlx.py`
-- Support for loading models from either a local directory or Hugging Face repo ID
-- Streaming improvements so clients receive output earlier instead of waiting for the full generation
-- SSE heartbeat comments during long prefills or reasoning pauses so agent clients appear alive while the model is still working
-- Hardened tool-call parsing for multiple formats used by agent frameworks
-- Lazy loading and automatic unload controls so the model does not stay resident in memory when idle
-
-## Current Tuned Profile
-
-The current default profile is optimized for local agentic use, not for benchmarking maximum context length at any cost.
-
-- Base model: `mlx-community/Qwen3.6-35B-A3B-4bit`
-- Draft model: `z-lab/Qwen3.6-35B-A3B-DFlash`
-- DFlash speculative decoding: `ON`
-- Speculative block size: `15`
-- Context window: `65536`
-- Output limit: `8192`
-- Draft sliding window: `4096`
-- Qwen thinking mode: `disabled` by default for faster, cleaner agent behavior
-- TurboQuant target KV cache: `4-bit`
-- Keep-alive: `60`
-- Preload at startup: `disabled`
-- Heartbeat interval while streaming: `2s`
-
-This profile was chosen because it is materially more stable for real local coding-agent use than trying to force a much larger context window such as `256k` on this setup.
-
-## Why This Setup Exists
-
-The main requirements behind this fork were:
-
-- Keep DFlash enabled
-- Run the 35B target in 4-bit mode
-- Preserve strong local quality for coding-agent tasks
-- Make Codex and OpenCode work against the local model with minimal friction
-- Avoid keeping 100+ GB allocated when the model is idle
-- Keep the system agentic: tool calls, long-running turns, streaming, and visible progress
-
-That is why the wrapper is designed to behave more like a serving product and less like a one-off test script.
+- A local OpenAI/Anthropic-style API wrapper in `scripts/local_api_server.py`
+- Compatibility wrappers for Codex, OpenCode, and Distill
+- Background service helpers for the main API and the dedicated Distill API
+- Lazy loading and keep-alive based unload behavior
+- Streaming heartbeats for long prefills and long-running turns
+- Broader tool-call parsing for real agent traffic
+- TurboQuant support for compatible target-model KV cache layers in the MLX path
+- Prefix reuse controls and health metrics for local serving
+- A separate Distill-oriented API profile on its own port
+- Experimental DDTree MLX integration and test entry points
 
 ## Repository Layout
 
 - `dflash/model_mlx.py`
-  - MLX DFlash generation path
-  - local-path-or-Hub loading
-  - TurboQuant KV cache integration for the target model
+  MLX DFlash generation path, model loading, cache management, and TurboQuant integration.
+- `dflash/ddtree_engine.py`
+  Experimental DDTree generation path for MLX.
+- `dflash_mlx/runtime.py`
+  MLX runtime helpers used by the DDTree integration.
 - `scripts/local_api_server.py`
-  - local OpenAI/Anthropic-compatible API wrapper
-  - streaming, heartbeats, tool parsing, lazy load/unload
+  Local HTTP API with OpenAI-style and Anthropic-style endpoints, streaming, health reporting, tool-call parsing, and model lifecycle controls.
 - `scripts/start_local_wrapper.sh`
-  - convenient launcher with the tuned default profile
-- `scripts/start_distill_wrapper.sh`
-  - separate stateless launcher for Distill on its own port
+  Main local API launcher with the default coding-agent profile.
 - `scripts/dflash.sh`
-  - service helper with `start`/`stop`/`restart`/`status`/`kill`/`logs` subcommands
+  Background service helper for the main API.
+- `scripts/start_distill_wrapper.sh`
+  Dedicated Distill API launcher on a separate port.
 - `scripts/dflash_distill.sh`
-  - service helper for the dedicated Distill API
+  Background service helper for the Distill API.
 - `scripts/run_codex_local.sh`
-  - writes a local Codex config and points Codex at this server
+  Writes a local Codex config and points Codex at the main API.
 - `scripts/run_opencode_local.sh`
-  - runs OpenCode against this local model
+  Runs OpenCode against the main API.
 - `scripts/run_distill_local.sh`
-  - runs Distill against the stateless local model API without mutating Distill config
+  Runs Distill against the dedicated Distill API without rewriting Distill's saved config.
 - `scripts/test_qwen36_dflash_mlx.py`
-  - minimal direct MLX test path without the HTTP wrapper
+  Direct MLX DFlash smoke test without the HTTP wrapper.
+- `scripts/test_qwen36_ddtree_mlx.py`
+  Direct MLX DDTree smoke test.
+- `scripts/sweep_block_size.py`
+  Replay and tuning utility for speculative block size experiments.
 
 ## Installation
 
@@ -108,9 +71,9 @@ pip install -U pip
 pip install -e ".[mlx]"
 ```
 
-The MLX extra in this fork also installs `mlx-turboquant`.
+The `mlx` extra in this fork also installs `mlx-turboquant`.
 
-## Download The Models
+## Model Download
 
 Example using local directories:
 
@@ -122,21 +85,21 @@ huggingface-cli download z-lab/Qwen3.6-35B-A3B-DFlash \
   --local-dir ~/models/Qwen3.6-35B-A3B-DFlash
 ```
 
-The launcher scripts default to the following paths:
+The launcher scripts default to:
 
 - Base model: `/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit`
 - Draft model: `/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-DFlash`
 
-Override them with environment variables if your paths differ:
+If your model paths differ, override them with environment variables:
 
 ```bash
 export LOCAL_DFLASH_MODEL_PATH=~/models/Qwen3.6-35B-A3B-4bit
 export LOCAL_DFLASH_DRAFT_PATH=~/models/Qwen3.6-35B-A3B-DFlash
 ```
 
-## Quick Local MLX Test
+## Quick MLX Tests
 
-This bypasses the HTTP server and tests direct MLX generation:
+Direct DFlash MLX test:
 
 ```bash
 python scripts/test_qwen36_dflash_mlx.py \
@@ -145,56 +108,73 @@ python scripts/test_qwen36_dflash_mlx.py \
   --target-turboquant-bits 4
 ```
 
-Useful flags:
+Direct DDTree MLX test:
 
-- `--prompt "..."` to change the input
-- `--max-tokens 256` to cap generation
-- `--sliding-window-size 4096` to limit draft KV growth
-- `--target-turboquant-bits 0` to disable TurboQuant for comparison
+```bash
+python scripts/test_qwen36_ddtree_mlx.py \
+  --disable-thinking \
+  --tree-budget 4 \
+  --target-turboquant-bits 4
+```
 
-## Start The Local API Server
+## Main Local API
 
-Foreground (logs in the terminal, Ctrl+C to stop):
+Start the main API in the foreground:
 
 ```bash
 ./scripts/start_local_wrapper.sh
 ```
 
-The wrapper exposes a local server on `127.0.0.1:8010` by default.
+Default endpoint:
 
-### Managing The Server As A Background Service
-
-For long-running agent sessions, use the `dflash.sh` helper, which runs the server in the background, tracks the PID, and waits for `/health` to be ready:
-
-```bash
-./scripts/dflash.sh start      # start in background, wait for /health (up to 120s)
-./scripts/dflash.sh status     # check running process + /health
-./scripts/dflash.sh logs       # tail -f dflash.log
-./scripts/dflash.sh stop       # graceful SIGTERM, wait up to 30s
-./scripts/dflash.sh restart    # stop then start
-./scripts/dflash.sh kill       # SIGKILL the process group, clear port squatters
-./scripts/dflash.sh opencode   # launch OpenCode against the local server
-./scripts/dflash.sh codex      # launch Codex against the local server
+```text
+http://127.0.0.1:8010
 ```
 
-The `opencode` and `codex` subcommands wrap `run_opencode_local.sh` and `run_codex_local.sh` respectively. Any extra arguments are forwarded, so you can do things like `./scripts/dflash.sh opencode run --print-logs "..."` or `./scripts/dflash.sh codex exec "..."`.
+### Main API Default Profile
 
-The background service is supervised. If the underlying MLX/Metal process aborts, `dflash.sh start` now keeps a lightweight shell supervisor alive and restarts the wrapper automatically after a short delay.
+- Model name: `qwen3.6-35b-a3b-dflash-local`
+- Port: `8010`
+- Block size: `10`
+- Adaptive block size: enabled
+- Draft sliding window: `4096`
+- Context window: `65536`
+- Max output tokens limit: `32768`
+- Thinking mode: disabled
+- TurboQuant target KV: `4`
+- Keep-alive: `60s`
+- Preload on startup: disabled
+- Response history limit: `1024`
+- Response prefix cache limit: `2`
+- Global prefix cache limit: `16`
 
-Paths used:
+### Main API Service Helper
 
-- PID file: `.dflash.pid` at the repo root
-- Log file: `dflash.log` at the repo root
+Use the background helper for longer sessions:
 
-Any extra arguments after `start` or `restart` are forwarded to `start_local_wrapper.sh` (and from there to `local_api_server.py`).
+```bash
+./scripts/dflash.sh start
+./scripts/dflash.sh status
+./scripts/dflash.sh logs
+./scripts/dflash.sh stop
+./scripts/dflash.sh restart
+./scripts/dflash.sh kill
+```
 
-Health check directly:
+The helper stores:
+
+- PID file: `.dflash.pid`
+- Log file: `dflash.log`
+
+Any extra arguments after `start` or `restart` are forwarded to `scripts/start_local_wrapper.sh`, and then to `scripts/local_api_server.py`.
+
+### Main API Health Check
 
 ```bash
 curl http://127.0.0.1:8010/health
 ```
 
-Typical health response fields include:
+Typical health fields include:
 
 - `loaded`
 - `context_window`
@@ -202,32 +182,49 @@ Typical health response fields include:
 - `disable_thinking`
 - `keep_alive_seconds`
 - `response_history_limit`
+- `response_history_entries`
+- `prefix_cache_state_limit`
+- `global_prefix_cache_limit`
+- `active_generation_requests`
+- `queued_generation_requests`
 - `stream_heartbeat_seconds`
 - `target_turboquant_bits`
 - `active_memory_gb`
 - `cache_memory_gb`
 - `peak_memory_gb`
 
-## Start The Distill API
+## Dedicated Distill API
 
-Foreground (logs in the terminal, Ctrl+C to stop):
+This repository also includes a separate API profile for Distill on its own port.
+
+Start it in the foreground:
 
 ```bash
 ./scripts/start_distill_wrapper.sh
 ```
 
-The Distill-only API is separate from the main local API and listens on `127.0.0.1:8011` by default.
+Default endpoint:
 
-Its default profile is intentionally stateless between requests:
+```text
+http://127.0.0.1:8011
+```
 
-- context window: `8192`
-- keep-alive after request: `0`
-- response history limit: `0`
-- response prefix cache limit: `0`
-- global prefix cache limit: `0`
+### Distill API Default Profile
+
+- Model name: `qwen3.6-35b-a3b-dflash-distill-local`
+- Port: `8011`
+- Context window: `8192`
+- Keep-alive: `30s`
+- Single active generation with FIFO queueing
+- Response history limit: `0`
+- Response prefix cache limit: `0`
+- Global prefix cache limit: `0`
 - MLX allocator cache limit: `0`
+- Preload on startup: disabled
 
-Background service commands:
+This profile is designed for fast repeated Distill calls with a single warm model instance and no conversation memory or reusable request cache between requests.
+
+### Distill API Service Helper
 
 ```bash
 ./scripts/dflash_distill.sh start
@@ -235,37 +232,51 @@ Background service commands:
 ./scripts/dflash_distill.sh logs
 ./scripts/dflash_distill.sh stop
 ./scripts/dflash_distill.sh restart
-./scripts/dflash_distill.sh distill "Summarize this build log"
+./scripts/dflash_distill.sh kill
 ```
 
-The Distill launcher passes `--provider dflash --model ... --host http://127.0.0.1:8011/v1` directly to `distill`, so it does not modify Distill's saved config.
+The helper stores:
 
-Health check directly:
+- PID file: `.dflash-distill.pid`
+- Log file: `dflash-distill.log`
+
+### Distill API Health Check
 
 ```bash
 curl http://127.0.0.1:8011/health
 ```
 
-## Run With Codex
+The same health endpoint also exposes:
+
+- `active_generation_requests`
+- `queued_generation_requests`
+
+Those fields are useful for confirming that the Distill API is queueing work instead of loading multiple model instances.
+
+## Client Wrappers
+
+### Codex
+
+Run Codex against the main API:
 
 ```bash
 ./scripts/run_codex_local.sh
 ```
 
-This script writes a local `config.toml` for Codex and points it at:
+This script writes a local Codex `config.toml` pointing at:
 
-- provider name: `localdflash`
-- base URL: `http://127.0.0.1:8010/v1`
-- wire API: `responses`
+- Provider name: `localdflash`
+- Base URL: `http://127.0.0.1:8010/v1`
+- Wire API: `responses`
 
-The Codex wrapper is configured for:
+It also sets:
 
 - `approval_policy = "never"`
 - `sandbox_mode = "danger-full-access"`
-- no reasoning summary requirement
-- long stream idle timeout for agentic turns
+- `model_reasoning_summary = "none"`
+- `stream_idle_timeout_ms = 600000`
 
-## Run With OpenCode
+### OpenCode
 
 Interactive mode:
 
@@ -276,129 +287,170 @@ Interactive mode:
 One-shot mode:
 
 ```bash
-./scripts/run_opencode_local.sh run --print-logs --format json --dir /tmp/test-run "Build a calculator in html, css, and js."
+./scripts/run_opencode_local.sh run --print-logs --format json --dir /tmp/test-run "Build a calculator in HTML, CSS, and JS."
 ```
 
-This fork was tuned specifically so OpenCode behaves in a more agentic way:
+The wrapper auto-checks `/health` and can restart the main API if needed.
 
-- tool calls are parsed more reliably
-- streaming starts earlier
-- heartbeat events make the run feel active during heavy prefills
-- the wrapper stays compatible with long tool-heavy turns
+### Distill
 
-## API Compatibility Notes
+Wrapper-based usage:
 
-The local wrapper is meant to make local MLX serving usable by real agent clients, not only by simple text-generation demos.
+```bash
+./scripts/run_distill_local.sh "Summarize this build log"
+```
 
-Supported API surfaces:
+Or through the service helper:
 
-- OpenAI-style chat completions
-- OpenAI-style responses API
-- Anthropic-style messages API
-- tool calling
-- streaming
-- token counting for Anthropic-compatible clients
+```bash
+./scripts/dflash_distill.sh distill "Summarize this build log"
+```
 
-Tool-call parsing was expanded beyond a single XML format and now accepts multiple patterns commonly produced by agent frameworks, including:
+The Distill wrapper passes:
 
-- XML-style function blocks
-- tagged JSON payloads
-- tagged tool-call lists
-- fenced tool-call blocks
-- payloads with keys such as `function`, `tool_calls`, `function_calls`, `input`, `parameters`, `tool_use`, and `recipient_name`
+- `--provider dflash`
+- `--model qwen3.6-35b-a3b-dflash-distill-local`
+- `--host http://127.0.0.1:8011/v1`
 
-The Responses API wrapper also keeps an in-process response history so clients that send `previous_response_id` plus incremental tool outputs can continue multi-step agent loops without replaying the full transcript on every turn.
+This avoids mutating Distill's saved config.
+
+## Supported API Surfaces
+
+The local API is intended to be usable by real agent clients, not just one-shot demos.
+
+Supported surfaces:
+
+- `POST /v1/responses`
+- `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
+- `GET /v1/models`
+- `GET /health`
+
+Supported behavior:
+
+- Streaming
+- Tool calling
+- OpenAI-style Responses API
+- OpenAI-style Chat Completions API
+- Anthropic-style Messages API
+- Anthropic token counting
+
+Tool-call parsing was expanded to tolerate multiple patterns commonly emitted by agent clients, including XML-style blocks, tagged JSON payloads, fenced blocks, and several common key variants.
 
 ## Memory Behavior
 
-One of the main changes in this fork is that the model should not remain loaded forever unless you explicitly want that behavior.
+One of the main goals of this fork is to avoid permanently pinning model memory unless that is explicitly desired.
 
-Default memory policy:
+Main API default memory policy:
 
-- preload on startup: `off`
-- keep-alive after request: `60`
-- unload after `1 minute` idle
+- Preload on startup: off
+- Keep-alive after request: `60s`
+- Unload after about one minute of inactivity
+
+Distill API default memory policy:
+
+- Preload on startup: off
+- Keep-alive after request: `30s`
+- One loaded model instance at a time
+- No response history or prefix cache reuse
 
 That means:
 
-- memory is allocated when a request needs the model
-- the API can stay online while the model is unloaded
-- the model stays warm briefly after each request
-- memory is released again after about one minute with no traffic
-- idle RAM pressure is drastically lower than an always-loaded setup like Ollama-style serving
+- The HTTP server can stay online even when the model is unloaded
+- The next generation request can reload the model automatically
+- You can keep a warm model briefly without keeping conversation state
+- The Distill API can queue requests while reusing a single warm model instance
 
-Relevant environment variables:
-
-```bash
-export LOCAL_DFLASH_KEEP_ALIVE=60
-export LOCAL_DFLASH_NO_PRELOAD=1
-export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
-export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
-```
-
-With these defaults, `/health` continues to respond even after the model unloads, and the next generation request reloads it automatically.
-
-If you launch OpenCode through `scripts/run_opencode_local.sh`, the script also checks `/health` before starting the client and auto-restarts the local wrapper when the API is down.
-
-If you want a different warm window after each request, set a positive keep-alive value:
+If you want a strict MLX-side memory ceiling, set:
 
 ```bash
-export LOCAL_DFLASH_KEEP_ALIVE=30
+export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=20
 ```
 
-## Tuning Knobs
+For the Distill API only:
 
-The main configuration knobs exposed by `scripts/start_local_wrapper.sh` are:
+```bash
+export LOCAL_DFLASH_DISTILL_MLX_MEMORY_LIMIT_GB=20
+```
+
+## Configuration Knobs
+
+Main API launcher defaults from `scripts/start_local_wrapper.sh`:
 
 ```bash
 export LOCAL_DFLASH_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-4bit
 export LOCAL_DFLASH_DRAFT_PATH=/path/to/Qwen3.6-35B-A3B-DFlash
-export LOCAL_DFLASH_BLOCK_SIZE=15
+export LOCAL_DFLASH_MODEL_NAME=qwen3.6-35b-a3b-dflash-local
+export LOCAL_DFLASH_HOST=127.0.0.1
+export LOCAL_DFLASH_PORT=8010
+export LOCAL_DFLASH_BLOCK_SIZE=10
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE=1
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN=8
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX=18
 export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=4096
 export LOCAL_DFLASH_DISABLE_THINKING=1
-export LOCAL_DFLASH_MAX_TOKENS=8192
+export LOCAL_DFLASH_MAX_TOKENS=32768
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
 export LOCAL_DFLASH_CONTEXT_WINDOW=65536
 export LOCAL_DFLASH_KEEP_ALIVE=60
 export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=2
 export LOCAL_DFLASH_TURBOQUANT_BITS=4
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
-export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
+export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=
 export LOCAL_DFLASH_NO_PRELOAD=1
 export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=1024
+export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=2
+export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=16
 ```
 
-## TurboQuant
-
-This fork adds TurboQuant KV cache support for the target model in the MLX path.
-
-What changed:
-
-- target prompt cache creation can replace compatible KV layers with TurboQuant-backed caches
-- the bit width is configurable
-- returned keys and values are cast back to the original dtype for stability
-
-Current default:
-
-- `LOCAL_DFLASH_TURBOQUANT_BITS=4`
-
-To disable TurboQuant:
+Distill API launcher defaults from `scripts/start_distill_wrapper.sh`:
 
 ```bash
-export LOCAL_DFLASH_TURBOQUANT_BITS=0
+export LOCAL_DFLASH_DISTILL_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-4bit
+export LOCAL_DFLASH_DISTILL_DRAFT_PATH=/path/to/Qwen3.6-35B-A3B-DFlash
+export LOCAL_DFLASH_DISTILL_MODEL_NAME=qwen3.6-35b-a3b-dflash-distill-local
+export LOCAL_DFLASH_DISTILL_HOST=127.0.0.1
+export LOCAL_DFLASH_DISTILL_PORT=8011
+export LOCAL_DFLASH_DISTILL_CONTEXT_WINDOW=8192
+export LOCAL_DFLASH_DISTILL_KEEP_ALIVE=30
+export LOCAL_DFLASH_DISTILL_NO_PRELOAD=1
+export LOCAL_DFLASH_DISTILL_RESPONSE_HISTORY_LIMIT=0
+export LOCAL_DFLASH_DISTILL_PREFIX_CACHE_STATE_LIMIT=0
+export LOCAL_DFLASH_DISTILL_GLOBAL_PREFIX_CACHE_LIMIT=0
+export LOCAL_DFLASH_DISTILL_MLX_CACHE_LIMIT_GB=0
 ```
 
-## Notes On Context Length
+## Tuning Notes
 
-The wrapper is currently tuned to `64k` context by default.
+The main local profile is tuned for practical coding-agent use, not for maximum advertised context size.
 
-That was an intentional choice. For this local MLX setup, forcing much larger contexts can increase latency, memory pressure, and instability without producing a better agent experience. If you want to experiment, you can raise:
+Important levers:
+
+- `LOCAL_DFLASH_BLOCK_SIZE`
+- `LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE`
+- `LOCAL_DFLASH_SLIDING_WINDOW_SIZE`
+- `LOCAL_DFLASH_TURBOQUANT_BITS`
+- `LOCAL_DFLASH_CONTEXT_WINDOW`
+- `LOCAL_DFLASH_KEEP_ALIVE`
+
+For replay-based speculative tuning, use:
 
 ```bash
-export LOCAL_DFLASH_CONTEXT_WINDOW=131072
+python scripts/sweep_block_size.py --help
 ```
 
-But the default `65536` is the balanced profile that was selected for actual local coding-agent use.
+## Experimental DDTree Path
+
+This repo now includes an experimental DDTree MLX path:
+
+- Core engine: `dflash/ddtree_engine.py`
+- Runtime helpers: `dflash_mlx/runtime.py`
+- Direct test entry point: `scripts/test_qwen36_ddtree_mlx.py`
+
+The DDTree path currently expects a compatible `ddtree-mlx` environment. If that package is missing, `dflash/ddtree_engine.py` raises a runtime error with an explicit install hint.
+
+This path is experimental and separate from the HTTP serving wrappers documented above.
 
 ## Upstream
 
@@ -406,13 +458,13 @@ This repository is based on:
 
 - Upstream project: `https://github.com/z-lab/dflash`
 - DFlash paper: `https://arxiv.org/abs/2602.06036`
-- DFlash models: `https://huggingface.co/collections/z-lab/dflash`
+- DFlash model collection: `https://huggingface.co/collections/z-lab/dflash`
 
-The core speculative decoding work belongs to the original DFlash authors. This fork focuses on the Apple Silicon MLX path and the local agent-serving workflow built around it.
+The original speculative decoding research belongs to the DFlash authors. This fork focuses on the MLX path, local serving ergonomics, and Apple Silicon agent workflows.
 
 ## Citation
 
-If you use DFlash in research, cite the original work:
+If you use DFlash in research, cite the original paper:
 
 ```bibtex
 @article{chen2026dflash,
