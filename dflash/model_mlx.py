@@ -1,3 +1,4 @@
+import copy
 import json
 import time
 from dataclasses import dataclass, field
@@ -444,12 +445,44 @@ class GenerationResponse:
     generation_tps: float
     peak_memory: float
     finish_reason: Optional[str] = None
+    prefill_state: Optional["PromptPrefillState"] = None
 
 
-def _make_response(text, tokens, accepted, prompt_size, prompt_tps, n, tic, finish_reason=None):
+@dataclass
+class PromptPrefillState:
+    prompt_tokens: Tuple[int, ...]
+    target_cache: List[Any]
+    hidden: mx.array
+    last_logits: mx.array
+
+
+def _make_response(text, tokens, accepted, prompt_size, prompt_tps, n, tic, finish_reason=None, prefill_state=None):
     return GenerationResponse(
         text, tokens, accepted, prompt_size, prompt_tps,
-        n, n / (time.perf_counter() - tic), mx.get_peak_memory() / 1e9, finish_reason,
+        n, n / (time.perf_counter() - tic), mx.get_peak_memory() / 1e9, finish_reason, prefill_state,
+    )
+
+
+def tokenize_prompt(tokenizer, prompt):
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    if isinstance(prompt, mx.array):
+        return prompt
+
+    if isinstance(prompt, str):
+        add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
+        prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+
+    return mx.array(prompt)
+
+
+def _snapshot_prefill_state(prompt_tokens, target_cache, hidden, logits):
+    return PromptPrefillState(
+        prompt_tokens=tuple(prompt_tokens),
+        target_cache=copy.deepcopy(target_cache),
+        hidden=copy.deepcopy(hidden),
+        last_logits=copy.deepcopy(logits[:, -1:]),
     )
 
 
@@ -457,6 +490,8 @@ def stream_generate(
     model, draft, tokenizer, prompt,
     block_size=None, max_tokens=256, temperature=0.0, sampler=None,
     target_turboquant_bits: Optional[float] = None,
+    prefix_state: Optional[PromptPrefillState] = None,
+    capture_prefill_state: bool = False,
 ):
     _patch_model(model, draft.config.target_layer_ids)
     block_size = block_size if block_size is not None else int(draft.config.block_size)
@@ -465,17 +500,27 @@ def stream_generate(
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
-    if not isinstance(prompt, mx.array):
-        if isinstance(prompt, str):
-            add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
-            prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-        prompt = mx.array(prompt)
+    prompt = tokenize_prompt(tokenizer, prompt)
+    prompt_tokens = prompt.tolist()
 
     detokenizer = tokenizer.detokenizer
     mask_id = int(draft.config.mask_token_id)
-    tokens = prompt.tolist()
+    tokens = list(prompt_tokens)
 
-    target_cache = _make_target_cache(model, turboquant_bits=target_turboquant_bits)
+    reusable_prefix = None
+    reusable_prefix_tokens = 0
+    if prefix_state is not None:
+        cached_tokens = prefix_state.prompt_tokens
+        cached_len = len(cached_tokens)
+        if cached_len <= len(prompt_tokens) and tuple(prompt_tokens[:cached_len]) == cached_tokens:
+            reusable_prefix = copy.deepcopy(prefix_state)
+            reusable_prefix_tokens = cached_len
+
+    target_cache = (
+        reusable_prefix.target_cache
+        if reusable_prefix is not None
+        else _make_target_cache(model, turboquant_bits=target_turboquant_bits)
+    )
     draft_cache = make_prompt_cache(draft)
     draft.bind(model)
     _target_can_trim = can_trim_prompt_cache(target_cache)
@@ -488,11 +533,28 @@ def stream_generate(
 
     try:
         tic = time.perf_counter()
-        with mx.stream(generation_stream):
-            logits = model(prompt[None], target_cache)
-            hidden = mx.concatenate(model._hidden_states, axis=-1)
-        mx.eval(logits, hidden)
-        prompt_tps = prompt.size / (time.perf_counter() - tic)
+        if reusable_prefix is None:
+            with mx.stream(generation_stream):
+                logits = model(prompt[None], target_cache)
+                hidden = mx.concatenate(model._hidden_states, axis=-1)
+            mx.eval(logits, hidden)
+        elif reusable_prefix_tokens < prompt.size:
+            suffix = prompt[reusable_prefix_tokens:]
+            with mx.stream(generation_stream):
+                logits = model(suffix[None], target_cache)
+                suffix_hidden = mx.concatenate(model._hidden_states, axis=-1)
+            hidden = mx.concatenate([reusable_prefix.hidden, suffix_hidden], axis=1)
+            mx.eval(logits, hidden)
+        else:
+            logits = reusable_prefix.last_logits
+            hidden = reusable_prefix.hidden
+        prefill_elapsed = max(time.perf_counter() - tic, 1e-9)
+        prompt_tps = prompt.size / prefill_elapsed
+        prompt_state = (
+            _snapshot_prefill_state(prompt_tokens, target_cache, hidden, logits)
+            if capture_prefill_state
+            else None
+        )
 
         tic = time.perf_counter()
         token = sampler(logits[:, -1:])[0, 0].item()
@@ -502,11 +564,21 @@ def stream_generate(
         if token in tokenizer.eos_token_ids:
             detokenizer.add_token(token)
             detokenizer.finalize()
-            yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic, "stop")
+            yield _make_response(
+                detokenizer.last_segment,
+                [token],
+                1,
+                prompt.size,
+                prompt_tps,
+                n,
+                tic,
+                "stop",
+                prompt_state,
+            )
             return
 
         detokenizer.add_token(token)
-        yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic)
+        yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic, prefill_state=prompt_state)
 
         while n < max_tokens:
             bs = min(block_size, max_tokens - n + 1)
@@ -546,7 +618,17 @@ def stream_generate(
                 detokenizer.finalize()
                 tokens.extend(new_tokens)
                 n += len(new_tokens)
-                yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic, "stop")
+                yield _make_response(
+                    detokenizer.last_segment,
+                    new_tokens,
+                    accepted + 1,
+                    prompt.size,
+                    prompt_tps,
+                    n,
+                    tic,
+                    "stop",
+                    prompt_state,
+                )
                 return
 
             for t in new_tokens:
@@ -554,7 +636,16 @@ def stream_generate(
             tokens.extend(new_tokens)
             n += len(new_tokens)
 
-            yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic)
+            yield _make_response(
+                detokenizer.last_segment,
+                new_tokens,
+                accepted + 1,
+                prompt.size,
+                prompt_tps,
+                n,
+                tic,
+                prefill_state=prompt_state,
+            )
 
             trim = bs - accepted - 1
             if trim > 0:
@@ -565,7 +656,7 @@ def stream_generate(
             hidden = hidden[:, :accepted + 1, :]
 
         detokenizer.finalize()
-        yield _make_response(detokenizer.last_segment, [], 0, prompt.size, prompt_tps, n, tic, "length")
+        yield _make_response(detokenizer.last_segment, [], 0, prompt.size, prompt_tps, n, tic, "length", prompt_state)
     finally:
         if _capture is not None:
             _capture.close()

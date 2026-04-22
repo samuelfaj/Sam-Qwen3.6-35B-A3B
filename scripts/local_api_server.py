@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from dflash.model_mlx import load, load_draft, stream_generate
+from dflash.model_mlx import PromptPrefillState, load, load_draft, stream_generate, tokenize_prompt
 
 
 DEFAULT_MODEL_PATH = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit"
@@ -83,8 +83,20 @@ def _env_positive_int(name: str, default: int) -> int:
     return default if value <= 0 else value
 
 
+def _env_non_negative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return default if value < 0 else value
+
+
 STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 2.0)
 RESPONSE_HISTORY_LIMIT = _env_positive_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
+PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
 
 
 class OpenAIMessage(BaseModel):
@@ -929,6 +941,8 @@ class LocalModelServer:
         self._last_used_at: float | None = None
         self._response_states: dict[str, dict[str, Any]] = {}
         self._response_order: deque[str] = deque()
+        self._prefix_state_order: deque[str] = deque()
+        self.prefix_cache_state_limit = PREFIX_CACHE_STATE_LIMIT
 
     def _clear_hidden_states_locked(self) -> None:
         hidden_states = getattr(self._model, "_hidden_states", None)
@@ -937,11 +951,17 @@ class LocalModelServer:
 
     def _clear_request_state_locked(self) -> None:
         self._clear_hidden_states_locked()
-        gc.collect()
-        mx.clear_cache()
+
+    def _clear_cached_prefix_states_locked(self) -> None:
+        while self._prefix_state_order:
+            response_id = self._prefix_state_order.popleft()
+            state = self._response_states.get(response_id)
+            if state is not None:
+                state["prompt_cache_state"] = None
 
     def _reset_loaded_state_locked(self) -> None:
         self._clear_hidden_states_locked()
+        self._clear_cached_prefix_states_locked()
         self._model = None
         self._draft = None
         self._tokenizer = None
@@ -992,10 +1012,21 @@ class LocalModelServer:
         self._model, self._tokenizer = load(self.model_path)
         self._draft = load_draft(self.draft_path, sliding_window_size=self.sliding_window_size)
 
+    def _prune_prefix_cache_states_locked(self) -> None:
+        while len(self._prefix_state_order) > self.prefix_cache_state_limit:
+            stale_response_id = self._prefix_state_order.popleft()
+            state = self._response_states.get(stale_response_id)
+            if state is not None:
+                state["prompt_cache_state"] = None
+
     def _prune_response_states_locked(self) -> None:
         while len(self._response_order) > RESPONSE_HISTORY_LIMIT:
             stale_response_id = self._response_order.popleft()
             self._response_states.pop(stale_response_id, None)
+            try:
+                self._prefix_state_order.remove(stale_response_id)
+            except ValueError:
+                pass
 
     def _conversation_from_response_locked(
         self,
@@ -1056,16 +1087,33 @@ class LocalModelServer:
         request_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         output_items: list[dict[str, Any]],
+        prompt_cache_state: PromptPrefillState | None = None,
     ) -> None:
         with self._lock:
+            stored_prompt_cache_state = prompt_cache_state if self.prefix_cache_state_limit > 0 else None
             self._response_states[response_id] = {
                 "previous_response_id": previous_response_id,
                 "input_messages": copy.deepcopy(request_messages),
                 "tools": copy.deepcopy(tools),
                 "output_items": copy.deepcopy(output_items),
+                "prompt_cache_state": stored_prompt_cache_state,
             }
             self._response_order.append(response_id)
+            if stored_prompt_cache_state is not None:
+                self._prefix_state_order.append(response_id)
+                self._prune_prefix_cache_states_locked()
             self._prune_response_states_locked()
+
+    def _prefix_cache_state_for_response_locked(self, response_id: str | None) -> PromptPrefillState | None:
+        if not response_id:
+            return None
+        state = self._response_states.get(response_id)
+        if state is None:
+            return None
+        prompt_cache_state = state.get("prompt_cache_state")
+        if prompt_cache_state is None:
+            return None
+        return copy.deepcopy(prompt_cache_state)
 
     def build_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
         kwargs: dict[str, Any] = {
@@ -1083,8 +1131,10 @@ class LocalModelServer:
         except TypeError:
             return self._tokenizer.apply_chat_template(messages, **kwargs)
 
-    def _effective_max_tokens(self, requested_max_tokens: int, prompt: str) -> tuple[int, int]:
-        prompt_tokens = len(self._tokenizer.encode(prompt))
+    def tokenize_prompt(self, prompt: str) -> list[int]:
+        return tokenize_prompt(self._tokenizer, prompt).tolist()
+
+    def _effective_max_tokens(self, requested_max_tokens: int, prompt_tokens: int) -> int:
         candidates = [max(1, requested_max_tokens)]
 
         if self.max_tokens_limit is not None:
@@ -1100,7 +1150,7 @@ class LocalModelServer:
             available_context = self.context_window - prompt_tokens - self.context_reserve
             candidates.append(max(1, available_context))
 
-        return min(candidates), prompt_tokens
+        return min(candidates)
 
     def _generate_locked(
         self,
@@ -1108,10 +1158,15 @@ class LocalModelServer:
         requested_max_tokens: int,
         temperature: float,
         tools: list[dict[str, Any]] | None = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
     ) -> tuple[list[str], dict[str, Any]]:
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
-        max_tokens, prompt_tokens = self._effective_max_tokens(requested_max_tokens, prompt)
+        prompt_tokens_list = self.tokenize_prompt(prompt)
+        prompt_tokens = len(prompt_tokens_list)
+        max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
+        prefix_state = self._prefix_cache_state_for_response_locked(previous_response_id)
         text_parts: list[str] = []
         final = None
         started = time.time()
@@ -1119,11 +1174,13 @@ class LocalModelServer:
             self._model,
             self._draft,
             self._tokenizer,
-            prompt,
+            prompt_tokens_list,
             block_size=self.block_size,
             max_tokens=max_tokens,
             temperature=temperature,
             target_turboquant_bits=self.target_turboquant_bits,
+            prefix_state=prefix_state,
+            capture_prefill_state=capture_prompt_cache_state,
         ):
             if chunk.text:
                 text_parts.append(chunk.text)
@@ -1139,6 +1196,7 @@ class LocalModelServer:
             "generated_tokens": final.generation_tokens,
             "peak_memory_gb": final.peak_memory,
             "elapsed": time.time() - started,
+            "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
         }
         return text_parts, result
 
@@ -1148,20 +1206,27 @@ class LocalModelServer:
         requested_max_tokens: int,
         temperature: float,
         tools: list[dict[str, Any]] | None = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
     ) -> tuple[Iterator[Any], int, float]:
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
-        max_tokens, prompt_tokens = self._effective_max_tokens(requested_max_tokens, prompt)
+        prompt_tokens_list = self.tokenize_prompt(prompt)
+        prompt_tokens = len(prompt_tokens_list)
+        max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
         started = time.time()
+        prefix_state = self._prefix_cache_state_for_response_locked(previous_response_id)
         iterator = stream_generate(
             self._model,
             self._draft,
             self._tokenizer,
-            prompt,
+            prompt_tokens_list,
             block_size=self.block_size,
             max_tokens=max_tokens,
             temperature=temperature,
             target_turboquant_bits=self.target_turboquant_bits,
+            prefix_state=prefix_state,
+            capture_prefill_state=capture_prompt_cache_state,
         )
         return iterator, prompt_tokens, started
 
@@ -1173,6 +1238,8 @@ class LocalModelServer:
         temperature: float,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
     ) -> None:
         text_parts: list[str] = []
         final = None
@@ -1185,6 +1252,8 @@ class LocalModelServer:
                     requested_max_tokens,
                     temperature,
                     tools=tools,
+                    previous_response_id=previous_response_id,
+                    capture_prompt_cache_state=capture_prompt_cache_state,
                 )
                 for chunk in iterator:
                     if chunk.text:
@@ -1204,6 +1273,7 @@ class LocalModelServer:
                 "generated_tokens": final.generation_tokens,
                 "peak_memory_gb": final.peak_memory,
                 "elapsed": time.time() - started,
+                "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
             }
             queue.put(("result", result))
         except Exception as exc:
@@ -1219,9 +1289,18 @@ class LocalModelServer:
         temperature: float,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
-            _, result = self._generate_locked(messages, max_tokens, temperature, tools=tools)
+            _, result = self._generate_locked(
+                messages,
+                max_tokens,
+                temperature,
+                tools=tools,
+                previous_response_id=previous_response_id,
+                capture_prompt_cache_state=capture_prompt_cache_state,
+            )
         self.finish_request(keep_alive_override)
         return result
 
@@ -1237,7 +1316,7 @@ class LocalModelServer:
         event_queue: Queue = Queue()
         worker = Thread(
             target=self._generation_worker,
-            args=(event_queue, messages, max_tokens, temperature, None, keep_alive_override),
+            args=(event_queue, messages, max_tokens, temperature, None, keep_alive_override, None, False),
             daemon=True,
         )
         worker.start()
@@ -1391,7 +1470,7 @@ class LocalModelServer:
         event_queue: Queue = Queue()
         worker = Thread(
             target=self._generation_worker,
-            args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override),
+            args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override, previous_response_id, True),
             daemon=True,
         )
         worker.start()
@@ -1525,6 +1604,7 @@ class LocalModelServer:
             request_messages=effective_request_messages,
             tools=tools or [],
             output_items=output_items,
+            prompt_cache_state=result.get("prompt_cache_state"),
         )
 
         next_output_index = 0
@@ -1704,7 +1784,7 @@ class LocalModelServer:
         event_queue: Queue = Queue()
         worker = Thread(
             target=self._generation_worker,
-            args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override),
+            args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override, None, False),
             daemon=True,
         )
         worker.start()
@@ -1935,6 +2015,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "keep_alive_seconds": server.keep_alive_seconds,
             "stream_heartbeat_seconds": STREAM_HEARTBEAT_SECONDS,
             "target_turboquant_bits": server.target_turboquant_bits,
+            "prefix_cache_state_limit": server.prefix_cache_state_limit,
+            "prefix_cache_entries": len(server._prefix_state_order),
             "last_used_at": server._last_used_at,
             "active_memory_gb": mx.get_active_memory() / (1024 ** 3),
             "cache_memory_gb": mx.get_cache_memory() / (1024 ** 3),
@@ -2097,7 +2179,15 @@ def create_app(server: LocalModelServer) -> FastAPI:
             )
 
         try:
-            result = server.generate(messages, max_tokens, req.temperature, tools=tools, keep_alive_override=req.keep_alive)
+            result = server.generate(
+                messages,
+                max_tokens,
+                req.temperature,
+                tools=tools,
+                keep_alive_override=req.keep_alive,
+                previous_response_id=req.previous_response_id,
+                capture_prompt_cache_state=True,
+            )
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         output_items = _build_output_items(result["text"])
@@ -2108,6 +2198,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             request_messages=request_messages,
             tools=tools,
             output_items=output_items,
+            prompt_cache_state=result.get("prompt_cache_state"),
         )
         return _build_response_payload(
             response_id=response_id,

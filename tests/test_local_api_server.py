@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -23,6 +24,8 @@ class FakeStreamingServer(local_api_server.LocalModelServer):
         temperature,
         tools=None,
         keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
     ) -> None:
         result = {
             "text": '<function_call>{"name":"write_file","arguments":{"path":"index.html","content":"ok"}}</function_call>',
@@ -47,6 +50,8 @@ class FakeChatStreamingServer(local_api_server.LocalModelServer):
         temperature,
         tools=None,
         keep_alive_override=None,
+        previous_response_id=None,
+        capture_prompt_cache_state=False,
     ) -> None:
         queue.put(("text", "Hello"))
         queue.put(("text", " world"))
@@ -300,6 +305,105 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertTrue(loaded["loaded"])
         self.assertFalse(after["loaded"])
         self.assertEqual(before["keep_alive_seconds"], 300)
+
+    def test_remember_response_keeps_only_recent_prefix_cache_states(self):
+        server = self._make_server()
+        server.prefix_cache_state_limit = 1
+        first_state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2),
+            target_cache=["cache-1"],
+            hidden="hidden-1",
+            last_logits="logits-1",
+        )
+        second_state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2, 3),
+            target_cache=["cache-2"],
+            hidden="hidden-2",
+            last_logits="logits-2",
+        )
+
+        server.remember_response(
+            response_id="resp_1",
+            previous_response_id=None,
+            request_messages=[{"role": "user", "content": "one"}],
+            tools=[],
+            output_items=[],
+            prompt_cache_state=first_state,
+        )
+        server.remember_response(
+            response_id="resp_2",
+            previous_response_id="resp_1",
+            request_messages=[{"role": "user", "content": "two"}],
+            tools=[],
+            output_items=[],
+            prompt_cache_state=second_state,
+        )
+
+        self.assertIsNone(server._response_states["resp_1"]["prompt_cache_state"])
+        self.assertEqual(server._response_states["resp_2"]["prompt_cache_state"], second_state)
+        self.assertEqual(list(server._prefix_state_order), ["resp_2"])
+
+    def test_generate_reuses_previous_response_prefix_cache(self):
+        server = self._make_server(TrackingServer)
+        prior_state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2, 3),
+            target_cache=["cached-prefix"],
+            hidden="hidden-prefix",
+            last_logits="logits-prefix",
+        )
+        next_state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2, 3, 4),
+            target_cache=["cached-next"],
+            hidden="hidden-next",
+            last_logits="logits-next",
+        )
+        server.remember_response(
+            response_id="resp_1",
+            previous_response_id=None,
+            request_messages=[{"role": "user", "content": "Inspect"}],
+            tools=[],
+            output_items=[],
+            prompt_cache_state=prior_state,
+        )
+
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, enable_thinking=True, **kwargs):
+                return "prompt"
+
+        observed: dict[str, object] = {}
+
+        def fake_stream_generate(model, draft, tokenizer, prompt, **kwargs):
+            observed["prompt"] = prompt
+            observed["prefix_state"] = kwargs.get("prefix_state")
+            observed["capture_prefill_state"] = kwargs.get("capture_prefill_state")
+            yield SimpleNamespace(
+                text="ok",
+                finish_reason="stop",
+                prompt_tps=10.0,
+                generation_tps=9.0,
+                generation_tokens=2,
+                peak_memory=1.0,
+                prefill_state=next_state,
+            )
+
+        with (
+            mock.patch.object(local_api_server, "load", return_value=("model-1", FakeTokenizer())),
+            mock.patch.object(local_api_server, "load_draft", return_value="draft-1"),
+            mock.patch.object(local_api_server, "tokenize_prompt", return_value=local_api_server.mx.array([10, 20, 30])),
+            mock.patch.object(local_api_server, "stream_generate", side_effect=fake_stream_generate),
+        ):
+            result = server.generate(
+                messages=[{"role": "user", "content": "Continue"}],
+                max_tokens=32,
+                temperature=0.0,
+                previous_response_id="resp_1",
+                capture_prompt_cache_state=True,
+            )
+
+        self.assertEqual(observed["prompt"], [10, 20, 30])
+        self.assertEqual(observed["prefix_state"], prior_state)
+        self.assertTrue(observed["capture_prefill_state"])
+        self.assertEqual(result["prompt_cache_state"], next_state)
 
 
 if __name__ == "__main__":
