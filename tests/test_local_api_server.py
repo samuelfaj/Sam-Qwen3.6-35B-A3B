@@ -31,9 +31,22 @@ class FakeStreamingServer(local_api_server.LocalModelServer):
             "text": '<function_call>{"name":"write_file","arguments":{"path":"index.html","content":"ok"}}</function_call>',
             "finish_reason": "stop",
             "prompt_tokens": 12,
+            "prefill_seconds": 0.1,
             "prompt_tps": 10.0,
+            "reused_prefix_tokens": 4,
+            "decode_seconds": 0.2,
             "generation_tps": 9.0,
             "generated_tokens": 8,
+            "speculative_steps": 3,
+            "proposed_tokens": 9,
+            "accepted_tokens": 7,
+            "avg_acceptance_length": 2.33,
+            "avg_acceptance_ratio": 0.77,
+            "acceptance_lengths": [2, 2, 3],
+            "acceptance_ratios": [0.66, 0.66, 1.0],
+            "block_size_history": [3, 3, 3],
+            "adaptive_block_size": True,
+            "prefix_cache_source": "global",
             "peak_memory_gb": 1.0,
             "elapsed": 0.5,
         }
@@ -59,9 +72,22 @@ class FakeChatStreamingServer(local_api_server.LocalModelServer):
             "text": "Hello world",
             "finish_reason": "stop",
             "prompt_tokens": 8,
+            "prefill_seconds": 0.05,
             "prompt_tps": 10.0,
+            "reused_prefix_tokens": 0,
+            "decode_seconds": 0.15,
             "generation_tps": 9.0,
             "generated_tokens": 2,
+            "speculative_steps": 1,
+            "proposed_tokens": 2,
+            "accepted_tokens": 2,
+            "avg_acceptance_length": 2.0,
+            "avg_acceptance_ratio": 1.0,
+            "acceptance_lengths": [2],
+            "acceptance_ratios": [1.0],
+            "block_size_history": [2],
+            "adaptive_block_size": False,
+            "prefix_cache_source": "none",
             "peak_memory_gb": 1.0,
             "elapsed": 0.2,
         }
@@ -345,14 +371,15 @@ class LocalApiServerTests(unittest.TestCase):
 
     def test_generate_reuses_previous_response_prefix_cache(self):
         server = self._make_server(TrackingServer)
+        server.global_prefix_cache_limit = 0
         prior_state = local_api_server.PromptPrefillState(
-            prompt_tokens=(1, 2, 3),
+            prompt_tokens=(10, 20, 30),
             target_cache=["cached-prefix"],
             hidden="hidden-prefix",
             last_logits="logits-prefix",
         )
         next_state = local_api_server.PromptPrefillState(
-            prompt_tokens=(1, 2, 3, 4),
+            prompt_tokens=(10, 20, 30, 40),
             target_cache=["cached-next"],
             hidden="hidden-next",
             last_logits="logits-next",
@@ -379,9 +406,21 @@ class LocalApiServerTests(unittest.TestCase):
             yield SimpleNamespace(
                 text="ok",
                 finish_reason="stop",
+                prefill_seconds=0.1,
                 prompt_tps=10.0,
+                reused_prefix_tokens=3,
+                decode_seconds=0.2,
                 generation_tps=9.0,
                 generation_tokens=2,
+                speculative_steps=1,
+                proposed_tokens=2,
+                accepted_tokens=2,
+                avg_acceptance_length=2.0,
+                avg_acceptance_ratio=1.0,
+                acceptance_lengths=(2,),
+                acceptance_ratios=(1.0,),
+                block_size_history=(2,),
+                adaptive_block_size=False,
                 peak_memory=1.0,
                 prefill_state=next_state,
             )
@@ -404,6 +443,28 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(observed["prefix_state"], prior_state)
         self.assertTrue(observed["capture_prefill_state"])
         self.assertEqual(result["prompt_cache_state"], next_state)
+
+    def test_select_prefix_state_prefers_longer_global_match(self):
+        server = self._make_server()
+        response_state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2),
+            target_cache=["resp-cache"],
+            hidden="resp-hidden",
+            last_logits="resp-logits",
+        )
+        global_state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2, 3),
+            target_cache=["global-cache"],
+            hidden="global-hidden",
+            last_logits="global-logits",
+        )
+        server._response_states["resp_1"] = {"prompt_cache_state": response_state}
+        server._global_prefix_states["stable"] = global_state
+
+        selected, source = server._select_prefix_state_locked([1, 2, 3, 4], "resp_1", "stable")
+
+        self.assertEqual(source, "global")
+        self.assertEqual(selected, global_state)
 
 
 if __name__ == "__main__":

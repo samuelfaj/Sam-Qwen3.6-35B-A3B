@@ -20,7 +20,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from dflash.model_mlx import PromptPrefillState, load, load_draft, stream_generate, tokenize_prompt
+from dflash.model_mlx import (
+    AdaptiveBlockSizeConfig,
+    PromptPrefillState,
+    derive_prefill_prefix_state,
+    load,
+    load_draft,
+    prefill_prompt,
+    stream_generate,
+    tokenize_prompt,
+)
 
 
 DEFAULT_MODEL_PATH = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit"
@@ -94,9 +103,17 @@ def _env_non_negative_int(name: str, default: int) -> int:
     return default if value < 0 else value
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 2.0)
 RESPONSE_HISTORY_LIMIT = _env_positive_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
+GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 16)
 
 
 class OpenAIMessage(BaseModel):
@@ -175,7 +192,7 @@ class UnknownPreviousResponseError(LookupError):
     pass
 
 
-def _trace_request(kind: str, payload: dict[str, Any]) -> None:
+def _trace_event(kind: str, payload: dict[str, Any]) -> None:
     if not DEFAULT_TRACE_FILE:
         return
     event = {
@@ -185,6 +202,10 @@ def _trace_request(kind: str, payload: dict[str, Any]) -> None:
     }
     with open(DEFAULT_TRACE_FILE, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _trace_request(kind: str, payload: dict[str, Any]) -> None:
+    _trace_event(kind, payload)
 
 
 def _json_line(event: str, payload: dict[str, Any]) -> str:
@@ -480,8 +501,21 @@ def _response_usage(result: dict[str, Any]) -> dict[str, int]:
 
 def _response_metrics(result: dict[str, Any]) -> dict[str, Any]:
     return {
+        "prefill_seconds": result["prefill_seconds"],
+        "decode_seconds": result["decode_seconds"],
         "prompt_tps": result["prompt_tps"],
         "generation_tps": result["generation_tps"],
+        "reused_prefix_tokens": result.get("reused_prefix_tokens", 0),
+        "prefix_cache_source": result.get("prefix_cache_source", "none"),
+        "speculative_steps": result.get("speculative_steps", 0),
+        "proposed_tokens": result.get("proposed_tokens", 0),
+        "accepted_tokens": result.get("accepted_tokens", 0),
+        "avg_acceptance_length": result.get("avg_acceptance_length", 0.0),
+        "avg_acceptance_ratio": result.get("avg_acceptance_ratio", 0.0),
+        "acceptance_lengths": result.get("acceptance_lengths", []),
+        "acceptance_ratios": result.get("acceptance_ratios", []),
+        "block_size_history": result.get("block_size_history", []),
+        "adaptive_block_size": result.get("adaptive_block_size", False),
         "peak_memory_gb": result["peak_memory_gb"],
         "elapsed": result["elapsed"],
     }
@@ -583,6 +617,29 @@ def _merge_message_context(
     merged.extend(base)
     merged.extend(new)
     return merged
+
+
+def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stable_messages: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "system":
+            break
+        stable_messages.append(copy.deepcopy(message))
+    return stable_messages
+
+
+def _longest_common_prefix_tokens(left: list[int], right: list[int]) -> tuple[int, ...]:
+    size = min(len(left), len(right))
+    idx = 0
+    while idx < size and left[idx] == right[idx]:
+        idx += 1
+    return tuple(left[:idx])
+
+
+def _prompt_startswith(prompt_tokens: list[int], prefix_tokens: tuple[int, ...]) -> bool:
+    if len(prefix_tokens) > len(prompt_tokens):
+        return False
+    return tuple(prompt_tokens[: len(prefix_tokens)]) == prefix_tokens
 
 
 def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -919,6 +976,8 @@ class LocalModelServer:
         context_reserve: int,
         keep_alive_seconds: float | None,
         target_turboquant_bits: float | None,
+        adaptive_block_size_config: AdaptiveBlockSizeConfig | None = None,
+        global_prefix_cache_limit: int = GLOBAL_PREFIX_CACHE_LIMIT,
     ) -> None:
         self.model_path = model_path
         self.draft_path = draft_path
@@ -933,6 +992,11 @@ class LocalModelServer:
         self.target_turboquant_bits = (
             None if target_turboquant_bits is not None and target_turboquant_bits <= 0 else target_turboquant_bits
         )
+        self.adaptive_block_size_config = adaptive_block_size_config or AdaptiveBlockSizeConfig(
+            enabled=False,
+            min_block_size=max(1, block_size),
+            max_block_size=max(1, block_size),
+        )
         self._lock = RLock()
         self._model = None
         self._draft = None
@@ -943,6 +1007,12 @@ class LocalModelServer:
         self._response_order: deque[str] = deque()
         self._prefix_state_order: deque[str] = deque()
         self.prefix_cache_state_limit = PREFIX_CACHE_STATE_LIMIT
+        self.global_prefix_cache_limit = global_prefix_cache_limit
+        self._global_prefix_states: dict[str, PromptPrefillState] = {}
+        self._global_prefix_order: deque[str] = deque()
+        self._stable_prefix_tokens_by_key: dict[str, tuple[int, ...]] = {}
+        self._global_prefix_cache_hits = 0
+        self._global_prefix_cache_misses = 0
 
     def _clear_hidden_states_locked(self) -> None:
         hidden_states = getattr(self._model, "_hidden_states", None)
@@ -959,9 +1029,15 @@ class LocalModelServer:
             if state is not None:
                 state["prompt_cache_state"] = None
 
+    def _clear_global_prefix_cache_locked(self) -> None:
+        self._global_prefix_states.clear()
+        self._global_prefix_order.clear()
+        self._stable_prefix_tokens_by_key.clear()
+
     def _reset_loaded_state_locked(self) -> None:
         self._clear_hidden_states_locked()
         self._clear_cached_prefix_states_locked()
+        self._clear_global_prefix_cache_locked()
         self._model = None
         self._draft = None
         self._tokenizer = None
@@ -1018,6 +1094,11 @@ class LocalModelServer:
             state = self._response_states.get(stale_response_id)
             if state is not None:
                 state["prompt_cache_state"] = None
+
+    def _prune_global_prefix_states_locked(self) -> None:
+        while len(self._global_prefix_order) > self.global_prefix_cache_limit:
+            stale_key = self._global_prefix_order.popleft()
+            self._global_prefix_states.pop(stale_key, None)
 
     def _prune_response_states_locked(self) -> None:
         while len(self._response_order) > RESPONSE_HISTORY_LIMIT:
@@ -1115,10 +1196,16 @@ class LocalModelServer:
             return None
         return copy.deepcopy(prompt_cache_state)
 
-    def build_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
+    def build_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        add_generation_prompt: bool = True,
+    ) -> str:
         kwargs: dict[str, Any] = {
             "tokenize": False,
-            "add_generation_prompt": True,
+            "add_generation_prompt": add_generation_prompt,
         }
         if tools:
             kwargs["tools"] = tools
@@ -1133,6 +1220,117 @@ class LocalModelServer:
 
     def tokenize_prompt(self, prompt: str) -> list[int]:
         return tokenize_prompt(self._tokenizer, prompt).tolist()
+
+    def _stable_prefix_key(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        stable_messages = _leading_system_messages(messages)
+        if not stable_messages and not tools:
+            return "stable-prefix::empty"
+        payload = {
+            "messages": stable_messages,
+            "tools": tools or [],
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+    def _stable_prefix_tokens_locked(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, ...]:
+        stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
+        if stable_prefix_key is None:
+            return ()
+        cached_tokens = self._stable_prefix_tokens_by_key.get(stable_prefix_key)
+        if cached_tokens is not None:
+            return cached_tokens
+
+        stable_messages = _leading_system_messages(messages)
+        probe_a = stable_messages + [{"role": "user", "content": "__LOCAL_DFLASH_STABLE_PREFIX_A__"}]
+        probe_b = stable_messages + [{"role": "user", "content": "__LOCAL_DFLASH_STABLE_PREFIX_B__"}]
+        prompt_a = self.build_prompt(probe_a, tools=tools, add_generation_prompt=False)
+        prompt_b = self.build_prompt(probe_b, tools=tools, add_generation_prompt=False)
+        prefix_tokens = _longest_common_prefix_tokens(
+            self.tokenize_prompt(prompt_a),
+            self.tokenize_prompt(prompt_b),
+        )
+        self._stable_prefix_tokens_by_key[stable_prefix_key] = prefix_tokens
+        return prefix_tokens
+
+    def _global_prefix_state_for_key_locked(self, stable_prefix_key: str | None) -> PromptPrefillState | None:
+        if stable_prefix_key is None:
+            return None
+        state = self._global_prefix_states.get(stable_prefix_key)
+        if state is None:
+            return None
+        return copy.deepcopy(state)
+
+    def _select_prefix_state_locked(
+        self,
+        prompt_tokens: list[int],
+        previous_response_id: str | None,
+        stable_prefix_key: str | None,
+    ) -> tuple[PromptPrefillState | None, str]:
+        best_state: PromptPrefillState | None = None
+        best_source = "none"
+
+        response_state = self._prefix_cache_state_for_response_locked(previous_response_id)
+        if response_state is not None and _prompt_startswith(prompt_tokens, response_state.prompt_tokens):
+            best_state = response_state
+            best_source = "response"
+
+        global_state = self._global_prefix_state_for_key_locked(stable_prefix_key)
+        if global_state is not None and _prompt_startswith(prompt_tokens, global_state.prompt_tokens):
+            if best_state is None or len(global_state.prompt_tokens) > len(best_state.prompt_tokens):
+                best_state = global_state
+                best_source = "global"
+            self._global_prefix_cache_hits += 1
+        elif stable_prefix_key is not None and self.global_prefix_cache_limit > 0:
+            self._global_prefix_cache_misses += 1
+
+        return best_state, best_source
+
+    def _remember_global_prefix_state_locked(
+        self,
+        stable_prefix_key: str | None,
+        stable_prefix_tokens: tuple[int, ...],
+        prompt_cache_state: PromptPrefillState | None,
+    ) -> None:
+        if (
+            stable_prefix_key is None
+            or not stable_prefix_tokens
+            or self.global_prefix_cache_limit <= 0
+            or self._model is None
+            or self._tokenizer is None
+        ):
+            return
+
+        derived_state = None
+        if prompt_cache_state is not None and _prompt_startswith(list(prompt_cache_state.prompt_tokens), stable_prefix_tokens):
+            derived_state = derive_prefill_prefix_state(prompt_cache_state, len(stable_prefix_tokens))
+
+        if derived_state is None:
+            prefill = prefill_prompt(
+                self._model,
+                self._tokenizer,
+                list(stable_prefix_tokens),
+                target_turboquant_bits=self.target_turboquant_bits,
+                capture_prefill_state=True,
+            )
+            derived_state = prefill.prefill_state
+
+        if derived_state is None:
+            return
+
+        self._global_prefix_states[stable_prefix_key] = copy.deepcopy(derived_state)
+        try:
+            self._global_prefix_order.remove(stable_prefix_key)
+        except ValueError:
+            pass
+        self._global_prefix_order.append(stable_prefix_key)
+        self._prune_global_prefix_states_locked()
 
     def _effective_max_tokens(self, requested_max_tokens: int, prompt_tokens: int) -> int:
         candidates = [max(1, requested_max_tokens)]
@@ -1166,7 +1364,13 @@ class LocalModelServer:
         prompt_tokens_list = self.tokenize_prompt(prompt)
         prompt_tokens = len(prompt_tokens_list)
         max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
-        prefix_state = self._prefix_cache_state_for_response_locked(previous_response_id)
+        stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
+        stable_prefix_tokens = self._stable_prefix_tokens_locked(messages, tools=tools)
+        prefix_state, prefix_cache_source = self._select_prefix_state_locked(
+            prompt_tokens_list,
+            previous_response_id,
+            stable_prefix_key,
+        )
         text_parts: list[str] = []
         final = None
         started = time.time()
@@ -1181,19 +1385,39 @@ class LocalModelServer:
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=prefix_state,
             capture_prefill_state=capture_prompt_cache_state,
+            adaptive_block_size=self.adaptive_block_size_config,
         ):
             if chunk.text:
                 text_parts.append(chunk.text)
             final = chunk
         if final is None:
             raise RuntimeError("Model returned no output")
+        if stable_prefix_tokens:
+            self._remember_global_prefix_state_locked(
+                stable_prefix_key,
+                stable_prefix_tokens,
+                final.prefill_state if capture_prompt_cache_state else None,
+            )
         result = {
             "text": "".join(text_parts),
             "finish_reason": final.finish_reason or "stop",
             "prompt_tokens": prompt_tokens,
+            "prefill_seconds": final.prefill_seconds,
             "prompt_tps": final.prompt_tps,
+            "reused_prefix_tokens": final.reused_prefix_tokens,
+            "decode_seconds": final.decode_seconds,
             "generation_tps": final.generation_tps,
             "generated_tokens": final.generation_tokens,
+            "speculative_steps": final.speculative_steps,
+            "proposed_tokens": final.proposed_tokens,
+            "accepted_tokens": final.accepted_tokens,
+            "avg_acceptance_length": final.avg_acceptance_length,
+            "avg_acceptance_ratio": final.avg_acceptance_ratio,
+            "acceptance_lengths": list(final.acceptance_lengths),
+            "acceptance_ratios": list(final.acceptance_ratios),
+            "block_size_history": list(final.block_size_history),
+            "adaptive_block_size": final.adaptive_block_size,
+            "prefix_cache_source": prefix_cache_source,
             "peak_memory_gb": final.peak_memory,
             "elapsed": time.time() - started,
             "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
@@ -1208,14 +1432,20 @@ class LocalModelServer:
         tools: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
-    ) -> tuple[Iterator[Any], int, float]:
+    ) -> tuple[Iterator[Any], int, float, str | None, tuple[int, ...], str]:
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
         prompt_tokens_list = self.tokenize_prompt(prompt)
         prompt_tokens = len(prompt_tokens_list)
         max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
         started = time.time()
-        prefix_state = self._prefix_cache_state_for_response_locked(previous_response_id)
+        stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
+        stable_prefix_tokens = self._stable_prefix_tokens_locked(messages, tools=tools)
+        prefix_state, prefix_cache_source = self._select_prefix_state_locked(
+            prompt_tokens_list,
+            previous_response_id,
+            stable_prefix_key,
+        )
         iterator = stream_generate(
             self._model,
             self._draft,
@@ -1227,8 +1457,9 @@ class LocalModelServer:
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=prefix_state,
             capture_prefill_state=capture_prompt_cache_state,
+            adaptive_block_size=self.adaptive_block_size_config,
         )
-        return iterator, prompt_tokens, started
+        return iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source
 
     def _generation_worker(
         self,
@@ -1245,9 +1476,12 @@ class LocalModelServer:
         final = None
         prompt_tokens = 0
         started = time.time()
+        stable_prefix_key: str | None = None
+        stable_prefix_tokens: tuple[int, ...] = ()
+        prefix_cache_source = "none"
         try:
             with self._lock:
-                iterator, prompt_tokens, started = self._stream_generate_locked(
+                iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source = self._stream_generate_locked(
                     messages,
                     requested_max_tokens,
                     temperature,
@@ -1264,13 +1498,33 @@ class LocalModelServer:
             if final is None:
                 raise RuntimeError("Model returned no output")
 
+            with self._lock:
+                if stable_prefix_tokens:
+                    self._remember_global_prefix_state_locked(
+                        stable_prefix_key,
+                        stable_prefix_tokens,
+                        final.prefill_state if capture_prompt_cache_state else None,
+                    )
             result = {
                 "text": "".join(text_parts),
                 "finish_reason": final.finish_reason or "stop",
                 "prompt_tokens": prompt_tokens,
+                "prefill_seconds": final.prefill_seconds,
                 "prompt_tps": final.prompt_tps,
+                "reused_prefix_tokens": final.reused_prefix_tokens,
+                "decode_seconds": final.decode_seconds,
                 "generation_tps": final.generation_tps,
                 "generated_tokens": final.generation_tokens,
+                "speculative_steps": final.speculative_steps,
+                "proposed_tokens": final.proposed_tokens,
+                "accepted_tokens": final.accepted_tokens,
+                "avg_acceptance_length": final.avg_acceptance_length,
+                "avg_acceptance_ratio": final.avg_acceptance_ratio,
+                "acceptance_lengths": list(final.acceptance_lengths),
+                "acceptance_ratios": list(final.acceptance_ratios),
+                "block_size_history": list(final.block_size_history),
+                "adaptive_block_size": final.adaptive_block_size,
+                "prefix_cache_source": prefix_cache_source,
                 "peak_memory_gb": final.peak_memory,
                 "elapsed": time.time() - started,
                 "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
@@ -1744,6 +1998,18 @@ class LocalModelServer:
             status="completed",
             previous_response_id=previous_response_id,
         )
+        _trace_event(
+            "responses.completed",
+            {
+                "response_id": response_id,
+                "previous_response_id": previous_response_id,
+                "max_output_tokens": max_tokens,
+                "temperature": temperature,
+                "request_messages": effective_request_messages,
+                "tools": tools or [],
+                "response": completed_payload,
+            },
+        )
         yield _json_line(
             "response.completed",
             {
@@ -2017,6 +2283,13 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "target_turboquant_bits": server.target_turboquant_bits,
             "prefix_cache_state_limit": server.prefix_cache_state_limit,
             "prefix_cache_entries": len(server._prefix_state_order),
+            "global_prefix_cache_limit": server.global_prefix_cache_limit,
+            "global_prefix_cache_entries": len(server._global_prefix_order),
+            "global_prefix_cache_hits": server._global_prefix_cache_hits,
+            "global_prefix_cache_misses": server._global_prefix_cache_misses,
+            "adaptive_block_size": server.adaptive_block_size_config.enabled,
+            "adaptive_block_size_min": server.adaptive_block_size_config.min_block_size,
+            "adaptive_block_size_max": server.adaptive_block_size_config.max_block_size,
             "last_used_at": server._last_used_at,
             "active_memory_gb": mx.get_active_memory() / (1024 ** 3),
             "cache_memory_gb": mx.get_cache_memory() / (1024 ** 3),
@@ -2079,7 +2352,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _, assistant_text = _strip_reasoning_blocks(result["text"])
-        return {
+        payload = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
             "created": int(time.time()),
@@ -2101,6 +2374,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             },
             "metrics": _response_metrics(result),
         }
+        _trace_event("chat_completions.completed", payload)
+        return payload
 
     @app.post("/v1/messages")
     def anthropic_messages(req: AnthropicRequest) -> Any:
@@ -2127,12 +2402,14 @@ def create_app(server: LocalModelServer) -> FastAPI:
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         content_blocks = _build_anthropic_content_blocks(result["text"])
-        return _build_anthropic_message_payload(
+        payload = _build_anthropic_message_payload(
             message_id=f"msg_{uuid.uuid4().hex}",
             model_name=server.model_name,
             result=result,
             content_blocks=content_blocks,
         )
+        _trace_event("messages.completed", payload)
+        return payload
 
     @app.post("/v1/messages/count_tokens")
     def anthropic_count_tokens(req: AnthropicCountTokensRequest) -> dict[str, Any]:
@@ -2200,7 +2477,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             output_items=output_items,
             prompt_cache_state=result.get("prompt_cache_state"),
         )
-        return _build_response_payload(
+        payload = _build_response_payload(
             response_id=response_id,
             model_name=server.model_name,
             result=result,
@@ -2208,6 +2485,19 @@ def create_app(server: LocalModelServer) -> FastAPI:
             status="completed",
             previous_response_id=req.previous_response_id,
         )
+        _trace_event(
+            "responses.completed",
+            {
+                "response_id": response_id,
+                "previous_response_id": req.previous_response_id,
+                "max_output_tokens": max_tokens,
+                "temperature": req.temperature,
+                "request_messages": request_messages,
+                "tools": tools,
+                "response": payload,
+            },
+        )
+        return payload
 
     return app
 
@@ -2220,6 +2510,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-path", default=os.environ.get("LOCAL_DFLASH_DRAFT_PATH", DEFAULT_DRAFT_PATH))
     parser.add_argument("--model-name", default=os.environ.get("LOCAL_DFLASH_MODEL_NAME", DEFAULT_MODEL_NAME))
     parser.add_argument("--block-size", type=int, default=int(os.environ.get("LOCAL_DFLASH_BLOCK_SIZE", "15")))
+    parser.add_argument(
+        "--adaptive-block-size",
+        action="store_true",
+        default=_env_bool("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE", False),
+        help="Enable adaptive speculative block size based on recent acceptance ratios.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-min",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN", "6")),
+        help="Lower bound for adaptive speculative block size.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-max",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX", os.environ.get("LOCAL_DFLASH_BLOCK_SIZE", "15"))),
+        help="Upper bound for adaptive speculative block size.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-grow-threshold",
+        type=float,
+        default=float(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_THRESHOLD", "0.95")),
+        help="Grow block size when accepted/proposed ratio stays at or above this threshold.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-shrink-threshold",
+        type=float,
+        default=float(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_THRESHOLD", "0.6")),
+        help="Shrink block size when accepted/proposed ratio falls at or below this threshold.",
+    )
+    parser.add_argument(
+        "--global-prefix-cache-limit",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", str(GLOBAL_PREFIX_CACHE_LIMIT))),
+        help="Maximum number of stable global prefix snapshots to keep in memory.",
+    )
     parser.add_argument(
         "--disable-thinking",
         action="store_true",
@@ -2291,6 +2617,13 @@ def main() -> int:
 
     detected_context_window = _detect_context_window(args.model_path)
     context_window = args.context_window_override or detected_context_window
+    adaptive_block_size_config = AdaptiveBlockSizeConfig(
+        enabled=args.adaptive_block_size,
+        min_block_size=max(1, args.adaptive_block_size_min),
+        max_block_size=max(1, args.adaptive_block_size_max),
+        grow_threshold=args.adaptive_block_size_grow_threshold,
+        shrink_threshold=args.adaptive_block_size_shrink_threshold,
+    )
     server = LocalModelServer(
         model_path=args.model_path,
         draft_path=args.draft_path,
@@ -2303,6 +2636,8 @@ def main() -> int:
         context_reserve=args.context_reserve,
         keep_alive_seconds=_parse_keep_alive(args.keep_alive_seconds),
         target_turboquant_bits=args.target_turboquant_bits,
+        adaptive_block_size_config=adaptive_block_size_config,
+        global_prefix_cache_limit=max(0, args.global_prefix_cache_limit),
     )
     if not args.no_preload:
         server.ensure_loaded()

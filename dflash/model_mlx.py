@@ -86,6 +86,40 @@ def _infer_model_head_dim(model: Any) -> int:
     raise ValueError(f"Could not infer attention head_dim for {type(model).__name__}")
 
 
+class _StableTurboQuantKVCache:
+    def __init__(self, inner: Any):
+        self._inner = inner
+
+    def update_and_fetch(self, keys, values):
+        deq_keys, deq_values = self._inner.update_and_fetch(keys, values)
+        return deq_keys.astype(keys.dtype), deq_values.astype(values.dtype)
+
+    @property
+    def state(self):
+        return self._inner.state
+
+    @state.setter
+    def state(self, value):
+        self._inner.state = value
+
+    @property
+    def meta_state(self):
+        return self._inner.meta_state
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self._inner.meta_state = value
+
+    def __deepcopy__(self, memo):
+        copied = type(self).__new__(type(self))
+        memo[id(self)] = copied
+        copied._inner = copy.deepcopy(self._inner, memo)
+        return copied
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _make_target_cache(
     model: Any,
     turboquant_bits: Optional[float] = None,
@@ -101,42 +135,17 @@ def _make_target_cache(
             "TurboQuant cache requested, but mlx-turboquant is not installed in the current environment."
         ) from exc
 
-    class StableTurboQuantKVCache:
-        def __init__(self, **kwargs):
-            self._inner = _TurboQuantKVCache(**kwargs)
-
-        def update_and_fetch(self, keys, values):
-            deq_keys, deq_values = self._inner.update_and_fetch(keys, values)
-            return deq_keys.astype(keys.dtype), deq_values.astype(values.dtype)
-
-        @property
-        def state(self):
-            return self._inner.state
-
-        @state.setter
-        def state(self, value):
-            self._inner.state = value
-
-        @property
-        def meta_state(self):
-            return self._inner.meta_state
-
-        @meta_state.setter
-        def meta_state(self, value):
-            self._inner.meta_state = value
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
     head_dim = _infer_model_head_dim(model)
     replaced = 0
     for idx, cache_entry in enumerate(cache):
         if isinstance(cache_entry, KVCache):
-            cache[idx] = StableTurboQuantKVCache(
-                bits=float(turboquant_bits),
-                head_dim=head_dim,
-                key_seed=42 + idx * 2,
-                value_seed=43 + idx * 2,
+            cache[idx] = _StableTurboQuantKVCache(
+                _TurboQuantKVCache(
+                    bits=float(turboquant_bits),
+                    head_dim=head_dim,
+                    key_seed=42 + idx * 2,
+                    value_seed=43 + idx * 2,
+                )
             )
             replaced += 1
 
@@ -440,10 +449,22 @@ class GenerationResponse:
     tokens: List[int]
     accepted: int
     prompt_tokens: int
+    prefill_seconds: float
+    reused_prefix_tokens: int
     prompt_tps: float
     generation_tokens: int
+    decode_seconds: float
     generation_tps: float
     peak_memory: float
+    speculative_steps: int = 0
+    proposed_tokens: int = 0
+    accepted_tokens: int = 0
+    avg_acceptance_length: float = 0.0
+    avg_acceptance_ratio: float = 0.0
+    acceptance_lengths: Tuple[int, ...] = ()
+    acceptance_ratios: Tuple[float, ...] = ()
+    block_size_history: Tuple[int, ...] = ()
+    adaptive_block_size: bool = False
     finish_reason: Optional[str] = None
     prefill_state: Optional["PromptPrefillState"] = None
 
@@ -453,13 +474,84 @@ class PromptPrefillState:
     prompt_tokens: Tuple[int, ...]
     target_cache: List[Any]
     hidden: mx.array
-    last_logits: mx.array
+    last_logits: Optional[mx.array] = None
 
 
-def _make_response(text, tokens, accepted, prompt_size, prompt_tps, n, tic, finish_reason=None, prefill_state=None):
+@dataclass(frozen=True)
+class AdaptiveBlockSizeConfig:
+    enabled: bool = False
+    min_block_size: int = 4
+    max_block_size: int = 15
+    grow_threshold: float = 0.9
+    shrink_threshold: float = 0.55
+    grow_step: int = 1
+    shrink_step: int = 1
+
+
+@dataclass
+class PromptPrefillRun:
+    prompt: mx.array
+    prompt_tokens: List[int]
+    target_cache: List[Any]
+    hidden: mx.array
+    logits: mx.array
+    prompt_tps: float
+    prefill_seconds: float
+    reused_prefix_tokens: int
+    prefill_state: Optional[PromptPrefillState] = None
+
+
+def _make_response(
+    text,
+    tokens,
+    accepted,
+    prompt_size,
+    prefill_seconds,
+    reused_prefix_tokens,
+    prompt_tps,
+    n,
+    tic,
+    finish_reason=None,
+    prefill_state=None,
+    speculative_steps=0,
+    proposed_tokens=0,
+    accepted_tokens=0,
+    acceptance_lengths=(),
+    acceptance_ratios=(),
+    block_size_history=(),
+    adaptive_block_size=False,
+):
+    decode_seconds = max(time.perf_counter() - tic, 1e-9)
+    generation_tps = n / decode_seconds
+    avg_acceptance_length = (
+        accepted_tokens / speculative_steps if speculative_steps > 0 else 0.0
+    )
+    avg_acceptance_ratio = (
+        accepted_tokens / proposed_tokens if proposed_tokens > 0 else 0.0
+    )
     return GenerationResponse(
-        text, tokens, accepted, prompt_size, prompt_tps,
-        n, n / (time.perf_counter() - tic), mx.get_peak_memory() / 1e9, finish_reason, prefill_state,
+        text=text,
+        tokens=tokens,
+        accepted=accepted,
+        prompt_tokens=prompt_size,
+        prefill_seconds=prefill_seconds,
+        reused_prefix_tokens=reused_prefix_tokens,
+        prompt_tps=prompt_tps,
+        generation_tokens=n,
+        decode_seconds=decode_seconds,
+        generation_tps=generation_tps,
+        peak_memory=mx.get_peak_memory() / 1e9,
+        speculative_steps=speculative_steps,
+        proposed_tokens=proposed_tokens,
+        accepted_tokens=accepted_tokens,
+        avg_acceptance_length=avg_acceptance_length,
+        avg_acceptance_ratio=avg_acceptance_ratio,
+        acceptance_lengths=tuple(acceptance_lengths),
+        acceptance_ratios=tuple(acceptance_ratios),
+        block_size_history=tuple(block_size_history),
+        adaptive_block_size=adaptive_block_size,
+        finish_reason=finish_reason,
+        prefill_state=prefill_state,
     )
 
 
@@ -482,8 +574,143 @@ def _snapshot_prefill_state(prompt_tokens, target_cache, hidden, logits):
         prompt_tokens=tuple(prompt_tokens),
         target_cache=copy.deepcopy(target_cache),
         hidden=copy.deepcopy(hidden),
-        last_logits=copy.deepcopy(logits[:, -1:]),
+        last_logits=None if logits is None else copy.deepcopy(logits[:, -1:]),
     )
+
+
+def derive_prefill_prefix_state(
+    prefill_state: PromptPrefillState,
+    prefix_length: int,
+) -> Optional[PromptPrefillState]:
+    if prefix_length <= 0:
+        return None
+    total_tokens = len(prefill_state.prompt_tokens)
+    if prefix_length > total_tokens:
+        raise ValueError(f"prefix_length={prefix_length} exceeds prompt length={total_tokens}")
+    if prefix_length == total_tokens:
+        return copy.deepcopy(prefill_state)
+
+    target_cache = copy.deepcopy(prefill_state.target_cache)
+    if not can_trim_prompt_cache(target_cache):
+        return None
+
+    trim_prompt_cache(target_cache, total_tokens - prefix_length)
+    return PromptPrefillState(
+        prompt_tokens=prefill_state.prompt_tokens[:prefix_length],
+        target_cache=target_cache,
+        hidden=copy.deepcopy(prefill_state.hidden[:, :prefix_length, :]),
+        last_logits=None,
+    )
+
+
+def _match_reusable_prefix(
+    prompt_tokens: List[int],
+    prefix_state: Optional[PromptPrefillState],
+) -> tuple[Optional[PromptPrefillState], int]:
+    if prefix_state is None:
+        return None, 0
+
+    cached_tokens = prefix_state.prompt_tokens
+    cached_len = len(cached_tokens)
+    if cached_len > len(prompt_tokens):
+        return None, 0
+    if tuple(prompt_tokens[:cached_len]) != cached_tokens:
+        return None, 0
+    if cached_len == len(prompt_tokens) and prefix_state.last_logits is None:
+        return None, 0
+    return copy.deepcopy(prefix_state), cached_len
+
+
+def prefill_prompt(
+    model,
+    tokenizer,
+    prompt,
+    *,
+    target_turboquant_bits: Optional[float] = None,
+    prefix_state: Optional[PromptPrefillState] = None,
+    capture_prefill_state: bool = False,
+) -> PromptPrefillRun:
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    prompt = tokenize_prompt(tokenizer, prompt)
+    prompt_tokens = prompt.tolist()
+    reusable_prefix, reusable_prefix_tokens = _match_reusable_prefix(prompt_tokens, prefix_state)
+    target_cache = (
+        reusable_prefix.target_cache
+        if reusable_prefix is not None
+        else _make_target_cache(model, turboquant_bits=target_turboquant_bits)
+    )
+
+    tic = time.perf_counter()
+    if reusable_prefix is None:
+        with mx.stream(generation_stream):
+            logits = model(prompt[None], target_cache)
+            hidden = mx.concatenate(model._hidden_states, axis=-1)
+        mx.eval(logits, hidden)
+    elif reusable_prefix_tokens < prompt.size:
+        suffix = prompt[reusable_prefix_tokens:]
+        with mx.stream(generation_stream):
+            logits = model(suffix[None], target_cache)
+            suffix_hidden = mx.concatenate(model._hidden_states, axis=-1)
+        hidden = mx.concatenate([reusable_prefix.hidden, suffix_hidden], axis=1)
+        mx.eval(logits, hidden)
+    else:
+        logits = reusable_prefix.last_logits
+        hidden = reusable_prefix.hidden
+
+    prefill_seconds = max(time.perf_counter() - tic, 1e-9)
+    prompt_tps = prompt.size / prefill_seconds
+    prefill_state = (
+        _snapshot_prefill_state(prompt_tokens, target_cache, hidden, logits)
+        if capture_prefill_state
+        else None
+    )
+    return PromptPrefillRun(
+        prompt=prompt,
+        prompt_tokens=prompt_tokens,
+        target_cache=target_cache,
+        hidden=hidden,
+        logits=logits,
+        prompt_tps=prompt_tps,
+        prefill_seconds=prefill_seconds,
+        reused_prefix_tokens=reusable_prefix_tokens,
+        prefill_state=prefill_state,
+    )
+
+
+def _clamp_block_size(value: int, *, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def next_adaptive_block_size(
+    current_block_size: int,
+    acceptance_length: int,
+    proposal_tokens: int,
+    config: Optional[AdaptiveBlockSizeConfig],
+) -> int:
+    if config is None or not config.enabled:
+        return current_block_size
+
+    current_block_size = _clamp_block_size(
+        current_block_size,
+        minimum=max(1, config.min_block_size),
+        maximum=max(1, config.max_block_size),
+    )
+    ratio = acceptance_length / max(proposal_tokens, 1)
+    if ratio >= config.grow_threshold and acceptance_length >= proposal_tokens:
+        return _clamp_block_size(
+            current_block_size + max(1, config.grow_step),
+            minimum=max(1, config.min_block_size),
+            maximum=max(1, config.max_block_size),
+        )
+    if ratio <= config.shrink_threshold:
+        return _clamp_block_size(
+            current_block_size - max(1, config.shrink_step),
+            minimum=max(1, config.min_block_size),
+            maximum=max(1, config.max_block_size),
+        )
+    return current_block_size
 
 
 def stream_generate(
@@ -492,6 +719,7 @@ def stream_generate(
     target_turboquant_bits: Optional[float] = None,
     prefix_state: Optional[PromptPrefillState] = None,
     capture_prefill_state: bool = False,
+    adaptive_block_size: Optional[AdaptiveBlockSizeConfig] = None,
 ):
     _patch_model(model, draft.config.target_layer_ids)
     block_size = block_size if block_size is not None else int(draft.config.block_size)
@@ -500,27 +728,20 @@ def stream_generate(
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
-    prompt = tokenize_prompt(tokenizer, prompt)
-    prompt_tokens = prompt.tolist()
-
     detokenizer = tokenizer.detokenizer
     mask_id = int(draft.config.mask_token_id)
-    tokens = list(prompt_tokens)
-
-    reusable_prefix = None
-    reusable_prefix_tokens = 0
-    if prefix_state is not None:
-        cached_tokens = prefix_state.prompt_tokens
-        cached_len = len(cached_tokens)
-        if cached_len <= len(prompt_tokens) and tuple(prompt_tokens[:cached_len]) == cached_tokens:
-            reusable_prefix = copy.deepcopy(prefix_state)
-            reusable_prefix_tokens = cached_len
-
-    target_cache = (
-        reusable_prefix.target_cache
-        if reusable_prefix is not None
-        else _make_target_cache(model, turboquant_bits=target_turboquant_bits)
+    prefill = prefill_prompt(
+        model,
+        tokenizer,
+        prompt,
+        target_turboquant_bits=target_turboquant_bits,
+        prefix_state=prefix_state,
+        capture_prefill_state=capture_prefill_state,
     )
+    prompt = prefill.prompt
+    prompt_tokens = prefill.prompt_tokens
+    tokens = list(prompt_tokens)
+    target_cache = prefill.target_cache
     draft_cache = make_prompt_cache(draft)
     draft.bind(model)
     _target_can_trim = can_trim_prompt_cache(target_cache)
@@ -532,34 +753,22 @@ def stream_generate(
     _capture = _GDNStateCapture() if not _target_can_trim else None
 
     try:
-        tic = time.perf_counter()
-        if reusable_prefix is None:
-            with mx.stream(generation_stream):
-                logits = model(prompt[None], target_cache)
-                hidden = mx.concatenate(model._hidden_states, axis=-1)
-            mx.eval(logits, hidden)
-        elif reusable_prefix_tokens < prompt.size:
-            suffix = prompt[reusable_prefix_tokens:]
-            with mx.stream(generation_stream):
-                logits = model(suffix[None], target_cache)
-                suffix_hidden = mx.concatenate(model._hidden_states, axis=-1)
-            hidden = mx.concatenate([reusable_prefix.hidden, suffix_hidden], axis=1)
-            mx.eval(logits, hidden)
-        else:
-            logits = reusable_prefix.last_logits
-            hidden = reusable_prefix.hidden
-        prefill_elapsed = max(time.perf_counter() - tic, 1e-9)
-        prompt_tps = prompt.size / prefill_elapsed
-        prompt_state = (
-            _snapshot_prefill_state(prompt_tokens, target_cache, hidden, logits)
-            if capture_prefill_state
-            else None
-        )
+        logits = prefill.logits
+        hidden = prefill.hidden
+        prompt_tps = prefill.prompt_tps
+        prompt_state = prefill.prefill_state
 
-        tic = time.perf_counter()
+        decode_tic = time.perf_counter()
         token = sampler(logits[:, -1:])[0, 0].item()
         tokens.append(token)
         n = 1
+        current_block_size = int(block_size)
+        proposal_history: list[int] = []
+        acceptance_lengths: list[int] = []
+        acceptance_ratios: list[float] = []
+        speculative_steps = 0
+        proposed_tokens = 0
+        accepted_tokens = 0
 
         if token in tokenizer.eos_token_ids:
             detokenizer.add_token(token)
@@ -569,21 +778,49 @@ def stream_generate(
                 [token],
                 1,
                 prompt.size,
+                prefill.prefill_seconds,
+                prefill.reused_prefix_tokens,
                 prompt_tps,
                 n,
-                tic,
+                decode_tic,
                 "stop",
                 prompt_state,
+                speculative_steps=0,
+                proposed_tokens=0,
+                accepted_tokens=0,
+                acceptance_lengths=(),
+                acceptance_ratios=(),
+                block_size_history=(),
+                adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
             )
             return
 
         detokenizer.add_token(token)
-        yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic, prefill_state=prompt_state)
+        yield _make_response(
+            detokenizer.last_segment,
+            [token],
+            1,
+            prompt.size,
+            prefill.prefill_seconds,
+            prefill.reused_prefix_tokens,
+            prompt_tps,
+            n,
+            decode_tic,
+            prefill_state=prompt_state,
+            speculative_steps=speculative_steps,
+            proposed_tokens=proposed_tokens,
+            accepted_tokens=accepted_tokens,
+            acceptance_lengths=acceptance_lengths,
+            acceptance_ratios=acceptance_ratios,
+            block_size_history=proposal_history,
+            adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+        )
 
         while n < max_tokens:
-            bs = min(block_size, max_tokens - n + 1)
+            bs = min(current_block_size, max_tokens - n + 1)
             if bs <= 1:
                 break
+            proposal_history.append(bs)
 
             with mx.stream(generation_stream):
                 block = mx.array([[tokens[-1]] + [mask_id] * (bs - 1)])
@@ -609,6 +846,12 @@ def stream_generate(
             accepted = next((i for i in range(len(d_list)) if d_list[i] != t_list[i]), len(d_list))
             new_tokens = d_list[:accepted] + [t_list[accepted]]
             new_tokens = new_tokens[:max_tokens - n]
+            accepted_length = len(new_tokens)
+            speculative_steps += 1
+            proposed_tokens += bs
+            accepted_tokens += accepted_length
+            acceptance_lengths.append(accepted_length)
+            acceptance_ratios.append(accepted_length / max(bs, 1))
 
             eos_idx = next((i for i, t in enumerate(new_tokens) if t in tokenizer.eos_token_ids), None)
             if eos_idx is not None:
@@ -623,11 +866,20 @@ def stream_generate(
                     new_tokens,
                     accepted + 1,
                     prompt.size,
+                    prefill.prefill_seconds,
+                    prefill.reused_prefix_tokens,
                     prompt_tps,
                     n,
-                    tic,
+                    decode_tic,
                     "stop",
                     prompt_state,
+                    speculative_steps=speculative_steps,
+                    proposed_tokens=proposed_tokens,
+                    accepted_tokens=accepted_tokens,
+                    acceptance_lengths=acceptance_lengths,
+                    acceptance_ratios=acceptance_ratios,
+                    block_size_history=proposal_history,
+                    adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
                 )
                 return
 
@@ -641,10 +893,19 @@ def stream_generate(
                 new_tokens,
                 accepted + 1,
                 prompt.size,
+                prefill.prefill_seconds,
+                prefill.reused_prefix_tokens,
                 prompt_tps,
                 n,
-                tic,
+                decode_tic,
                 prefill_state=prompt_state,
+                speculative_steps=speculative_steps,
+                proposed_tokens=proposed_tokens,
+                accepted_tokens=accepted_tokens,
+                acceptance_lengths=acceptance_lengths,
+                acceptance_ratios=acceptance_ratios,
+                block_size_history=proposal_history,
+                adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
             )
 
             trim = bs - accepted - 1
@@ -654,9 +915,34 @@ def stream_generate(
                 elif _capture is not None:
                     _capture.rollback(target_cache, accepted, trim)
             hidden = hidden[:, :accepted + 1, :]
+            current_block_size = next_adaptive_block_size(
+                current_block_size,
+                accepted_length,
+                bs,
+                adaptive_block_size,
+            )
 
         detokenizer.finalize()
-        yield _make_response(detokenizer.last_segment, [], 0, prompt.size, prompt_tps, n, tic, "length", prompt_state)
+        yield _make_response(
+            detokenizer.last_segment,
+            [],
+            0,
+            prompt.size,
+            prefill.prefill_seconds,
+            prefill.reused_prefix_tokens,
+            prompt_tps,
+            n,
+            decode_tic,
+            "length",
+            prompt_state,
+            speculative_steps=speculative_steps,
+            proposed_tokens=proposed_tokens,
+            accepted_tokens=accepted_tokens,
+            acceptance_lengths=acceptance_lengths,
+            acceptance_ratios=acceptance_ratios,
+            block_size_history=proposal_history,
+            adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+        )
     finally:
         if _capture is not None:
             _capture.close()
