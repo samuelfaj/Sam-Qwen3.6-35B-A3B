@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 
@@ -37,6 +38,27 @@ class ModelMlxTests(unittest.TestCase):
         self.assertIsInstance(copied, model_mlx._StableTurboQuantKVCache)
         self.assertIsNot(copied, wrapped)
         self.assertIsNot(copied._inner, wrapped._inner)
+
+    def test_stable_rotating_turboquant_kv_cache_supports_deepcopy(self):
+        try:
+            from mlx_turboquant.cache import TurboQuantKVCache
+        except ImportError:
+            self.skipTest("mlx-turboquant is not installed")
+
+        wrapped = model_mlx._StableRotatingTurboQuantKVCache(
+            TurboQuantKVCache(bits=3.5, head_dim=128, key_seed=42, value_seed=43),
+            max_size=128,
+            keep=0,
+        )
+        wrapped.offset = 17
+
+        copied = copy.deepcopy(wrapped)
+
+        self.assertIsInstance(copied, model_mlx._StableRotatingTurboQuantKVCache)
+        self.assertIsNot(copied, wrapped)
+        self.assertIsNot(copied._inner, wrapped._inner)
+        self.assertEqual(copied.offset, 17)
+        self.assertEqual(copied.max_size, 128)
 
     def test_next_adaptive_block_size_grows_and_shrinks(self):
         config = model_mlx.AdaptiveBlockSizeConfig(
@@ -96,6 +118,24 @@ class ModelMlxTests(unittest.TestCase):
         self.assertIsNot(cloned.target_cache[0], state.target_cache[0])
         self.assertIs(cloned.hidden, hidden)
         self.assertIs(cloned.last_logits, last_logits)
+
+    def test_estimate_prefill_state_bytes_counts_hidden_cache_and_logits(self):
+        hidden = mx.zeros((1, 3, 5), dtype=mx.float16)
+        last_logits = mx.zeros((1, 1, 7), dtype=mx.float16)
+        cache = SimpleNamespace(
+            keys=mx.zeros((1, 1, 4, 2), dtype=mx.float16),
+            values=mx.zeros((1, 1, 4, 2), dtype=mx.float16),
+        )
+        state = model_mlx.PromptPrefillState(
+            prompt_tokens=(10, 20, 30),
+            target_cache=[cache],
+            hidden=hidden,
+            last_logits=last_logits,
+        )
+
+        expected = hidden.nbytes + last_logits.nbytes + cache.keys.nbytes + cache.values.nbytes
+
+        self.assertEqual(model_mlx.estimate_prefill_state_bytes(state), expected)
 
 
 if __name__ == "__main__":

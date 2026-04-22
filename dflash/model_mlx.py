@@ -44,6 +44,7 @@ class DFlashConfig:
     mask_token_id: int = 0
     rope_scaling: Optional[Dict[str, Any]] = None
     sliding_window_size: Optional[int] = None
+    turboquant_bits: Optional[float] = None
 
 
 def _resolve_local_or_hub_path(model_id_or_path: str, allow_patterns: Optional[List[str]] = None) -> Path:
@@ -120,6 +121,107 @@ class _StableTurboQuantKVCache:
         return getattr(self._inner, name)
 
 
+class _StableRotatingTurboQuantKVCache(_StableTurboQuantKVCache):
+    def __init__(self, inner: Any, *, max_size: int, keep: int = 0):
+        super().__init__(inner)
+        self.max_size = max_size
+        self.keep = keep
+        self.offset = 0
+
+    def _trim_return(self, trim_size: int, value: mx.array) -> mx.array:
+        if trim_size <= 0:
+            return value
+        suffix = value[..., trim_size + self.keep :, :]
+        if self.keep <= 0:
+            return suffix
+        prefix = value[..., : self.keep, :]
+        return mx.concatenate([prefix, suffix], axis=2)
+
+    def update_and_fetch(self, keys, values):
+        prev_inner_offset = self._inner.offset
+        deq_keys, deq_values = self._inner.update_and_fetch(keys, values)
+        self.offset += keys.shape[2]
+
+        trim_size = max(prev_inner_offset - self.max_size + 1, 0)
+        if trim_size > 0:
+            trimmed = int(self._inner.trim(trim_size))
+            if trimmed > 0:
+                deq_keys = self._trim_return(trimmed, deq_keys)
+                deq_values = self._trim_return(trimmed, deq_values)
+
+        return deq_keys.astype(keys.dtype), deq_values.astype(values.dtype)
+
+    def __deepcopy__(self, memo):
+        copied = type(self).__new__(type(self))
+        memo[id(self)] = copied
+        copied._inner = copy.deepcopy(self._inner, memo)
+        copied.max_size = self.max_size
+        copied.keep = self.keep
+        copied.offset = self.offset
+        return copied
+
+
+def _turboquant_cache_cls():
+    try:
+        from mlx_turboquant.cache import TurboQuantKVCache as _TurboQuantKVCache
+    except ImportError as exc:
+        raise RuntimeError(
+            "TurboQuant cache requested, but mlx-turboquant is not installed in the current environment."
+        ) from exc
+    return _TurboQuantKVCache
+
+
+def _make_turboquant_cache_entry(
+    *,
+    bits: float,
+    head_dim: int,
+    layer_index: int,
+    rotating_max_size: Optional[int] = None,
+    keep: int = 0,
+):
+    inner = _turboquant_cache_cls()(
+        bits=float(bits),
+        head_dim=head_dim,
+        key_seed=42 + layer_index * 2,
+        value_seed=43 + layer_index * 2,
+    )
+    if rotating_max_size is not None:
+        return _StableRotatingTurboQuantKVCache(inner, max_size=rotating_max_size, keep=keep)
+    return _StableTurboQuantKVCache(inner)
+
+
+def estimate_memory_bytes(value: Any, seen: Optional[set[int]] = None) -> int:
+    if value is None:
+        return 0
+
+    if seen is None:
+        seen = set()
+
+    obj_id = id(value)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+
+    if isinstance(value, dict):
+        return sum(estimate_memory_bytes(item, seen) for item in value.values())
+
+    if isinstance(value, (list, tuple, set)):
+        return sum(estimate_memory_bytes(item, seen) for item in value)
+
+    if hasattr(value, "__dict__"):
+        return sum(estimate_memory_bytes(item, seen) for item in vars(value).values())
+
+    return 0
+
+
+def estimate_prefill_state_bytes(prefill_state: Optional["PromptPrefillState"]) -> int:
+    return estimate_memory_bytes(prefill_state)
+
+
 def _make_target_cache(
     model: Any,
     turboquant_bits: Optional[float] = None,
@@ -128,24 +230,14 @@ def _make_target_cache(
     if turboquant_bits is None:
         return cache
 
-    try:
-        from mlx_turboquant.cache import TurboQuantKVCache as _TurboQuantKVCache
-    except ImportError as exc:
-        raise RuntimeError(
-            "TurboQuant cache requested, but mlx-turboquant is not installed in the current environment."
-        ) from exc
-
     head_dim = _infer_model_head_dim(model)
     replaced = 0
     for idx, cache_entry in enumerate(cache):
         if isinstance(cache_entry, KVCache):
-            cache[idx] = _StableTurboQuantKVCache(
-                _TurboQuantKVCache(
-                    bits=float(turboquant_bits),
-                    head_dim=head_dim,
-                    key_seed=42 + idx * 2,
-                    value_seed=43 + idx * 2,
-                )
+            cache[idx] = _make_turboquant_cache_entry(
+                bits=float(turboquant_bits),
+                head_dim=head_dim,
+                layer_index=idx,
             )
             replaced += 1
 
@@ -257,6 +349,17 @@ class DFlashDraftModel(nn.Module):
         return self
 
     def make_cache(self):
+        if self.config.turboquant_bits is not None:
+            return [
+                _make_turboquant_cache_entry(
+                    bits=float(self.config.turboquant_bits),
+                    head_dim=self.config.head_dim,
+                    layer_index=idx,
+                    rotating_max_size=self.config.sliding_window_size,
+                    keep=0,
+                )
+                for idx, _ in enumerate(self.layers)
+            ]
         if self.config.sliding_window_size is not None:
             return [RotatingKVCache(max_size=self.config.sliding_window_size, keep=0) for _ in self.layers]
         return [KVCache() for _ in self.layers]
@@ -274,11 +377,17 @@ def load(model_id: str):
     return mlx_lm_load(model_id)
 
 
-def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFlashDraftModel:
+def load_draft(
+    draft_id: str,
+    sliding_window_size: Optional[int] = None,
+    turboquant_bits: Optional[float] = None,
+) -> DFlashDraftModel:
     if sliding_window_size is not None and sliding_window_size <= 0:
         raise ValueError(
             f"sliding_window_size must be positive or None, got {sliding_window_size}"
         )
+    if turboquant_bits is not None and turboquant_bits <= 0:
+        turboquant_bits = None
     path = _resolve_local_or_hub_path(draft_id, allow_patterns=["*.safetensors", "*.json"])
     cfg = json.loads((path / "config.json").read_text())
     config = DFlashConfig(
@@ -298,6 +407,7 @@ def load_draft(draft_id: str, sliding_window_size: Optional[int] = None) -> DFla
         mask_token_id=cfg["dflash_config"]["mask_token_id"],
         rope_scaling=cfg.get("rope_scaling"),
         sliding_window_size=sliding_window_size,
+        turboquant_bits=turboquant_bits,
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
     model = DFlashDraftModel(config)
@@ -456,6 +566,11 @@ class GenerationResponse:
     decode_seconds: float
     generation_tps: float
     peak_memory: float
+    prefill_hidden_bytes: int = 0
+    prefill_target_cache_bytes: int = 0
+    prefill_logits_bytes: int = 0
+    prefill_working_set_bytes: int = 0
+    prompt_cache_state_bytes: int = 0
     speculative_steps: int = 0
     proposed_tokens: int = 0
     accepted_tokens: int = 0
@@ -498,6 +613,11 @@ class PromptPrefillRun:
     prompt_tps: float
     prefill_seconds: float
     reused_prefix_tokens: int
+    hidden_bytes: int = 0
+    target_cache_bytes: int = 0
+    logits_bytes: int = 0
+    working_set_bytes: int = 0
+    prefill_state_bytes: int = 0
     prefill_state: Optional[PromptPrefillState] = None
 
 
@@ -521,6 +641,11 @@ def _make_response(
     block_size_history=(),
     adaptive_block_size=False,
     snapshot_histories=True,
+    prefill_hidden_bytes=0,
+    prefill_target_cache_bytes=0,
+    prefill_logits_bytes=0,
+    prefill_working_set_bytes=0,
+    prompt_cache_state_bytes=0,
 ):
     decode_seconds = max(time.perf_counter() - tic, 1e-9)
     generation_tps = n / decode_seconds
@@ -552,6 +677,11 @@ def _make_response(
         block_size_history=tuple(block_size_history) if snapshot_histories else (),
         adaptive_block_size=adaptive_block_size,
         finish_reason=finish_reason,
+        prefill_hidden_bytes=prefill_hidden_bytes,
+        prefill_target_cache_bytes=prefill_target_cache_bytes,
+        prefill_logits_bytes=prefill_logits_bytes,
+        prefill_working_set_bytes=prefill_working_set_bytes,
+        prompt_cache_state_bytes=prompt_cache_state_bytes,
         prefill_state=prefill_state,
     )
 
@@ -676,6 +806,10 @@ def prefill_prompt(
         if capture_prefill_state
         else None
     )
+    hidden_bytes = estimate_memory_bytes(hidden)
+    target_cache_bytes = estimate_memory_bytes(target_cache)
+    logits_bytes = estimate_memory_bytes(logits)
+    prefill_state_bytes = estimate_prefill_state_bytes(prefill_state)
     return PromptPrefillRun(
         prompt=prompt,
         prompt_tokens=prompt_tokens,
@@ -685,6 +819,11 @@ def prefill_prompt(
         prompt_tps=prompt_tps,
         prefill_seconds=prefill_seconds,
         reused_prefix_tokens=reusable_prefix_tokens,
+        hidden_bytes=hidden_bytes,
+        target_cache_bytes=target_cache_bytes,
+        logits_bytes=logits_bytes,
+        working_set_bytes=hidden_bytes + target_cache_bytes + logits_bytes,
+        prefill_state_bytes=prefill_state_bytes,
         prefill_state=prefill_state,
     )
 
@@ -811,6 +950,11 @@ def stream_generate(
                 acceptance_ratios=(),
                 block_size_history=(),
                 adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+                prefill_hidden_bytes=prefill.hidden_bytes,
+                prefill_target_cache_bytes=prefill.target_cache_bytes,
+                prefill_logits_bytes=prefill.logits_bytes,
+                prefill_working_set_bytes=prefill.working_set_bytes,
+                prompt_cache_state_bytes=prefill.prefill_state_bytes,
                 snapshot_histories=True,
             )
             return
@@ -834,6 +978,11 @@ def stream_generate(
             acceptance_ratios=acceptance_ratios,
             block_size_history=proposal_history,
             adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+            prefill_hidden_bytes=prefill.hidden_bytes,
+            prefill_target_cache_bytes=prefill.target_cache_bytes,
+            prefill_logits_bytes=prefill.logits_bytes,
+            prefill_working_set_bytes=prefill.working_set_bytes,
+            prompt_cache_state_bytes=prefill.prefill_state_bytes,
             snapshot_histories=False,
         )
 
@@ -901,6 +1050,11 @@ def stream_generate(
                     acceptance_ratios=acceptance_ratios,
                     block_size_history=proposal_history,
                     adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+                    prefill_hidden_bytes=prefill.hidden_bytes,
+                    prefill_target_cache_bytes=prefill.target_cache_bytes,
+                    prefill_logits_bytes=prefill.logits_bytes,
+                    prefill_working_set_bytes=prefill.working_set_bytes,
+                    prompt_cache_state_bytes=prefill.prefill_state_bytes,
                     snapshot_histories=True,
                 )
                 return
@@ -928,6 +1082,11 @@ def stream_generate(
                 acceptance_ratios=acceptance_ratios,
                 block_size_history=proposal_history,
                 adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+                prefill_hidden_bytes=prefill.hidden_bytes,
+                prefill_target_cache_bytes=prefill.target_cache_bytes,
+                prefill_logits_bytes=prefill.logits_bytes,
+                prefill_working_set_bytes=prefill.working_set_bytes,
+                prompt_cache_state_bytes=prefill.prefill_state_bytes,
                 snapshot_histories=False,
             )
 
@@ -965,6 +1124,11 @@ def stream_generate(
             acceptance_ratios=acceptance_ratios,
             block_size_history=proposal_history,
             adaptive_block_size=bool(adaptive_block_size and adaptive_block_size.enabled),
+            prefill_hidden_bytes=prefill.hidden_bytes,
+            prefill_target_cache_bytes=prefill.target_cache_bytes,
+            prefill_logits_bytes=prefill.logits_bytes,
+            prefill_working_set_bytes=prefill.working_set_bytes,
+            prompt_cache_state_bytes=prefill.prefill_state_bytes,
             snapshot_histories=True,
         )
     finally:

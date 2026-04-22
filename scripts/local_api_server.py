@@ -25,6 +25,7 @@ from dflash.model_mlx import (
     PromptPrefillState,
     clone_prefill_state_for_reuse,
     derive_prefill_prefix_state,
+    estimate_memory_bytes,
     load,
     load_draft,
     prefill_prompt,
@@ -124,6 +125,12 @@ RESPONSES_CONTINUE_PROMPT = (
     "Do not repeat prior acknowledgements, summaries, or bullet lists. "
     "Execute the required tool call immediately. "
     "If a tool call was cut off, re-emit it in full.]"
+)
+RESPONSES_TOOL_RESULT_PROMPT = (
+    "[System: The previous tool call already completed and its result is available above. "
+    "Use that result to continue. "
+    "Do not immediately repeat the exact same tool call with identical arguments unless the tool output "
+    "explicitly shows a failure, truncation, or asks for a retry.]"
 )
 
 
@@ -286,6 +293,22 @@ def _coerce_tool_arguments(value: Any) -> dict[str, Any]:
             return {"input": stripped}
         return parsed if isinstance(parsed, dict) else {"input": parsed}
     return {"input": value}
+
+
+def _canonical_tool_arguments(value: Any) -> str:
+    return json.dumps(_coerce_tool_arguments(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _make_tool_message(content: Any, *, tool_call_id: str | None = None, name: str | None = None) -> dict[str, Any]:
+    message = {
+        "role": "tool",
+        "content": _extract_text_from_content(content),
+    }
+    if tool_call_id:
+        message["tool_call_id"] = tool_call_id
+    if name:
+        message["name"] = name
+    return message
 
 
 def _parse_param_value(value: str) -> Any:
@@ -586,8 +609,11 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     return _clean_output_text(visible_text), tool_calls
 
 
-def _make_internal_tool_call(name: str, arguments: Any) -> dict[str, Any]:
+def _make_internal_tool_call(name: str, arguments: Any, *, call_id: str | None = None) -> dict[str, Any]:
+    tool_call_id = call_id or f"call_{uuid.uuid4().hex}"
     return {
+        "id": tool_call_id,
+        "type": "function",
         "function": {
             "name": name,
             "arguments": _coerce_tool_arguments(arguments),
@@ -701,10 +727,21 @@ def _output_text_from_items(items: list[dict[str, Any]]) -> str:
 def _build_output_items(full_text: str) -> list[dict[str, Any]]:
     _, visible_text = _strip_reasoning_blocks(full_text)
     assistant_text, tool_calls = _parse_tool_calls(visible_text)
+    deduped_tool_calls: list[dict[str, Any]] = []
+    previous_signature: tuple[str, str] | None = None
+    for tool_call in tool_calls:
+        signature = (
+            _coerce_text(tool_call.get("name") or "tool"),
+            _canonical_tool_arguments(tool_call.get("arguments")),
+        )
+        if signature == previous_signature:
+            continue
+        deduped_tool_calls.append(tool_call)
+        previous_signature = signature
     items: list[dict[str, Any]] = []
     if assistant_text:
         items.append(_make_message_item(assistant_text))
-    items.extend(tool_calls)
+    items.extend(deduped_tool_calls)
     if not items:
         items.append(_make_message_item(""))
     return items
@@ -729,12 +766,11 @@ def _messages_from_output_items(output_items: list[dict[str, Any]]) -> list[dict
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        {
-                            "function": {
-                                "name": item.get("name") or "tool",
-                                "arguments": _coerce_tool_arguments(item.get("arguments")),
-                            }
-                        }
+                        _make_internal_tool_call(
+                            item.get("name") or "tool",
+                            item.get("arguments"),
+                            call_id=item.get("call_id"),
+                        )
                     ],
                 }
             )
@@ -796,6 +832,30 @@ def _massage_responses_continuation_messages(messages: list[dict[str, Any]]) -> 
         "content": RESPONSES_CONTINUE_PROMPT,
     }
     return [*messages[:trailing_start], last_assistant, continue_message]
+
+
+def _massage_responses_tool_result_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not messages or messages[-1].get("role") != "tool":
+        return messages
+
+    tool_result_start = len(messages) - 1
+    while tool_result_start > 0 and messages[tool_result_start - 1].get("role") == "tool":
+        tool_result_start -= 1
+
+    if tool_result_start == 0:
+        return messages
+
+    preceding_message = messages[tool_result_start - 1]
+    if preceding_message.get("role") != "assistant" or not preceding_message.get("tool_calls"):
+        return messages
+
+    return [
+        *messages,
+        {
+            "role": "user",
+            "content": RESPONSES_TOOL_RESULT_PROMPT,
+        },
+    ]
 
 
 def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -874,6 +934,7 @@ def _normalize_anthropic_messages(req: AnthropicRequest | AnthropicCountTokensRe
                         _make_internal_tool_call(
                             block_data.get("name") or "tool",
                             block_data.get("input"),
+                            call_id=block_data.get("id"),
                         )
                     )
                     continue
@@ -900,10 +961,11 @@ def _normalize_anthropic_messages(req: AnthropicRequest | AnthropicCountTokensRe
                     messages.append({"role": msg.role, "content": "".join(text_parts)})
                     text_parts = []
                 messages.append(
-                    {
-                        "role": "tool",
-                        "content": _extract_text_from_content(block_data.get("content")),
-                    }
+                    _make_tool_message(
+                        block_data.get("content"),
+                        tool_call_id=block_data.get("tool_use_id"),
+                        name=block_data.get("name"),
+                    )
                 )
                 continue
 
@@ -1173,17 +1235,17 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
 
         if item_type in {"function_call", "custom_tool_call"}:
             tool_name = item.get("name") or item.get("tool_name") or item.get("action") or "tool"
+            call_id = item.get("call_id") or item.get("tool_call_id") or item.get("id")
             messages.append(
                 {
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        {
-                            "function": {
-                                "name": tool_name,
-                                "arguments": _coerce_tool_arguments(item.get("arguments")),
-                            }
-                        }
+                        _make_internal_tool_call(
+                            tool_name,
+                            item.get("arguments"),
+                            call_id=call_id,
+                        )
                     ],
                 }
             )
@@ -1194,10 +1256,11 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
             if not output:
                 output = item.get("content")
             messages.append(
-                {
-                    "role": "tool",
-                    "content": _extract_text_from_content(output),
-                }
+                _make_tool_message(
+                    output,
+                    tool_call_id=item.get("call_id") or item.get("tool_call_id") or item.get("id"),
+                    name=item.get("name") or item.get("tool_name"),
+                )
             )
             continue
 
@@ -1228,6 +1291,7 @@ class LocalModelServer:
         context_reserve: int,
         keep_alive_seconds: float | None,
         target_turboquant_bits: float | None,
+        draft_turboquant_bits: float | None = None,
         adaptive_block_size_config: AdaptiveBlockSizeConfig | None = None,
         global_prefix_cache_limit: int = GLOBAL_PREFIX_CACHE_LIMIT,
     ) -> None:
@@ -1243,6 +1307,9 @@ class LocalModelServer:
         self.keep_alive_seconds = keep_alive_seconds
         self.target_turboquant_bits = (
             None if target_turboquant_bits is not None and target_turboquant_bits <= 0 else target_turboquant_bits
+        )
+        self.draft_turboquant_bits = (
+            None if draft_turboquant_bits is not None and draft_turboquant_bits <= 0 else draft_turboquant_bits
         )
         self.adaptive_block_size_config = adaptive_block_size_config or AdaptiveBlockSizeConfig(
             enabled=False,
@@ -1362,7 +1429,11 @@ class LocalModelServer:
         if self._model is not None and self._draft is not None and self._tokenizer is not None:
             return
         self._model, self._tokenizer = load(self.model_path)
-        self._draft = load_draft(self.draft_path, sliding_window_size=self.sliding_window_size)
+        self._draft = load_draft(
+            self.draft_path,
+            sliding_window_size=self.sliding_window_size,
+            turboquant_bits=self.draft_turboquant_bits,
+        )
 
     def _prune_prefix_cache_states_locked(self) -> None:
         while len(self._prefix_state_order) > self.prefix_cache_state_limit:
@@ -1611,6 +1682,11 @@ class LocalModelServer:
         self._global_prefix_order.append(stable_prefix_key)
         self._prune_global_prefix_states_locked()
 
+    def _should_capture_prompt_cache_state(self, stable_prefix_tokens: tuple[int, ...]) -> bool:
+        if self.prefix_cache_state_limit > 0:
+            return True
+        return self.global_prefix_cache_limit > 0 and bool(stable_prefix_tokens)
+
     def _effective_max_tokens(self, requested_max_tokens: int, prompt_tokens: int) -> int:
         candidates = [max(1, requested_max_tokens)]
 
@@ -1645,6 +1721,7 @@ class LocalModelServer:
         max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
         stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
         stable_prefix_tokens = self._stable_prefix_tokens_locked(messages, tools=tools)
+        capture_prefill_state = capture_prompt_cache_state and self._should_capture_prompt_cache_state(stable_prefix_tokens)
         prefix_state, prefix_cache_source = self._select_prefix_state_locked(
             prompt_tokens_list,
             previous_response_id,
@@ -1663,7 +1740,7 @@ class LocalModelServer:
             temperature=temperature,
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=prefix_state,
-            capture_prefill_state=capture_prompt_cache_state,
+            capture_prefill_state=capture_prefill_state,
             adaptive_block_size=self.adaptive_block_size_config,
         ):
             if chunk.text:
@@ -1675,7 +1752,7 @@ class LocalModelServer:
             self._remember_global_prefix_state_locked(
                 stable_prefix_key,
                 stable_prefix_tokens,
-                final.prefill_state if capture_prompt_cache_state else None,
+                final.prefill_state if capture_prefill_state else None,
             )
         result = {
             "text": "".join(text_parts),
@@ -1697,9 +1774,14 @@ class LocalModelServer:
             "block_size_history": list(final.block_size_history),
             "adaptive_block_size": final.adaptive_block_size,
             "prefix_cache_source": prefix_cache_source,
+            "prefill_hidden_bytes": final.prefill_hidden_bytes,
+            "prefill_target_cache_bytes": final.prefill_target_cache_bytes,
+            "prefill_logits_bytes": final.prefill_logits_bytes,
+            "prefill_working_set_bytes": final.prefill_working_set_bytes,
+            "prompt_cache_state_bytes": final.prompt_cache_state_bytes,
             "peak_memory_gb": final.peak_memory,
             "elapsed": time.time() - started,
-            "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
+            "prompt_cache_state": final.prefill_state if capture_prefill_state else None,
         }
         return text_parts, result
 
@@ -1720,6 +1802,7 @@ class LocalModelServer:
         started = time.time()
         stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
         stable_prefix_tokens = self._stable_prefix_tokens_locked(messages, tools=tools)
+        capture_prefill_state = capture_prompt_cache_state and self._should_capture_prompt_cache_state(stable_prefix_tokens)
         prefix_state, prefix_cache_source = self._select_prefix_state_locked(
             prompt_tokens_list,
             previous_response_id,
@@ -1735,7 +1818,7 @@ class LocalModelServer:
             temperature=temperature,
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=prefix_state,
-            capture_prefill_state=capture_prompt_cache_state,
+            capture_prefill_state=capture_prefill_state,
             adaptive_block_size=self.adaptive_block_size_config,
         )
         return iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source
@@ -1806,6 +1889,11 @@ class LocalModelServer:
                 "block_size_history": list(final.block_size_history),
                 "adaptive_block_size": final.adaptive_block_size,
                 "prefix_cache_source": prefix_cache_source,
+                "prefill_hidden_bytes": final.prefill_hidden_bytes,
+                "prefill_target_cache_bytes": final.prefill_target_cache_bytes,
+                "prefill_logits_bytes": final.prefill_logits_bytes,
+                "prefill_working_set_bytes": final.prefill_working_set_bytes,
+                "prompt_cache_state_bytes": final.prompt_cache_state_bytes,
                 "peak_memory_gb": final.peak_memory,
                 "elapsed": time.time() - started,
                 "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
@@ -2666,14 +2754,19 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "keep_alive_seconds": server.keep_alive_seconds,
             "stream_heartbeat_seconds": STREAM_HEARTBEAT_SECONDS,
             "target_turboquant_bits": server.target_turboquant_bits,
+            "draft_turboquant_bits": server.draft_turboquant_bits,
             "response_history_limit": server.response_history_limit,
             "response_history_entries": len(server._response_order),
             "active_generation_requests": 1 if server._active_generation_ticket is not None else 0,
             "queued_generation_requests": len(server._queued_generation_tickets),
             "prefix_cache_state_limit": server.prefix_cache_state_limit,
             "prefix_cache_entries": len(server._prefix_state_order),
+            "response_prefix_cache_bytes": estimate_memory_bytes(
+                [state.get("prompt_cache_state") for state in server._response_states.values()]
+            ),
             "global_prefix_cache_limit": server.global_prefix_cache_limit,
             "global_prefix_cache_entries": len(server._global_prefix_order),
+            "global_prefix_cache_bytes": estimate_memory_bytes(list(server._global_prefix_states.values())),
             "global_prefix_cache_hits": server._global_prefix_cache_hits,
             "global_prefix_cache_misses": server._global_prefix_cache_misses,
             "adaptive_block_size": server.adaptive_block_size_config.enabled,
@@ -2847,6 +2940,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
         except UnknownPreviousResponseError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         messages = _massage_responses_continuation_messages(messages)
+        messages = _massage_responses_tool_result_messages(messages)
         max_tokens = _responses_max_tokens(req.max_output_tokens, tools)
 
         if req.stream:
@@ -3002,6 +3096,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional TurboQuant bit width for the target model's KV cache on compatible full-attention layers. Use values like 4 or 3.5.",
     )
     parser.add_argument(
+        "--draft-turboquant-bits",
+        type=float,
+        default=(
+            float(os.environ["LOCAL_DFLASH_DRAFT_TURBOQUANT_BITS"])
+            if os.environ.get("LOCAL_DFLASH_DRAFT_TURBOQUANT_BITS")
+            else (
+                float(os.environ["LOCAL_DFLASH_TURBOQUANT_BITS"])
+                if os.environ.get("LOCAL_DFLASH_TURBOQUANT_BITS")
+                else None
+            )
+        ),
+        help="Optional TurboQuant bit width for the draft model's KV cache. Defaults to the target TurboQuant setting when unset.",
+    )
+    parser.add_argument(
         "--mlx-memory-limit-gb",
         type=float,
         default=(float(os.environ["LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB"]) if os.environ.get("LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB") else None),
@@ -3052,6 +3160,7 @@ def main() -> int:
         context_reserve=args.context_reserve,
         keep_alive_seconds=_parse_keep_alive(args.keep_alive_seconds),
         target_turboquant_bits=args.target_turboquant_bits,
+        draft_turboquant_bits=args.draft_turboquant_bits,
         adaptive_block_size_config=adaptive_block_size_config,
         global_prefix_cache_limit=max(0, args.global_prefix_cache_limit),
     )

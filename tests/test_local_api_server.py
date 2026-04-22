@@ -8,6 +8,8 @@ from pathlib import Path
 from queue import Queue
 from unittest import mock
 
+import mlx.core as mx
+
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "local_api_server.py"
 SPEC = importlib.util.spec_from_file_location("local_api_server", MODULE_PATH)
@@ -209,6 +211,7 @@ class LocalApiServerTests(unittest.TestCase):
             context_reserve=128,
             keep_alive_seconds=keep_alive_seconds,
             target_turboquant_bits=None,
+            draft_turboquant_bits=None,
         )
 
     def _get_health_endpoint(self, server):
@@ -224,6 +227,34 @@ class LocalApiServerTests(unittest.TestCase):
             if getattr(route, "path", None) == path:
                 return route.endpoint
         self.fail(f"Endpoint not found: {path}")
+
+    def _make_generation_chunk(self, *, prefill_state=None):
+        return SimpleNamespace(
+            text="ok",
+            finish_reason="stop",
+            prefill_seconds=0.1,
+            prompt_tps=10.0,
+            reused_prefix_tokens=0,
+            decode_seconds=0.2,
+            generation_tps=9.0,
+            generation_tokens=2,
+            speculative_steps=1,
+            proposed_tokens=2,
+            accepted_tokens=2,
+            avg_acceptance_length=2.0,
+            avg_acceptance_ratio=1.0,
+            acceptance_lengths=(),
+            acceptance_ratios=(),
+            block_size_history=(),
+            adaptive_block_size=False,
+            prefill_hidden_bytes=11,
+            prefill_target_cache_bytes=22,
+            prefill_logits_bytes=33,
+            prefill_working_set_bytes=66,
+            prompt_cache_state_bytes=77,
+            peak_memory=1.5,
+            prefill_state=prefill_state,
+        )
 
     def test_previous_response_id_restores_context_and_tools(self):
         server = self._make_server()
@@ -271,8 +302,107 @@ class LocalApiServerTests(unittest.TestCase):
             merged_messages[3]["tool_calls"][0]["function"]["name"],
             "search_files",
         )
+        self.assertEqual(merged_messages[3]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(merged_messages[3]["tool_calls"][0]["type"], "function")
         self.assertEqual(merged_messages[4], {"role": "tool", "content": '[{"path":"README.md"}]'})
         self.assertEqual(merged_tools, tools)
+
+    def test_normalize_responses_input_preserves_tool_call_ids(self):
+        req = SimpleNamespace(
+            tools=None,
+            instructions=None,
+            input=[
+                {
+                    "type": "function_call",
+                    "name": "search_files",
+                    "call_id": "call_123",
+                    "arguments": {"path": "."},
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": '[{"path":"README.md"}]',
+                },
+            ],
+        )
+
+        messages, tools = local_api_server._normalize_responses_input(req)
+
+        self.assertEqual(tools, [])
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["tool_calls"][0]["id"], "call_123")
+        self.assertEqual(messages[0]["tool_calls"][0]["type"], "function")
+        self.assertEqual(messages[0]["tool_calls"][0]["function"]["name"], "search_files")
+        self.assertEqual(messages[1]["role"], "tool")
+        self.assertEqual(messages[1]["tool_call_id"], "call_123")
+        self.assertEqual(messages[1]["content"], '[{"path":"README.md"}]')
+
+    def test_build_output_items_deduplicates_identical_consecutive_tool_calls(self):
+        output_items = local_api_server._build_output_items(
+            (
+                '<function_call>{"name":"search_files","arguments":{"path":"."}}</function_call>\n'
+                '<function_call>{"name":"search_files","arguments":{"path":"."}}</function_call>'
+            )
+        )
+
+        function_calls = [item for item in output_items if item["type"] == "function_call"]
+        self.assertEqual(len(function_calls), 1)
+        self.assertEqual(function_calls[0]["name"], "search_files")
+        self.assertEqual(function_calls[0]["call_id"][:5], "call_")
+
+    def test_generate_locked_skips_prefill_capture_when_caches_are_disabled(self):
+        server = self._make_server()
+        server.prefix_cache_state_limit = 0
+        server.global_prefix_cache_limit = 0
+        server.ensure_loaded = mock.Mock()
+        server.build_prompt = mock.Mock(return_value="prompt")
+        server.tokenize_prompt = mock.Mock(return_value=[1, 2, 3])
+        chunk = self._make_generation_chunk(prefill_state=object())
+        observed = {}
+
+        def fake_stream_generate(*args, **kwargs):
+            observed["capture_prefill_state"] = kwargs["capture_prefill_state"]
+            yield chunk
+
+        with mock.patch.object(local_api_server, "stream_generate", side_effect=fake_stream_generate):
+            _, result = server._generate_locked(
+                messages=[{"role": "user", "content": "hello"}],
+                requested_max_tokens=16,
+                temperature=0.0,
+                capture_prompt_cache_state=True,
+            )
+
+        self.assertFalse(observed["capture_prefill_state"])
+        self.assertIsNone(result["prompt_cache_state"])
+        self.assertEqual(result["prefill_hidden_bytes"], 11)
+        self.assertEqual(result["prefill_target_cache_bytes"], 22)
+        self.assertEqual(result["prefill_logits_bytes"], 33)
+        self.assertEqual(result["prefill_working_set_bytes"], 66)
+        self.assertEqual(result["prompt_cache_state_bytes"], 77)
+
+    def test_generate_locked_captures_prefill_state_when_prefix_cache_is_enabled(self):
+        server = self._make_server()
+        server.prefix_cache_state_limit = 1
+        server.ensure_loaded = mock.Mock()
+        server.build_prompt = mock.Mock(return_value="prompt")
+        server.tokenize_prompt = mock.Mock(return_value=[1, 2, 3])
+        chunk = self._make_generation_chunk(prefill_state=object())
+        observed = {}
+
+        def fake_stream_generate(*args, **kwargs):
+            observed["capture_prefill_state"] = kwargs["capture_prefill_state"]
+            yield chunk
+
+        with mock.patch.object(local_api_server, "stream_generate", side_effect=fake_stream_generate):
+            _, result = server._generate_locked(
+                messages=[{"role": "user", "content": "hello"}],
+                requested_max_tokens=16,
+                temperature=0.0,
+                capture_prompt_cache_state=True,
+            )
+
+        self.assertTrue(observed["capture_prefill_state"])
+        self.assertIs(result["prompt_cache_state"], chunk.prefill_state)
 
     def test_massage_responses_continuation_messages_adds_explicit_continue_prompt(self):
         messages = [
@@ -300,6 +430,29 @@ class LocalApiServerTests(unittest.TestCase):
             local_api_server._massage_responses_continuation_messages(messages),
             messages,
         )
+
+    def test_massage_responses_tool_result_messages_adds_anti_repeat_prompt(self):
+        messages = [
+            {"role": "user", "content": "Inspect the repository."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "search_files",
+                        {"path": "."},
+                        call_id="call_1",
+                    )
+                ],
+            },
+            {"role": "tool", "content": '[{"path":"README.md"}]', "tool_call_id": "call_1"},
+        ]
+
+        massaged = local_api_server._massage_responses_tool_result_messages(messages)
+
+        self.assertEqual(massaged[:-1], messages)
+        self.assertEqual(massaged[-1]["role"], "user")
+        self.assertEqual(massaged[-1]["content"], local_api_server.RESPONSES_TOOL_RESULT_PROMPT)
 
     def test_responses_max_tokens_raises_floor_when_tools_are_available(self):
         self.assertEqual(
@@ -518,7 +671,7 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(server._tokenizer, "tokenizer-1")
         self.assertEqual(server._draft, "draft-1")
         load_mock.assert_called_once_with("model")
-        load_draft_mock.assert_called_once_with("draft", sliding_window_size=256)
+        load_draft_mock.assert_called_once_with("draft", sliding_window_size=256, turboquant_bits=None)
 
         server.unload()
         self.assertEqual(server.reset_loaded_state_calls, 1)
@@ -533,7 +686,7 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(server._tokenizer, "tokenizer-2")
         self.assertEqual(server._draft, "draft-2")
         load_mock.assert_called_once_with("model")
-        load_draft_mock.assert_called_once_with("draft", sliding_window_size=256)
+        load_draft_mock.assert_called_once_with("draft", sliding_window_size=256, turboquant_bits=None)
 
     def test_health_reports_loaded_state_without_preload(self):
         server = self._make_server(TrackingServer, keep_alive_seconds=300)
@@ -560,6 +713,37 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(before["response_history_entries"], 0)
         self.assertEqual(before["active_generation_requests"], 0)
         self.assertEqual(before["queued_generation_requests"], 0)
+        self.assertIsNone(before["draft_turboquant_bits"])
+        self.assertEqual(before["response_prefix_cache_bytes"], 0)
+        self.assertEqual(before["global_prefix_cache_bytes"], 0)
+
+    def test_health_reports_prefix_cache_bytes(self):
+        server = self._make_server()
+        health = self._get_health_endpoint(server)
+        state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2),
+            target_cache=[
+                SimpleNamespace(
+                    keys=mx.zeros((1, 1, 2, 2), dtype=mx.float16),
+                    values=mx.zeros((1, 1, 2, 2), dtype=mx.float16),
+                )
+            ],
+            hidden=mx.zeros((1, 2, 3), dtype=mx.float16),
+            last_logits=mx.zeros((1, 1, 4), dtype=mx.float16),
+        )
+        server._response_states["resp_1"] = {"prompt_cache_state": state}
+        server._global_prefix_states["stable"] = state
+
+        with (
+            mock.patch.object(local_api_server.mx, "get_active_memory", return_value=0),
+            mock.patch.object(local_api_server.mx, "get_cache_memory", return_value=0),
+            mock.patch.object(local_api_server.mx, "get_peak_memory", return_value=0),
+        ):
+            payload = health()
+
+        expected_bytes = local_api_server.estimate_memory_bytes([state])
+        self.assertEqual(payload["response_prefix_cache_bytes"], expected_bytes)
+        self.assertEqual(payload["global_prefix_cache_bytes"], expected_bytes)
 
     def test_compatibility_endpoints_expose_model_metadata(self):
         server = self._make_server()
@@ -745,6 +929,11 @@ class LocalApiServerTests(unittest.TestCase):
                 acceptance_ratios=(1.0,),
                 block_size_history=(2,),
                 adaptive_block_size=False,
+                prefill_hidden_bytes=11,
+                prefill_target_cache_bytes=22,
+                prefill_logits_bytes=33,
+                prefill_working_set_bytes=66,
+                prompt_cache_state_bytes=77,
                 peak_memory=1.0,
                 prefill_state=next_state,
             )

@@ -131,6 +131,7 @@ def _make_server(args: argparse.Namespace, block_size: int):
         context_reserve=args.context_reserve,
         keep_alive_seconds=None,
         target_turboquant_bits=args.target_turboquant_bits,
+        draft_turboquant_bits=args.draft_turboquant_bits,
         adaptive_block_size_config=adaptive_config,
         global_prefix_cache_limit=max(0, args.global_prefix_cache_limit),
     )
@@ -252,11 +253,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--draft-path", default=DEFAULT_DRAFT_PATH)
     parser.add_argument("--model-name", default="qwen3.6-35b-a3b-dflash-local")
-    parser.add_argument("--sliding-window-size", type=int, default=4096)
+    parser.add_argument("--sliding-window-size", type=int, default=2048)
     parser.add_argument("--max-tokens-limit", type=int, default=32768)
     parser.add_argument("--context-reserve", type=int, default=256)
     parser.add_argument("--context-window-override", type=int, default=65536)
-    parser.add_argument("--target-turboquant-bits", type=float, default=4.0)
+    parser.add_argument("--target-turboquant-bits", type=float, default=3.5)
+    parser.add_argument("--draft-turboquant-bits", type=float, default=3.5)
     parser.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode when rebuilding prompts.")
     parser.add_argument("--adaptive-block-size", action="store_true", help="Evaluate adaptive block size instead of fixed block size.")
     parser.add_argument("--adaptive-block-size-min", type=int, default=8)

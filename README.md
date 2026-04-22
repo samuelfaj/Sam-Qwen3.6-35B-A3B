@@ -137,16 +137,19 @@ http://127.0.0.1:8010
 - Port: `8010`
 - Block size: `10`
 - Adaptive block size: enabled
-- Draft sliding window: `4096`
-- Context window: `65536`
-- Max output tokens limit: `32768`
+- Draft sliding window: `2048`
+- Context window: `49152`
+- Max output tokens limit: `4096`
 - Thinking mode: disabled
-- TurboQuant target KV: `4`
+- TurboQuant target KV: `3.5`
+- TurboQuant draft KV: `3.5`
+- MLX memory limit: `28 GiB`
+- MLX allocator cache limit: `0 GiB`
 - Keep-alive: `60s`
 - Preload on startup: disabled
-- Response history limit: `1024`
-- Response prefix cache limit: `2`
-- Global prefix cache limit: `16`
+- Response history limit: `128`
+- Response prefix cache limit: `0`
+- Global prefix cache limit: `0`
 
 ### Main API Service Helper
 
@@ -189,6 +192,9 @@ Typical health fields include:
 - `queued_generation_requests`
 - `stream_heartbeat_seconds`
 - `target_turboquant_bits`
+- `draft_turboquant_bits`
+- `response_prefix_cache_bytes`
+- `global_prefix_cache_bytes`
 - `active_memory_gb`
 - `cache_memory_gb`
 - `peak_memory_gb`
@@ -388,20 +394,21 @@ export LOCAL_DFLASH_BLOCK_SIZE=10
 export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE=1
 export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN=8
 export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX=18
-export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=4096
+export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=2048
 export LOCAL_DFLASH_DISABLE_THINKING=1
-export LOCAL_DFLASH_MAX_TOKENS=32768
+export LOCAL_DFLASH_MAX_TOKENS=4096
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
-export LOCAL_DFLASH_CONTEXT_WINDOW=65536
+export LOCAL_DFLASH_CONTEXT_WINDOW=49152
 export LOCAL_DFLASH_KEEP_ALIVE=60
 export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=2
-export LOCAL_DFLASH_TURBOQUANT_BITS=4
-export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=
-export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=
+export LOCAL_DFLASH_TURBOQUANT_BITS=3.5
+export LOCAL_DFLASH_DRAFT_TURBOQUANT_BITS=3.5
+export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=28
+export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
 export LOCAL_DFLASH_NO_PRELOAD=1
-export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=1024
-export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=2
-export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=16
+export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=128
+export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=0
+export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=0
 ```
 
 Distill API launcher defaults from `scripts/start_distill_wrapper.sh`:
