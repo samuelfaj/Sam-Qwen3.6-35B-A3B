@@ -135,21 +135,24 @@ http://127.0.0.1:8010
 
 - Model name: `qwen3.6-35b-a3b-dflash-local`
 - Port: `8010`
-- Block size: `10`
-- Adaptive block size: enabled
-- Draft sliding window: `2048`
-- Context window: `49152`
+- Block size: `12`
+- Adaptive block size: enabled (min 10, max 22, grow 0.88, shrink 0.5)
+- Draft sliding window: `32768`
+- Rotating keep tokens: `4096`
+- Context window: `98304`
 - Max output tokens limit: `4096`
 - Thinking mode: disabled
 - TurboQuant target KV: `3.5`
 - TurboQuant draft KV: `3.5`
-- MLX memory limit: `28 GiB`
-- MLX allocator cache limit: `0 GiB`
-- Keep-alive: `60s`
+- MLX memory limit: `36 GiB`
+- MLX allocator cache limit: `10 GiB`
+- MLX wired limit: `24 GiB`
+- Keep-alive: `120s`
+- Stream heartbeat: `10s`
 - Preload on startup: disabled
-- Response history limit: `128`
-- Response prefix cache limit: `0`
-- Global prefix cache limit: `0`
+- Response history limit: `16`
+- Response prefix cache limit: `8`
+- Global prefix cache limit: `4` (byte cap `8 GiB`)
 
 ### Main API Service Helper
 
@@ -418,25 +421,30 @@ export LOCAL_DFLASH_DRAFT_PATH=/path/to/Qwen3.6-35B-A3B-DFlash
 export LOCAL_DFLASH_MODEL_NAME=qwen3.6-35b-a3b-dflash-local
 export LOCAL_DFLASH_HOST=127.0.0.1
 export LOCAL_DFLASH_PORT=8010
-export LOCAL_DFLASH_BLOCK_SIZE=10
+export LOCAL_DFLASH_BLOCK_SIZE=12
 export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE=1
-export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN=8
-export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX=18
-export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=2048
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN=10
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX=22
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_THRESHOLD=0.88
+export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_THRESHOLD=0.5
+export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=32768
+export LOCAL_DFLASH_ROTATING_KEEP_TOKENS=4096
 export LOCAL_DFLASH_DISABLE_THINKING=1
 export LOCAL_DFLASH_MAX_TOKENS=4096
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
-export LOCAL_DFLASH_CONTEXT_WINDOW=49152
-export LOCAL_DFLASH_KEEP_ALIVE=60
-export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=1
+export LOCAL_DFLASH_CONTEXT_WINDOW=98304
+export LOCAL_DFLASH_KEEP_ALIVE=120
+export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=10
 export LOCAL_DFLASH_TURBOQUANT_BITS=3.5
 export LOCAL_DFLASH_DRAFT_TURBOQUANT_BITS=3.5
-export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=28
-export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=0
+export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=36
+export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=10
+export LOCAL_DFLASH_MLX_WIRED_LIMIT_GB=24
 export LOCAL_DFLASH_NO_PRELOAD=1
-export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=128
-export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=0
-export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=0
+export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=16
+export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=8
+export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=4
+export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB=8
 ```
 
 Distill API launcher defaults from `scripts/start_distill_wrapper.sh`:
