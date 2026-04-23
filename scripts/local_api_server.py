@@ -4987,7 +4987,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-window-override",
         type=int,
-        default=(int(os.environ["LOCAL_DFLASH_CONTEXT_WINDOW"]) if os.environ.get("LOCAL_DFLASH_CONTEXT_WINDOW") else 65536),
+        default=(int(os.environ["LOCAL_DFLASH_CONTEXT_WINDOW"]) if os.environ.get("LOCAL_DFLASH_CONTEXT_WINDOW") else 32768),
         help="Optional logical context cap. Requests above this token budget are rejected before generation.",
     )
     parser.add_argument(
