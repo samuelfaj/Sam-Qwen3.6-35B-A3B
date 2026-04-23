@@ -415,6 +415,34 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(result["prefill_working_set_bytes"], 66)
         self.assertEqual(result["prompt_cache_state_bytes"], 77)
 
+    def test_generate_locked_skips_full_prompt_capture_for_global_cache_only(self):
+        server = self._make_server()
+        server.prefix_cache_state_limit = 0
+        server.global_prefix_cache_limit = 1
+        server.ensure_loaded = mock.Mock()
+        server.build_prompt = mock.Mock(return_value="prompt")
+        server.tokenize_prompt = mock.Mock(return_value=[1, 2, 3])
+        server._stable_prefix_tokens_locked = mock.Mock(return_value=(1,))
+        server._remember_global_prefix_state_locked = mock.Mock()
+        chunk = self._make_generation_chunk(prefill_state=object())
+        observed = {}
+
+        def fake_stream_generate(*args, **kwargs):
+            observed["capture_prefill_state"] = kwargs["capture_prefill_state"]
+            yield chunk
+
+        with mock.patch.object(local_api_server, "stream_generate", side_effect=fake_stream_generate):
+            _, result = server._generate_locked(
+                messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+                requested_max_tokens=16,
+                temperature=0.0,
+                capture_prompt_cache_state=True,
+            )
+
+        self.assertFalse(observed["capture_prefill_state"])
+        self.assertIsNone(result["prompt_cache_state"])
+        server._remember_global_prefix_state_locked.assert_called_once()
+
     def test_generate_locked_captures_prefill_state_when_prefix_cache_is_enabled(self):
         server = self._make_server()
         server.prefix_cache_state_limit = 1
@@ -837,6 +865,20 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertTrue(timer.cancelled)
         self.assertIsNone(server._unload_timer)
 
+    def test_generate_finishes_request_when_generation_raises(self):
+        server = self._make_server(TrackingServer, keep_alive_seconds=300)
+        server._generate_locked = mock.Mock(side_effect=RuntimeError("boom"))
+
+        with self.assertRaises(RuntimeError):
+            server.generate(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+
+        self.assertEqual(server.clear_request_state_calls, 1)
+        self.assertIsNone(server._active_generation_ticket)
+
     def test_ensure_loaded_reloads_model_after_idle_unload(self):
         server = self._make_server(TrackingServer, keep_alive_seconds=300)
 
@@ -920,8 +962,19 @@ class LocalApiServerTests(unittest.TestCase):
             hidden=mx.zeros((1, 2, 3), dtype=mx.float16),
             last_logits=mx.zeros((1, 1, 4), dtype=mx.float16),
         )
-        server._response_states["resp_1"] = {"prompt_cache_state": state}
+        expected_bytes = local_api_server.estimate_memory_bytes(state)
+        server.remember_response(
+            response_id="resp_1",
+            previous_response_id=None,
+            request_messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            output_items=[],
+            prompt_cache_state=state,
+        )
         server._global_prefix_states["stable"] = state
+        server._global_prefix_order.append("stable")
+        server._global_prefix_state_bytes["stable"] = expected_bytes
+        server._global_prefix_cache_bytes = expected_bytes
 
         with (
             mock.patch.object(local_api_server.mx, "get_active_memory", return_value=0),
@@ -930,7 +983,6 @@ class LocalApiServerTests(unittest.TestCase):
         ):
             payload = health()
 
-        expected_bytes = local_api_server.estimate_memory_bytes([state])
         self.assertEqual(payload["response_prefix_cache_bytes"], expected_bytes)
         self.assertEqual(payload["global_prefix_cache_bytes"], expected_bytes)
 
@@ -1011,6 +1063,30 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIsNone(server._response_states["resp_1"]["prompt_cache_state"])
         self.assertEqual(server._response_states["resp_2"]["prompt_cache_state"], second_state)
         self.assertEqual(list(server._prefix_state_order), ["resp_2"])
+
+    def test_remember_response_drops_prefix_state_over_byte_limit(self):
+        server = self._make_server()
+        server.prefix_cache_state_limit = 1
+        server.prefix_cache_state_byte_limit = 1
+        state = local_api_server.PromptPrefillState(
+            prompt_tokens=(1, 2),
+            target_cache=[],
+            hidden=mx.zeros((1, 2, 2), dtype=mx.float16),
+            last_logits=None,
+        )
+
+        server.remember_response(
+            response_id="resp_1",
+            previous_response_id=None,
+            request_messages=[{"role": "user", "content": "one"}],
+            tools=[],
+            output_items=[],
+            prompt_cache_state=state,
+        )
+
+        self.assertIsNone(server._response_states["resp_1"]["prompt_cache_state"])
+        self.assertEqual(list(server._prefix_state_order), [])
+        self.assertEqual(server._response_prefix_cache_bytes, 0)
 
     def test_remember_response_discards_history_when_limit_is_zero(self):
         server = self._make_server()

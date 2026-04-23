@@ -11,7 +11,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import re
 import time
 import uuid
@@ -136,10 +136,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 1.0)
-RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
-PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
-GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 16)
-MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 32768)
+STREAM_QUEUE_MAX_CHUNKS = _env_positive_int("LOCAL_DFLASH_STREAM_QUEUE_MAX_CHUNKS", 32)
+STREAM_QUEUE_PUT_TIMEOUT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_QUEUE_PUT_TIMEOUT_SECONDS", 0.5)
+RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 8)
+PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 1)
+PREFIX_CACHE_STATE_BYTE_LIMIT = _env_non_negative_int(
+    "LOCAL_DFLASH_PREFIX_CACHE_STATE_BYTE_LIMIT",
+    2 * 1024 * 1024 * 1024,
+)
+GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 1)
+MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 2)
 RESPONSES_CONTINUE_PROMPT = (
     "[System: Continue the previous incomplete response now. "
@@ -227,7 +233,7 @@ DEFAULT_MIN_P = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_MIN_P", 0.0)
 DEFAULT_PRESENCE_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_PRESENCE_PENALTY", 1.5)
 DEFAULT_REPETITION_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_REPETITION_PENALTY", 1.0)
 DEFAULT_FREQUENCY_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_FREQUENCY_PENALTY", 0.0)
-DEFAULT_MAX_TOKENS_FALLBACK = _env_positive_int("LOCAL_DFLASH_DEFAULT_MAX_TOKENS", 16384)
+DEFAULT_MAX_TOKENS_FALLBACK = _env_positive_int("LOCAL_DFLASH_DEFAULT_MAX_TOKENS", 8192)
 MIN_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS", 0.1)
 
 
@@ -474,6 +480,25 @@ def _data_line(payload: dict[str, Any]) -> str:
 
 def _done_line() -> str:
     return "data: [DONE]\n\n"
+
+
+def _make_stream_queue() -> Queue:
+    return Queue(maxsize=max(1, STREAM_QUEUE_MAX_CHUNKS))
+
+
+def _queue_put(queue: Queue, item: Any, stop_event: Any = None) -> bool:
+    while True:
+        if stop_event is not None:
+            try:
+                if stop_event.is_set():
+                    return False
+            except Exception:
+                return False
+        try:
+            queue.put(item, timeout=STREAM_QUEUE_PUT_TIMEOUT_SECONDS)
+            return True
+        except Full:
+            continue
 
 
 def _coerce_text(value: Any) -> str:
@@ -1983,6 +2008,7 @@ class LocalModelServer:
         draft_turboquant_bits: float | None = None,
         adaptive_block_size_config: AdaptiveBlockSizeConfig | None = None,
         global_prefix_cache_limit: int = GLOBAL_PREFIX_CACHE_LIMIT,
+        prefix_cache_state_byte_limit: int = PREFIX_CACHE_STATE_BYTE_LIMIT,
         global_prefix_cache_byte_limit: int | None = None,
         stable_prefix_tokens_byte_limit: int | None = None,
         mlx_clear_cache_threshold: float | None = 0.9,
@@ -2020,6 +2046,7 @@ class LocalModelServer:
         self._prefix_state_order: deque[str] = deque()
         self.response_history_limit = RESPONSE_HISTORY_LIMIT
         self.prefix_cache_state_limit = PREFIX_CACHE_STATE_LIMIT
+        self.prefix_cache_state_byte_limit = max(0, int(prefix_cache_state_byte_limit or 0))
         self.global_prefix_cache_limit = global_prefix_cache_limit
         self._global_prefix_states: dict[str, PromptPrefillState] = {}
         self._global_prefix_order: deque[str] = deque()
@@ -2036,6 +2063,8 @@ class LocalModelServer:
         self._global_prefix_cache_bytes = 0
         self._global_prefix_state_bytes: dict[str, int] = {}
         self._stable_prefix_tokens_bytes = 0
+        self._response_prefix_cache_bytes = 0
+        self._prefix_state_bytes: dict[str, int] = {}
 
     def _clear_hidden_states_locked(self) -> None:
         hidden_states = getattr(self._model, "_hidden_states", None)
@@ -2064,12 +2093,20 @@ class LocalModelServer:
     def _clear_request_state_locked(self) -> None:
         self._clear_hidden_states_locked()
 
+    def _drop_prefix_cache_state_locked(self, response_id: str) -> None:
+        state = self._response_states.get(response_id)
+        if state is not None:
+            state["prompt_cache_state"] = None
+        stale_bytes = self._prefix_state_bytes.pop(response_id, 0)
+        self._response_prefix_cache_bytes = max(
+            0,
+            self._response_prefix_cache_bytes - stale_bytes,
+        )
+
     def _clear_cached_prefix_states_locked(self) -> None:
         while self._prefix_state_order:
             response_id = self._prefix_state_order.popleft()
-            state = self._response_states.get(response_id)
-            if state is not None:
-                state["prompt_cache_state"] = None
+            self._drop_prefix_cache_state_locked(response_id)
 
     def _clear_global_prefix_cache_locked(self) -> None:
         self._global_prefix_states.clear()
@@ -2212,11 +2249,15 @@ class LocalModelServer:
             _logger.debug("failed to augment eos_token_ids: %s", exc)
 
     def _prune_prefix_cache_states_locked(self) -> None:
-        while len(self._prefix_state_order) > self.prefix_cache_state_limit:
+        while self._prefix_state_order and (
+            len(self._prefix_state_order) > self.prefix_cache_state_limit
+            or (
+                self.prefix_cache_state_byte_limit > 0
+                and self._response_prefix_cache_bytes > self.prefix_cache_state_byte_limit
+            )
+        ):
             stale_response_id = self._prefix_state_order.popleft()
-            state = self._response_states.get(stale_response_id)
-            if state is not None:
-                state["prompt_cache_state"] = None
+            self._drop_prefix_cache_state_locked(stale_response_id)
 
     def _prune_global_prefix_states_locked(self) -> None:
         while len(self._global_prefix_order) > self.global_prefix_cache_limit:
@@ -2269,6 +2310,7 @@ class LocalModelServer:
         while len(self._response_order) > self.response_history_limit:
             stale_response_id = self._response_order.popleft()
             stale_state = self._response_states.pop(stale_response_id, None)
+            self._drop_prefix_cache_state_locked(stale_response_id)
             stale_parent_id = stale_state.get("previous_response_id") if stale_state is not None else None
             stale_tools = stale_state.get("tools") or [] if stale_state is not None else []
             for state in self._response_states.values():
@@ -2344,12 +2386,25 @@ class LocalModelServer:
     ) -> None:
         with self._lock:
             stored_prompt_cache_state = prompt_cache_state if self.prefix_cache_state_limit > 0 else None
+            stored_prompt_cache_state_bytes = 0
+            if stored_prompt_cache_state is not None:
+                try:
+                    stored_prompt_cache_state_bytes = int(estimate_memory_bytes(stored_prompt_cache_state))
+                except Exception:
+                    stored_prompt_cache_state_bytes = 0
+                if (
+                    self.prefix_cache_state_byte_limit > 0
+                    and stored_prompt_cache_state_bytes > self.prefix_cache_state_byte_limit
+                ):
+                    stored_prompt_cache_state = None
+                    stored_prompt_cache_state_bytes = 0
             previous_tools = []
             if previous_response_id:
                 previous_state = self._response_states.get(previous_response_id)
                 if previous_state is not None:
                     previous_tools = previous_state.get("tools") or []
             stored_tools = list(tools) if tools and previous_tools != tools else []
+            self._drop_prefix_cache_state_locked(response_id)
             self._response_states[response_id] = {
                 "previous_response_id": previous_response_id,
                 "input_messages": list(request_messages),
@@ -2359,6 +2414,8 @@ class LocalModelServer:
             }
             self._response_order.append(response_id)
             if stored_prompt_cache_state is not None:
+                self._prefix_state_bytes[response_id] = stored_prompt_cache_state_bytes
+                self._response_prefix_cache_bytes += stored_prompt_cache_state_bytes
                 self._prefix_state_order.append(response_id)
                 self._prune_prefix_cache_states_locked()
             self._prune_response_states_locked()
@@ -2559,14 +2616,20 @@ class LocalModelServer:
         if derived_state is None:
             return
 
-        previous = self._global_prefix_states.get(stable_prefix_key)
-        if previous is not None:
-            prev_bytes = self._global_prefix_state_bytes.pop(stable_prefix_key, 0)
-            self._global_prefix_cache_bytes = max(0, self._global_prefix_cache_bytes - prev_bytes)
         try:
             state_bytes = int(estimate_memory_bytes(derived_state))
         except Exception:
             state_bytes = 0
+        if (
+            self.global_prefix_cache_byte_limit > 0
+            and state_bytes > self.global_prefix_cache_byte_limit
+        ):
+            return
+
+        previous = self._global_prefix_states.get(stable_prefix_key)
+        if previous is not None:
+            prev_bytes = self._global_prefix_state_bytes.pop(stable_prefix_key, 0)
+            self._global_prefix_cache_bytes = max(0, self._global_prefix_cache_bytes - prev_bytes)
         self._global_prefix_states[stable_prefix_key] = derived_state
         self._global_prefix_state_bytes[stable_prefix_key] = state_bytes
         self._global_prefix_cache_bytes += state_bytes
@@ -2578,9 +2641,7 @@ class LocalModelServer:
         self._prune_global_prefix_states_locked()
 
     def _should_capture_prompt_cache_state(self, stable_prefix_tokens: tuple[int, ...]) -> bool:
-        if self.prefix_cache_state_limit > 0:
-            return True
-        return self.global_prefix_cache_limit > 0 and bool(stable_prefix_tokens)
+        return self.prefix_cache_state_limit > 0
 
     def _effective_max_tokens(self, requested_max_tokens: int, prompt_tokens: int) -> int:
         candidates = [max(1, requested_max_tokens)]
@@ -2779,7 +2840,8 @@ class LocalModelServer:
                 for chunk in iterator:
                     if chunk.text:
                         text_parts.append(chunk.text)
-                        queue.put(("text", chunk.text))
+                        if not _queue_put(queue, ("text", chunk.text), stop_event):
+                            return
                     final = chunk
 
             if final is None:
@@ -2821,15 +2883,16 @@ class LocalModelServer:
                 "elapsed": time.time() - started,
                 "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
             }
-            queue.put(("result", result))
+            if not _queue_put(queue, ("result", result), stop_event):
+                return
         except Exception as exc:
-            queue.put(("error", str(exc)))
+            _queue_put(queue, ("error", str(exc)), stop_event)
         finally:
             try:
                 self.finish_request(keep_alive_override)
             finally:
                 self._release_generation_turn(generation_ticket)
-            queue.put(("done", None))
+            _queue_put(queue, ("done", None), stop_event)
 
     def generate(
         self,
@@ -2855,10 +2918,12 @@ class LocalModelServer:
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
                 )
-            self.finish_request(keep_alive_override)
             return result
         finally:
-            self._release_generation_turn(generation_ticket)
+            try:
+                self.finish_request(keep_alive_override)
+            finally:
+                self._release_generation_turn(generation_ticket)
 
     def _generate_response_locked(
         self,
@@ -3113,11 +3178,11 @@ class LocalModelServer:
                 capture_prompt_cache_state=capture_prompt_cache_state,
                 should_stop=(stop_event.is_set if stop_event is not None else None),
             )
-            queue.put(("result", (result, output_items)))
+            _queue_put(queue, ("result", (result, output_items)), stop_event)
         except Exception as exc:
-            queue.put(("error", str(exc)))
+            _queue_put(queue, ("error", str(exc)), stop_event)
         finally:
-            queue.put(("done", None))
+            _queue_put(queue, ("done", None), stop_event)
 
     def generate_response(
         self,
@@ -3164,7 +3229,7 @@ class LocalModelServer:
         from threading import Event as _Event
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        event_queue: Queue = Queue()
+        event_queue: Queue = _make_stream_queue()
         stop_event = _Event()
         worker = Thread(
             target=self._generation_worker,
@@ -3348,7 +3413,7 @@ class LocalModelServer:
             },
         )
         from threading import Event as _Event
-        event_queue: Queue = Queue()
+        event_queue: Queue = _make_stream_queue()
         stop_event = _Event()
         worker = Thread(
             target=self._responses_generation_worker,
@@ -3815,7 +3880,7 @@ class LocalModelServer:
                 },
             },
         )
-        event_queue: Queue = Queue()
+        event_queue: Queue = _make_stream_queue()
         stop_event = _Event()
         worker = Thread(
             target=self._generation_worker,
@@ -4089,13 +4154,12 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "active_generation_requests": 1 if server._active_generation_ticket is not None else 0,
             "queued_generation_requests": len(server._queued_generation_tickets),
             "prefix_cache_state_limit": server.prefix_cache_state_limit,
+            "prefix_cache_state_byte_limit": server.prefix_cache_state_byte_limit,
             "prefix_cache_entries": len(server._prefix_state_order),
-            "response_prefix_cache_bytes": estimate_memory_bytes(
-                [state.get("prompt_cache_state") for state in server._response_states.values()]
-            ),
+            "response_prefix_cache_bytes": server._response_prefix_cache_bytes,
             "global_prefix_cache_limit": server.global_prefix_cache_limit,
             "global_prefix_cache_entries": len(server._global_prefix_order),
-            "global_prefix_cache_bytes": estimate_memory_bytes(list(server._global_prefix_states.values())),
+            "global_prefix_cache_bytes": server._global_prefix_cache_bytes,
             "global_prefix_cache_hits": server._global_prefix_cache_hits,
             "global_prefix_cache_misses": server._global_prefix_cache_misses,
             "adaptive_block_size": server.adaptive_block_size_config.enabled,
@@ -4140,6 +4204,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "dflash_active_ticket_age_seconds": active_pid_age,
             "dflash_response_history_entries": len(server._response_order),
             "dflash_prefix_cache_entries": len(server._prefix_state_order),
+            "dflash_response_prefix_cache_bytes": server._response_prefix_cache_bytes,
             "dflash_global_prefix_cache_entries": len(server._global_prefix_order),
             "dflash_global_prefix_cache_bytes": server._global_prefix_cache_bytes,
             "dflash_stable_prefix_tokens_bytes": server._stable_prefix_tokens_bytes,
@@ -4512,6 +4577,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of stable global prefix snapshots to keep in memory.",
     )
     parser.add_argument(
+        "--prefix-cache-state-byte-limit-gb",
+        type=float,
+        default=(
+            float(os.environ["LOCAL_DFLASH_PREFIX_CACHE_STATE_BYTE_LIMIT_GB"])
+            if os.environ.get("LOCAL_DFLASH_PREFIX_CACHE_STATE_BYTE_LIMIT_GB")
+            else PREFIX_CACHE_STATE_BYTE_LIMIT / (1024 ** 3)
+        ),
+        help="Byte ceiling (GiB) for per-response prompt-cache snapshots.",
+    )
+    parser.add_argument(
         "--disable-thinking",
         action="store_true",
         default=os.environ.get("LOCAL_DFLASH_DISABLE_THINKING", "").lower() in {"1", "true", "yes", "on"},
@@ -4530,13 +4605,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens-limit",
         type=int,
-        default=(int(os.environ["LOCAL_DFLASH_MAX_TOKENS"]) if os.environ.get("LOCAL_DFLASH_MAX_TOKENS") else 32768),
+        default=(int(os.environ["LOCAL_DFLASH_MAX_TOKENS"]) if os.environ.get("LOCAL_DFLASH_MAX_TOKENS") else 8192),
         help="Optional hard cap applied after context-window checks. Leave unset to use the full available context.",
     )
     parser.add_argument(
         "--context-reserve",
         type=int,
-        default=int(os.environ.get("LOCAL_DFLASH_CONTEXT_RESERVE", "256")),
+        default=int(os.environ.get("LOCAL_DFLASH_CONTEXT_RESERVE", "512")),
         help="Token margin reserved to avoid hitting the absolute context edge.",
     )
     parser.add_argument(
@@ -4597,7 +4672,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-prefix-cache-byte-limit-gb",
         type=float,
-        default=(float(os.environ["LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB"]) if os.environ.get("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB") else 12.0),
+        default=(float(os.environ["LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB"]) if os.environ.get("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB") else 4.0),
         help="Byte ceiling (GiB) for the global prompt-cache state dict. Prevents slow leaks over 24h.",
     )
     parser.add_argument(
@@ -4649,6 +4724,7 @@ def main() -> int:
         grow_threshold=args.adaptive_block_size_grow_threshold,
         shrink_threshold=args.adaptive_block_size_shrink_threshold,
     )
+    response_prefix_byte_limit = _gb_to_bytes(getattr(args, "prefix_cache_state_byte_limit_gb", None) or 0) or 0
     prefix_byte_limit = _gb_to_bytes(getattr(args, "global_prefix_cache_byte_limit_gb", None) or 0) or 0
     stable_prefix_byte_limit = _gb_to_bytes(getattr(args, "stable_prefix_tokens_byte_limit_gb", None) or 0) or 0
     server = LocalModelServer(
@@ -4667,6 +4743,7 @@ def main() -> int:
         draft_turboquant_bits=args.draft_turboquant_bits,
         adaptive_block_size_config=adaptive_block_size_config,
         global_prefix_cache_limit=max(0, args.global_prefix_cache_limit),
+        prefix_cache_state_byte_limit=response_prefix_byte_limit,
         global_prefix_cache_byte_limit=prefix_byte_limit,
         stable_prefix_tokens_byte_limit=stable_prefix_byte_limit,
         mlx_clear_cache_threshold=args.mlx_clear_cache_threshold,

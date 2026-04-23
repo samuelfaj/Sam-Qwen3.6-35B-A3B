@@ -897,6 +897,19 @@ def _accepted_tokens_from_cpu_batches(
     return accepted, draft_tokens[:accepted] + [target_tokens[accepted]]
 
 
+def _acceptance_prefix_length(draft_tokens, target_tokens) -> int:
+    draft_values = draft_tokens.tolist() if hasattr(draft_tokens, "tolist") else list(draft_tokens)
+    target_values = target_tokens.tolist() if hasattr(target_tokens, "tolist") else list(target_tokens)
+    if draft_values and isinstance(draft_values[0], (list, tuple)):
+        draft_values = draft_values[0]
+    if target_values and isinstance(target_values[0], (list, tuple)):
+        target_values = target_values[0]
+    return _accepted_tokens_from_cpu_batches(
+        [int(token_id) for token_id in draft_values],
+        [int(token_id) for token_id in target_values],
+    )[0]
+
+
 def next_adaptive_block_size(
     current_block_size: int,
     acceptance_length: int,
@@ -1280,6 +1293,12 @@ def stream_generate(
         )
     finally:
         prefill.logits = None
+        prefill.hidden = None
+        prefill.target_cache = []
+        target_cache = None
+        draft_cache = None
+        hidden = None
+        logits = None
         _clear_model_hidden_states(model)
         if _capture is not None:
             _capture.close()
