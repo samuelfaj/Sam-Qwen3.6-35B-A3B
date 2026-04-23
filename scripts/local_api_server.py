@@ -119,7 +119,7 @@ STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SE
 RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 1024)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 2)
 GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 16)
-MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
+MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 32768)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 2)
 RESPONSES_CONTINUE_PROMPT = (
     "[System: Continue the previous incomplete response now. "
@@ -134,22 +134,46 @@ RESPONSES_TOOL_RESULT_PROMPT = (
     "explicitly shows a failure, truncation, or asks for a retry.]"
 )
 RESPONSES_ACTION_PROMPT = (
-    "[System: You just stated the next action but did not actually do it. "
-    "Do not repeat the plan. "
-    "If a tool is needed, call it now. "
-    "If no tool is needed, provide the final answer now. "
-    "Do not stop after saying what you will do next.]"
+    "[System: You just stated the next action but did not execute it. "
+    "Do not repeat or re-emit the plan; do not call update_plan again on this turn. "
+    "If files need to change, call apply_patch now. "
+    "If a command must run, call shell now. "
+    "Only produce a final text answer if no tool call is possible. "
+    "Do not stop after announcing what you will do next.]"
+)
+PLANNING_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "update_plan",
+        "plan",
+        "todo_write",
+        "todo",
+        "apply_plan",
+        "planner",
+    }
 )
 RESPONSES_FOLLOWUP_JUDGE_ENABLED = _env_bool("LOCAL_DFLASH_FOLLOWUP_JUDGE", True)
 RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS = _env_positive_int(
-    "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 8
+    "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 128
 )
-RESPONSES_FOLLOWUP_JUDGE_SYSTEM_PROMPT = (
+RESPONSES_FOLLOWUP_JUDGE_LOGPROB_MARGIN = _env_positive_float(
+    "LOCAL_DFLASH_FOLLOWUP_JUDGE_LOGPROB_MARGIN", 1.0
+)
+RESPONSES_FOLLOWUP_JUDGE_LOGPROB_SYSTEM_PROMPT = (
     "You are a strict turn-completion checker for an AI coding agent. "
     "The agent has function-calling tools to read files, edit code, run commands, and inspect results. "
     "Decide whether the agent's latest turn is finished or whether it still needs to act.\n\n"
-    "Reply with EXACTLY one uppercase word and nothing else: COMPLETE or INCOMPLETE.\n\n"
-    "- COMPLETE: the agent delivered the final answer, reported a genuine blocker, or asked the user a real clarifying question.\n"
+    "Reply with EXACTLY one uppercase letter and nothing else.\n"
+    "- Y: the agent delivered the final answer, reported a genuine blocker, or asked a real clarifying question.\n"
+    "- N: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n"
+    "When unsure, answer N."
+)
+RESPONSES_FOLLOWUP_JUDGE_JSON_SYSTEM_PROMPT = (
+    "You are a strict turn-completion checker for an AI coding agent. "
+    "The agent has function-calling tools to read files, edit code, run commands, and inspect results. "
+    "Decide whether the agent's latest turn is finished or whether it still needs to act.\n\n"
+    "Respond with ONLY a single JSON object and nothing else, matching this schema:\n"
+    '{"reason":"<one short sentence>","verdict":"COMPLETE"|"INCOMPLETE"}\n\n'
+    "- COMPLETE: the agent delivered the final answer, reported a genuine blocker, or asked a real clarifying question.\n"
     "- INCOMPLETE: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n\n"
     "When unsure, answer INCOMPLETE."
 )
@@ -717,6 +741,13 @@ def _response_completion_state(result: dict[str, Any]) -> tuple[str, dict[str, A
     return "completed", None
 
 
+def _is_planning_only_function_call(item: dict[str, Any]) -> bool:
+    if item.get("type") != "function_call":
+        return False
+    name = str(item.get("name") or "").strip().lower()
+    return name in PLANNING_ONLY_TOOL_NAMES
+
+
 def _response_is_followup_candidate(
     result: dict[str, Any],
     output_items: list[dict[str, Any]],
@@ -730,11 +761,18 @@ def _response_is_followup_candidate(
     if response_status != "completed":
         return False
 
-    if any(item.get("type") == "function_call" for item in output_items):
+    has_action_call = any(
+        item.get("type") == "function_call" and not _is_planning_only_function_call(item)
+        for item in output_items
+    )
+    if has_action_call:
         return False
 
+    has_planning_call = any(
+        _is_planning_only_function_call(item) for item in output_items
+    )
     assistant_text = _output_text_from_items(output_items).strip()
-    if not assistant_text:
+    if not assistant_text and not has_planning_call:
         return False
 
     return True
@@ -765,6 +803,37 @@ def _summarize_tool_names(tools: list[dict[str, Any]] | None) -> str:
         if candidate:
             names.append(str(candidate))
     return ", ".join(names) if names else "(none)"
+
+
+def _first_encoded_token_id(tokenizer: Any, text: str) -> int | None:
+    try:
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        tokens = tokenizer.encode(text)
+    if not tokens:
+        return None
+    return int(tokens[0])
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        candidate = json.loads(stripped[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return candidate if isinstance(candidate, dict) else None
 
 
 def _make_message_item(text: str) -> dict[str, Any]:
@@ -2036,9 +2105,14 @@ class LocalModelServer:
             ):
                 return result, output_items
 
+            carry_items = [
+                item
+                for item in output_items
+                if not _is_planning_only_function_call(item)
+            ]
             current_messages = [
                 *current_messages,
-                *_messages_from_output_items(output_items),
+                *_messages_from_output_items(carry_items),
                 {
                     "role": "user",
                     "content": RESPONSES_ACTION_PROMPT,
@@ -2056,17 +2130,106 @@ class LocalModelServer:
     ) -> bool:
         if not RESPONSES_FOLLOWUP_JUDGE_ENABLED:
             return False
+
         last_user_text = _last_user_message_text(messages)
         tool_names = _summarize_tool_names(tools)
+
+        logprob_verdict: bool | None = None
+        logprob_margin = 0.0
+        try:
+            logprob_verdict, logprob_margin = self._judge_verdict_via_logprobs(
+                last_user_text, tool_names, assistant_text
+            )
+        except Exception:
+            logprob_verdict, logprob_margin = None, 0.0
+
+        if (
+            logprob_verdict is not None
+            and logprob_margin >= RESPONSES_FOLLOWUP_JUDGE_LOGPROB_MARGIN
+        ):
+            return logprob_verdict
+
+        reasoning_verdict = self._judge_verdict_via_reasoning(
+            last_user_text, tool_names, assistant_text
+        )
+        if reasoning_verdict is not None:
+            return reasoning_verdict
+
+        if logprob_verdict is not None:
+            return logprob_verdict
+        return True
+
+    def _judge_verdict_via_logprobs(
+        self,
+        last_user_text: str,
+        tool_names: str,
+        assistant_text: str,
+    ) -> tuple[bool | None, float]:
+        self.ensure_loaded()
+        tokenizer = self._tokenizer
+        tok_y = _first_encoded_token_id(tokenizer, "Y")
+        tok_n = _first_encoded_token_id(tokenizer, "N")
+        if tok_y is None or tok_n is None or tok_y == tok_n:
+            return None, 0.0
+
         judge_messages = [
-            {"role": "system", "content": RESPONSES_FOLLOWUP_JUDGE_SYSTEM_PROMPT},
+            {"role": "system", "content": RESPONSES_FOLLOWUP_JUDGE_LOGPROB_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
                     f"Tools available: {tool_names}\n\n"
                     f"User's latest message:\n{last_user_text or '(not shown)'}\n\n"
                     f"Agent's latest response:\n{assistant_text}\n\n"
-                    "Reply with exactly one word: COMPLETE or INCOMPLETE."
+                    "Answer with exactly one letter: Y if the turn is complete, N if the agent still needs to act."
+                ),
+            },
+        ]
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                judge_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt_text = tokenizer.apply_chat_template(
+                judge_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        prompt_tokens_list = tokenize_prompt(tokenizer, prompt_text).tolist()
+        run = prefill_prompt(
+            self._model,
+            tokenizer,
+            prompt_tokens_list,
+            target_turboquant_bits=self.target_turboquant_bits,
+            prefix_state=None,
+            capture_prefill_state=False,
+        )
+        row = run.logits[0, -1, :].astype(mx.float32)
+        mx.eval(row)
+        logit_y = float(row[tok_y].item())
+        logit_n = float(row[tok_n].item())
+        margin = abs(logit_n - logit_y)
+        is_incomplete = logit_n > logit_y
+        return is_incomplete, margin
+
+    def _judge_verdict_via_reasoning(
+        self,
+        last_user_text: str,
+        tool_names: str,
+        assistant_text: str,
+    ) -> bool | None:
+        judge_messages = [
+            {"role": "system", "content": RESPONSES_FOLLOWUP_JUDGE_JSON_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Tools available: {tool_names}\n\n"
+                    f"User's latest message:\n{last_user_text or '(not shown)'}\n\n"
+                    f"Agent's latest response:\n{assistant_text}\n\n"
+                    'Respond with ONLY: {"reason":"<one short sentence>","verdict":"COMPLETE"|"INCOMPLETE"}.'
                 ),
             },
         ]
@@ -2077,11 +2240,18 @@ class LocalModelServer:
                 0.0,
             )
         except Exception:
-            return False
+            return None
         raw = _coerce_text(judge_result.get("text", ""))
         _, visible = _strip_reasoning_blocks(raw)
-        verdict = visible.strip().upper()
-        return verdict.startswith("INCOMPLETE")
+        parsed = _extract_json_object(visible)
+        if not parsed:
+            return None
+        verdict = str(parsed.get("verdict") or "").strip().upper()
+        if verdict.startswith("INCOMPLETE"):
+            return True
+        if verdict.startswith("COMPLETE"):
+            return False
+        return None
 
     def _responses_generation_worker(
         self,
@@ -3218,7 +3388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens-limit",
         type=int,
-        default=(int(os.environ["LOCAL_DFLASH_MAX_TOKENS"]) if os.environ.get("LOCAL_DFLASH_MAX_TOKENS") else 8192),
+        default=(int(os.environ["LOCAL_DFLASH_MAX_TOKENS"]) if os.environ.get("LOCAL_DFLASH_MAX_TOKENS") else 32768),
         help="Optional hard cap applied after context-window checks. Leave unset to use the full available context.",
     )
     parser.add_argument(

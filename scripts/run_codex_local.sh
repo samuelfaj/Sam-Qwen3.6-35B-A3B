@@ -5,6 +5,8 @@ CODEX_HOME_DIR="${CODEX_HOME:-${CODEX_HOME_DIR:-/tmp/codex-local-dflash}}"
 LOCAL_MODEL_NAME="${LOCAL_DFLASH_MODEL_NAME:-qwen3.6-35b-a3b-dflash-local}"
 LOCAL_HOST="${LOCAL_DFLASH_HOST:-127.0.0.1}"
 LOCAL_PORT="${LOCAL_DFLASH_PORT:-8010}"
+LOCAL_CONTEXT_WINDOW="${LOCAL_DFLASH_CODEX_CONTEXT_WINDOW:-262144}"
+LOCAL_AUTO_COMPACT_LIMIT="${LOCAL_DFLASH_CODEX_AUTO_COMPACT_LIMIT:-200000}"
 
 mkdir -p "${CODEX_HOME_DIR}"
 
@@ -16,6 +18,9 @@ sandbox_mode = "danger-full-access"
 model_reasoning_summary = "none"
 model_supports_reasoning_summaries = false
 model_verbosity = "low"
+model_context_window = ${LOCAL_CONTEXT_WINDOW}
+model_auto_compact_token_limit = ${LOCAL_AUTO_COMPACT_LIMIT}
+include_apply_patch_tool = true
 
 [model_providers.localdflash]
 name = "Local DFlash"
