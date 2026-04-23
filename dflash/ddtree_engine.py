@@ -339,8 +339,8 @@ def generate_ddtree(
 
     generated_token_ids = generated_token_ids[:max_new_tokens]
     text = tokenizer.decode(generated_token_ids) if generated_token_ids else ""
-    elapsed = time.perf_counter() - started
-    decode_seconds = max(elapsed - prefill_seconds, 1e-9)
+    decode_seconds = max(time.perf_counter() - started, 1e-9)
+    elapsed = prefill_seconds + decode_seconds
     proposed_tokens = sum(block_size_history)
     accepted_tokens = sum(acceptance_lengths)
 
