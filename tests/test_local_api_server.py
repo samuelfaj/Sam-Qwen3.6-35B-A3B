@@ -655,6 +655,82 @@ class LocalApiServerTests(unittest.TestCase):
         )
         self.assertEqual(second_messages[-1]["role"], "user")
         self.assertEqual(second_messages[-1]["content"], local_api_server.RESPONSES_ACTION_PROMPT)
+
+    def test_generate_response_auto_continues_after_empty_stop(self):
+        server = self._make_server()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        empty_result = {
+            "text": "",
+            "finish_reason": "stop",
+            "prompt_tokens": 12000,
+            "prefill_seconds": 1.0,
+            "prompt_tps": 2000.0,
+            "reused_prefix_tokens": 0,
+            "decode_seconds": 0.01,
+            "generation_tps": 100.0,
+            "generated_tokens": 1,
+            "speculative_steps": 0,
+            "proposed_tokens": 0,
+            "accepted_tokens": 0,
+            "avg_acceptance_length": 0.0,
+            "avg_acceptance_ratio": 0.0,
+            "acceptance_lengths": [],
+            "acceptance_ratios": [],
+            "block_size_history": [],
+            "adaptive_block_size": True,
+            "prefix_cache_source": "global",
+            "peak_memory_gb": 1.0,
+            "elapsed": 1.01,
+            "prompt_cache_state": None,
+        }
+        tool_result = {
+            "text": '<function_call>{"name":"edit","arguments":{"filePath":"src/App.jsx","oldString":"todo","newString":"done"}}</function_call>',
+            "finish_reason": "stop",
+            "prompt_tokens": 12100,
+            "prefill_seconds": 1.0,
+            "prompt_tps": 2000.0,
+            "reused_prefix_tokens": 0,
+            "decode_seconds": 0.2,
+            "generation_tps": 50.0,
+            "generated_tokens": 10,
+            "speculative_steps": 1,
+            "proposed_tokens": 10,
+            "accepted_tokens": 8,
+            "avg_acceptance_length": 8.0,
+            "avg_acceptance_ratio": 0.8,
+            "acceptance_lengths": [8],
+            "acceptance_ratios": [0.8],
+            "block_size_history": [8],
+            "adaptive_block_size": True,
+            "prefix_cache_source": "global",
+            "peak_memory_gb": 1.0,
+            "elapsed": 1.2,
+            "prompt_cache_state": None,
+        }
+        with mock.patch.object(
+            server,
+            "_generate_locked",
+            side_effect=[(None, empty_result), (None, tool_result)],
+        ) as generate_locked:
+            result, output_items = server.generate_response(
+                [{"role": "user", "content": "create app"}],
+                128,
+                tools=tools,
+            )
+
+        self.assertIs(result, tool_result)
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(generate_locked.call_count, 2)
+        second_messages = generate_locked.call_args_list[1].args[0]
+        self.assertEqual(second_messages[-1]["content"], local_api_server.RESPONSES_EMPTY_OUTPUT_PROMPT)
         self.assertEqual(result["text"], tool_result["text"])
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(output_items[0]["name"], "edit")
