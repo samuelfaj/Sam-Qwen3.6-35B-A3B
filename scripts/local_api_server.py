@@ -140,9 +140,18 @@ RESPONSES_ACTION_PROMPT = (
     "If no tool is needed, provide the final answer now. "
     "Do not stop after saying what you will do next.]"
 )
-RESPONSES_ACTION_INTENT_RE = re.compile(
-    r"\b(?:i['’]ll|i will|let me|now i['’]ll|next[, ]+i['’]ll|vou|agora vou|deixa eu)\b",
-    re.IGNORECASE,
+RESPONSES_FOLLOWUP_JUDGE_ENABLED = _env_bool("LOCAL_DFLASH_FOLLOWUP_JUDGE", True)
+RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS = _env_positive_int(
+    "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 8
+)
+RESPONSES_FOLLOWUP_JUDGE_SYSTEM_PROMPT = (
+    "You are a strict turn-completion checker for an AI coding agent. "
+    "The agent has function-calling tools to read files, edit code, run commands, and inspect results. "
+    "Decide whether the agent's latest turn is finished or whether it still needs to act.\n\n"
+    "Reply with EXACTLY one uppercase word and nothing else: COMPLETE or INCOMPLETE.\n\n"
+    "- COMPLETE: the agent delivered the final answer, reported a genuine blocker, or asked the user a real clarifying question.\n"
+    "- INCOMPLETE: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n\n"
+    "When unsure, answer INCOMPLETE."
 )
 
 
@@ -708,11 +717,12 @@ def _response_completion_state(result: dict[str, Any]) -> tuple[str, dict[str, A
     return "completed", None
 
 
-def _response_requires_action_followup(
+def _response_is_followup_candidate(
     result: dict[str, Any],
     output_items: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
 ) -> bool:
+    """Cheap gate: returns True only if it is worth asking the model-based judge."""
     if not tools:
         return False
 
@@ -727,7 +737,34 @@ def _response_requires_action_followup(
     if not assistant_text:
         return False
 
-    return bool(RESPONSES_ACTION_INTENT_RE.search(assistant_text))
+    return True
+
+
+def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        text = _extract_text_from_content(message.get("content"))
+        if text.strip():
+            return text
+    return ""
+
+
+def _summarize_tool_names(tools: list[dict[str, Any]] | None) -> str:
+    if not tools:
+        return "(none)"
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        candidate = tool.get("name")
+        if not candidate:
+            fn = tool.get("function")
+            if isinstance(fn, dict):
+                candidate = fn.get("name")
+        if candidate:
+            names.append(str(candidate))
+    return ", ".join(names) if names else "(none)"
 
 
 def _make_message_item(text: str) -> dict[str, Any]:
@@ -1990,7 +2027,13 @@ class LocalModelServer:
                 capture_prompt_cache_state=capture_prompt_cache_state,
             )
             output_items = _build_output_items(result["text"])
-            if not _response_requires_action_followup(result, output_items, tools):
+            if not _response_is_followup_candidate(result, output_items, tools):
+                return result, output_items
+
+            assistant_text = _output_text_from_items(output_items).strip()
+            if not self._judge_response_needs_followup(
+                current_messages, assistant_text, tools
+            ):
                 return result, output_items
 
             current_messages = [
@@ -2004,6 +2047,41 @@ class LocalModelServer:
             current_previous_response_id = None
 
         return result, output_items
+
+    def _judge_response_needs_followup(
+        self,
+        messages: list[dict[str, Any]],
+        assistant_text: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> bool:
+        if not RESPONSES_FOLLOWUP_JUDGE_ENABLED:
+            return False
+        last_user_text = _last_user_message_text(messages)
+        tool_names = _summarize_tool_names(tools)
+        judge_messages = [
+            {"role": "system", "content": RESPONSES_FOLLOWUP_JUDGE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Tools available: {tool_names}\n\n"
+                    f"User's latest message:\n{last_user_text or '(not shown)'}\n\n"
+                    f"Agent's latest response:\n{assistant_text}\n\n"
+                    "Reply with exactly one word: COMPLETE or INCOMPLETE."
+                ),
+            },
+        ]
+        try:
+            _, judge_result = self._generate_locked(
+                judge_messages,
+                RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS,
+                0.0,
+            )
+        except Exception:
+            return False
+        raw = _coerce_text(judge_result.get("text", ""))
+        _, visible = _strip_reasoning_blocks(raw)
+        verdict = visible.strip().upper()
+        return verdict.startswith("INCOMPLETE")
 
     def _responses_generation_worker(
         self,

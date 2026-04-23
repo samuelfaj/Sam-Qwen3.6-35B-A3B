@@ -161,6 +161,25 @@ cmd_codex() {
   exec "${SCRIPT_DIR}/run_codex_local.sh" "$@"
 }
 
+cmd_queue() {
+  warn_if_not_ready
+  exec python3 "${SCRIPT_DIR}/agent_queue.py" run "$@"
+}
+
+cmd_queue_resume() {
+  warn_if_not_ready
+  exec python3 "${SCRIPT_DIR}/agent_queue.py" resume "$@"
+}
+
+cmd_queue_status() {
+  exec python3 "${SCRIPT_DIR}/agent_queue.py" status "$@"
+}
+
+cmd_queue_plan() {
+  warn_if_not_ready
+  exec python3 "${SCRIPT_DIR}/agent_queue.py" plan "$@"
+}
+
 usage() {
   cat <<EOF
 usage: $(basename "$0") <command> [args...]
@@ -174,9 +193,19 @@ server commands:
   logs      tail -f ${LOG_FILE}
 
 client commands:
-  opencode  launch OpenCode against the local server (forwards extra args)
+  opencode       launch OpenCode against the local server (forwards extra args)
   opencode-auto  launch supervised OpenCode one-shot mode with watchdog/restarts
-  codex     launch Codex against the local server (forwards extra args)
+  codex          launch Codex against the local server (forwards extra args)
+
+autonomous queue:
+  queue --dir <workdir> "<goal>"
+                 plan a goal into sub-tasks with DoD checks and execute them
+  queue-resume --dir <workdir> [--retry-failed] [--retry-blocked]
+                 resume an existing queue
+  queue-status --dir <workdir>
+                 show queue state
+  queue-plan "<goal>"
+                 run the planner only and print JSON to stdout
 
 env:
   LOCAL_DFLASH_HOST=${HOST}
@@ -201,6 +230,10 @@ main() {
     opencode)          cmd_opencode "$@" ;;
     opencode-auto)     cmd_opencode_auto "$@" ;;
     codex)             cmd_codex "$@" ;;
+    queue)             cmd_queue "$@" ;;
+    queue-resume)      cmd_queue_resume "$@" ;;
+    queue-status)      cmd_queue_status "$@" ;;
+    queue-plan)        cmd_queue_plan "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "unknown command: ${cmd}" >&2; usage >&2; exit 2 ;;
   esac
