@@ -128,7 +128,11 @@ def _build_tree_from_mlx_logits(
     sort_order = mx.argsort(-top_logits, axis=-1)
     top_token_ids = mx.take_along_axis(top_indices, sort_order, axis=-1)
     top_logits = mx.take_along_axis(top_logits, sort_order, axis=-1)
-    top_log_probs = top_logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    if _env_bool("LOCAL_DFLASH_DDTREE_APPROX_LOGPROBS", False):
+        normalizer = mx.logsumexp(top_logits, axis=-1, keepdims=True)
+    else:
+        normalizer = mx.logsumexp(logits, axis=-1, keepdims=True)
+    top_log_probs = top_logits - normalizer
     mx.eval(top_token_ids, top_log_probs)
     return build_ddtree_tree_from_topk(
         np.array(top_token_ids, copy=False),
