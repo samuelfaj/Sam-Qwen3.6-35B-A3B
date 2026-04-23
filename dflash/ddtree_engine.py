@@ -8,7 +8,12 @@ import mlx.core as mx
 import numpy as np
 from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
-from dflash.model_mlx import _make_target_cache, tokenize_prompt
+from dflash.model_mlx import (
+    AdaptiveBlockSizeConfig,
+    _make_target_cache,
+    next_adaptive_block_size,
+    tokenize_prompt,
+)
 from dflash_mlx.runtime import (
     _lm_head_logits,
     _eval_logits_and_captured,
@@ -26,9 +31,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _import_ddtree_modules() -> tuple[Any, Any, Any, Any]:
+def _import_ddtree_modules() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
     try:
-        from ddtree_mlx.cache import tree_aware_path_commit
+        from ddtree_mlx.cache import snapshot_caches, slow_path_commit, tree_aware_path_commit
         from ddtree_mlx.compile import compile_tree
         from ddtree_mlx.tree import build_ddtree_tree_from_topk, follow_verified_tree
         from ddtree_mlx.verify import tree_verify_forward
@@ -43,7 +48,22 @@ def _import_ddtree_modules() -> tuple[Any, Any, Any, Any]:
         compile_tree,
         tree_verify_forward,
         tree_aware_path_commit,
+        snapshot_caches,
+        slow_path_commit,
     )
+
+
+def _can_tree_aware_commit(cache_entries: list[Any]) -> bool:
+    for cache_entry in cache_entries:
+        if hasattr(cache_entry, "rollback"):
+            continue
+        if hasattr(cache_entry, "state") and not hasattr(cache_entry, "offset"):
+            continue
+        if hasattr(cache_entry, "offset") and not (
+            hasattr(cache_entry, "keys") and hasattr(cache_entry, "values")
+        ):
+            return False
+    return True
 
 
 def _tree_token_id(tree: Any, root_token: int, tree_index: int) -> int:
@@ -98,6 +118,8 @@ def generate_ddtree(
     prompt_tokens: str | list[int] | mx.array,
     max_new_tokens: int,
     tree_budget: int,
+    block_size: int | None = None,
+    adaptive_block_size: AdaptiveBlockSizeConfig | None = None,
     target_turboquant_bits: float | None = None,
 ) -> dict[str, Any]:
     (
@@ -106,6 +128,8 @@ def generate_ddtree(
         compile_tree,
         tree_verify_forward,
         tree_aware_path_commit,
+        snapshot_caches,
+        slow_path_commit,
     ) = _import_ddtree_modules()
 
     prompt_array = tokenize_prompt(tokenizer, prompt_tokens)
@@ -117,9 +141,8 @@ def generate_ddtree(
     draft_model.bind(target_model)
 
     capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.config.target_layer_ids}
-    # DDTree tree-aware commit needs direct KV repacking on accepted paths.
-    # TurboQuant caches do not expose mutable keys/values for that commit path.
-    target_cache = _make_target_cache(target_model, turboquant_bits=None)
+    target_cache = _make_target_cache(target_model, turboquant_bits=target_turboquant_bits)
+    tree_aware_commit = _can_tree_aware_commit(target_cache)
     draft_cache = make_prompt_cache(draft_model)
     lm_holder = getattr(target_model, "language_model", target_model)
     lm_head = getattr(target_model, "lm_head", None) or getattr(lm_holder, "lm_head", None)
@@ -167,12 +190,16 @@ def generate_ddtree(
     fast_path_count = 0
     stop_hit = False
 
-    block_size = max(1, int(draft_model.config.block_size))
+    current_block_size = max(
+        1,
+        int(block_size if block_size is not None else draft_model.config.block_size),
+    )
+    _adaptive_hysteresis: dict[str, int] = {"grow": 0, "shrink": 0}
     eos_token_ids = set(getattr(tokenizer, "eos_token_ids", []) or [])
 
     while len(generated_token_ids) < max_new_tokens:
         remaining = max_new_tokens - len(generated_token_ids)
-        block_len = max(1, min(block_size, remaining))
+        block_len = max(1, min(current_block_size, remaining))
         block_size_history.append(block_len)
 
         block_token_ids = mx.full((block_len,), int(draft_model.config.mask_token_id), dtype=mx.uint32)
@@ -205,6 +232,7 @@ def generate_ddtree(
 
         verify_started = time.perf_counter_ns()
         tree_cache_state: dict[str, Any] = {}
+        cache_snapshot = None if tree_aware_commit else snapshot_caches(target_cache)
         verify_logits, verify_hidden_raw = tree_verify_forward(
             target_model,
             compiled_tree=compiled_tree,
@@ -225,18 +253,35 @@ def generate_ddtree(
         cycles_completed += 1
 
         commit_started = time.perf_counter_ns()
-        tree_aware_path_commit(
-            target_cache,
-            prefix_len=prompt_len + len(generated_token_ids),
-            accepted_indices=accepted_indices,
-            tree_cache_state=tree_cache_state,
-        )
-        all_hidden = extract_context_feature_from_dict(
-            verify_hidden_raw,
-            list(draft_model.config.target_layer_ids),
-        )
-        accepted_idx_array = mx.array(accepted_indices, dtype=mx.int32)
-        target_hidden = all_hidden[:, accepted_idx_array, :]
+        if tree_aware_commit:
+            tree_aware_path_commit(
+                target_cache,
+                prefix_len=prompt_len + len(generated_token_ids),
+                accepted_indices=accepted_indices,
+                tree_cache_state=tree_cache_state,
+            )
+            all_hidden = extract_context_feature_from_dict(
+                verify_hidden_raw,
+                list(draft_model.config.target_layer_ids),
+            )
+            accepted_idx_array = mx.array(accepted_indices, dtype=mx.int32)
+            target_hidden = all_hidden[:, accepted_idx_array, :]
+        else:
+            if cache_snapshot is None:
+                raise RuntimeError("DDTree slow-path commit missing cache snapshot")
+            accepted_ids = mx.array([accepted_token_ids], dtype=mx.uint32)
+            _, committed_hidden_raw = slow_path_commit(
+                target_model,
+                target_cache,
+                cache_snapshot,
+                accepted_ids,
+                capture_layer_ids=capture_layer_ids,
+            )
+            target_hidden = extract_context_feature_from_dict(
+                committed_hidden_raw,
+                list(draft_model.config.target_layer_ids),
+            )
+            mx.eval(target_hidden)
         phase_timings_us["commit"] += (time.perf_counter_ns() - commit_started) / 1_000.0
         fast_path_count += 1
 
@@ -251,6 +296,14 @@ def generate_ddtree(
 
         if stop_hit:
             break
+
+        current_block_size = next_adaptive_block_size(
+            current_block_size,
+            acceptance_len,
+            block_len,
+            adaptive_block_size,
+            hysteresis_state=_adaptive_hysteresis,
+        )
 
     generated_token_ids = generated_token_ids[:max_new_tokens]
     text = tokenizer.decode(generated_token_ids) if generated_token_ids else ""
@@ -281,13 +334,14 @@ def generate_ddtree(
         "acceptance_lengths": acceptance_lengths,
         "acceptance_ratios": acceptance_ratios,
         "block_size_history": block_size_history,
-        "adaptive_block_size": False,
+        "adaptive_block_size": bool(adaptive_block_size and adaptive_block_size.enabled),
         "prefix_cache_source": "none",
         "peak_memory_gb": mx.get_peak_memory() / 1e9,
         "elapsed": elapsed,
         "prompt_cache_state": None,
         "engine": "ddtree",
-        "target_turboquant_bits": None if target_turboquant_bits is not None else None,
+        "target_turboquant_bits": target_turboquant_bits,
+        "ddtree_commit": "tree_aware" if tree_aware_commit else "slow_path",
         "tree_budget": tree_budget,
         "ddtree_cycles_completed": cycles_completed,
         "ddtree_fast_path_ratio": (

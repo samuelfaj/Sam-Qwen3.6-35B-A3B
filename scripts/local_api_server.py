@@ -24,8 +24,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+from dflash.ddtree_engine import generate_ddtree
 from dflash.model_mlx import (
     AdaptiveBlockSizeConfig,
+    GenerationResponse,
     PromptPrefillState,
     clone_prefill_state_for_reuse,
     derive_prefill_prefix_state,
@@ -2032,6 +2034,11 @@ class LocalModelServer:
         rotating_keep_tokens: int = 0,
         draft_turboquant_bits: float | None = None,
         adaptive_block_size_config: AdaptiveBlockSizeConfig | None = None,
+        generation_engine: str = "dflash",
+        ddtree_tree_budget: int = 4,
+        ddtree_target_turboquant_bits: float | None = None,
+        ddtree_fallback_to_dflash: bool = True,
+        ddtree_retry_without_turboquant: bool = True,
         global_prefix_cache_limit: int = GLOBAL_PREFIX_CACHE_LIMIT,
         prefix_cache_state_byte_limit: int = PREFIX_CACHE_STATE_BYTE_LIMIT,
         global_prefix_cache_byte_limit: int | None = None,
@@ -2055,6 +2062,19 @@ class LocalModelServer:
         self.draft_turboquant_bits = (
             None if draft_turboquant_bits is not None and draft_turboquant_bits <= 0 else draft_turboquant_bits
         )
+        normalized_engine = (generation_engine or "dflash").strip().lower()
+        if normalized_engine not in {"dflash", "ddtree"}:
+            raise ValueError(f"Unsupported generation_engine: {generation_engine}")
+        self.generation_engine = normalized_engine
+        self.ddtree_tree_budget = max(1, int(ddtree_tree_budget or 1))
+        self.ddtree_target_turboquant_bits = (
+            None
+            if ddtree_target_turboquant_bits is not None and ddtree_target_turboquant_bits <= 0
+            else ddtree_target_turboquant_bits
+        )
+        self.ddtree_fallback_to_dflash = bool(ddtree_fallback_to_dflash)
+        self.ddtree_retry_without_turboquant = bool(ddtree_retry_without_turboquant)
+        self._ddtree_target_turboquant_failed = False
         self.adaptive_block_size_config = adaptive_block_size_config or AdaptiveBlockSizeConfig(
             enabled=False,
             min_block_size=max(1, block_size),
@@ -2137,6 +2157,8 @@ class LocalModelServer:
             "avg_acceptance_ratio": float(result.get("avg_acceptance_ratio", 0.0) or 0.0),
             "peak_memory_gb": float(result.get("peak_memory_gb", 0.0) or 0.0),
             "prefix_cache_source": result.get("prefix_cache_source", "none"),
+            "engine": result.get("engine", self.generation_engine),
+            "ddtree_commit": result.get("ddtree_commit"),
         }
         block_size_history = result.get("block_size_history") or []
         if block_size_history:
@@ -2718,6 +2740,98 @@ class LocalModelServer:
 
         return min(candidates)
 
+    def _generate_ddtree_result_locked(
+        self,
+        messages: list[dict[str, Any]],
+        requested_max_tokens: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], int, float]:
+        self.ensure_loaded()
+        prompt = self.build_prompt(messages, tools=tools)
+        prompt_tokens_list = self.tokenize_prompt(prompt)
+        prompt_tokens = len(prompt_tokens_list)
+        max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
+        started = time.time()
+
+        target_turboquant_bits = (
+            None if self._ddtree_target_turboquant_failed else self.ddtree_target_turboquant_bits
+        )
+        attempts: list[tuple[str, float | None]] = [("ddtree", target_turboquant_bits)]
+        if self.ddtree_retry_without_turboquant and target_turboquant_bits is not None:
+            attempts.append(("ddtree-no-target-turboquant", None))
+
+        last_error: Exception | None = None
+        for engine_name, target_turboquant_bits in attempts:
+            try:
+                result = generate_ddtree(
+                    target_model=self._model,
+                    draft_model=self._draft,
+                    tokenizer=self._tokenizer,
+                    prompt_tokens=prompt_tokens_list,
+                    max_new_tokens=max_tokens,
+                    tree_budget=self.ddtree_tree_budget,
+                    block_size=self.block_size,
+                    adaptive_block_size=self.adaptive_block_size_config,
+                    target_turboquant_bits=target_turboquant_bits,
+                )
+                result.update(
+                    {
+                        "engine": engine_name,
+                        "prompt_tokens": prompt_tokens,
+                        "prefix_cache_source": "none",
+                        "prefill_hidden_bytes": 0,
+                        "prefill_target_cache_bytes": 0,
+                        "prefill_logits_bytes": 0,
+                        "prefill_working_set_bytes": 0,
+                        "prompt_cache_state_bytes": 0,
+                        "prompt_cache_state": None,
+                        "elapsed": time.time() - started,
+                    }
+                )
+                return result, prompt_tokens, started
+            except Exception as exc:
+                last_error = exc
+                _logger.warning("%s generation failed: %s", engine_name, exc)
+                if engine_name == "ddtree" and target_turboquant_bits is not None:
+                    self._ddtree_target_turboquant_failed = True
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("DDTree generation failed without an exception")
+
+    @staticmethod
+    def _ddtree_result_to_response(result: dict[str, Any]) -> GenerationResponse:
+        response = GenerationResponse(
+            text=str(result.get("text", "")),
+            tokens=[],
+            accepted=int(result.get("accepted_tokens", 0) or 0),
+            prompt_tokens=int(result.get("prompt_tokens", 0) or 0),
+            prefill_seconds=float(result.get("prefill_seconds", 0.0) or 0.0),
+            reused_prefix_tokens=int(result.get("reused_prefix_tokens", 0) or 0),
+            prompt_tps=float(result.get("prompt_tps", 0.0) or 0.0),
+            generation_tokens=int(result.get("generated_tokens", 0) or 0),
+            decode_seconds=float(result.get("decode_seconds", 0.0) or 0.0),
+            generation_tps=float(result.get("generation_tps", 0.0) or 0.0),
+            peak_memory=float(result.get("peak_memory_gb", 0.0) or 0.0),
+            speculative_steps=int(result.get("speculative_steps", 0) or 0),
+            proposed_tokens=int(result.get("proposed_tokens", 0) or 0),
+            accepted_tokens=int(result.get("accepted_tokens", 0) or 0),
+            avg_acceptance_length=float(result.get("avg_acceptance_length", 0.0) or 0.0),
+            avg_acceptance_ratio=float(result.get("avg_acceptance_ratio", 0.0) or 0.0),
+            acceptance_lengths=tuple(result.get("acceptance_lengths", ()) or ()),
+            acceptance_ratios=tuple(result.get("acceptance_ratios", ()) or ()),
+            block_size_history=tuple(result.get("block_size_history", ()) or ()),
+            adaptive_block_size=False,
+            finish_reason=str(result.get("finish_reason", "stop")),
+            prefill_state=None,
+        )
+        response.extra_result_fields = {
+            key: value
+            for key, value in result.items()
+            if key.startswith("ddtree_") or key in {"engine", "tree_budget", "target_turboquant_bits"}
+        }
+        return response
+
     def _generate_locked(
         self,
         messages: list[dict[str, Any]],
@@ -2731,6 +2845,19 @@ class LocalModelServer:
         temperature: float | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         sampling = _coerce_sampling_arg(sampling, temperature)
+        if self.generation_engine == "ddtree":
+            try:
+                result, _, _ = self._generate_ddtree_result_locked(
+                    messages,
+                    requested_max_tokens,
+                    tools=tools,
+                )
+                return [str(result.get("text", ""))], result
+            except Exception:
+                if not self.ddtree_fallback_to_dflash:
+                    raise
+                _logger.exception("DDTree generation failed; falling back to DFlash")
+
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
         prompt_tokens_list = self.tokenize_prompt(prompt)
@@ -2808,6 +2935,7 @@ class LocalModelServer:
             "peak_memory_gb": final.peak_memory,
             "elapsed": time.time() - started,
             "prompt_cache_state": final.prefill_state if capture_prefill_state else None,
+            "engine": "dflash",
         }
         return text_parts, result
 
@@ -2824,6 +2952,26 @@ class LocalModelServer:
         temperature: float | None = None,
     ) -> tuple[Iterator[Any], int, float, str | None, tuple[int, ...], str]:
         sampling = _coerce_sampling_arg(sampling, temperature)
+        if self.generation_engine == "ddtree":
+            try:
+                result, prompt_tokens, started = self._generate_ddtree_result_locked(
+                    messages,
+                    requested_max_tokens,
+                    tools=tools,
+                )
+                return (
+                    iter((self._ddtree_result_to_response(result),)),
+                    prompt_tokens,
+                    started,
+                    None,
+                    (),
+                    "none",
+                )
+            except Exception:
+                if not self.ddtree_fallback_to_dflash:
+                    raise
+                _logger.exception("DDTree streaming generation failed; falling back to DFlash")
+
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
         prompt_tokens_list = self.tokenize_prompt(prompt)
@@ -2939,7 +3087,11 @@ class LocalModelServer:
                 "peak_memory_gb": final.peak_memory,
                 "elapsed": time.time() - started,
                 "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
+                "engine": "dflash",
             }
+            extra_result_fields = getattr(final, "extra_result_fields", None)
+            if isinstance(extra_result_fields, dict):
+                result.update(extra_result_fields)
             self._record_generation_metrics(result, surface="stream")
             if not _queue_put(queue, ("result", result), stop_event):
                 return
@@ -4214,6 +4366,11 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "context_window": server.context_window,
             "context_reserve": server.context_reserve,
             "block_size": server.block_size,
+            "generation_engine": server.generation_engine,
+            "ddtree_tree_budget": server.ddtree_tree_budget,
+            "ddtree_target_turboquant_bits": server.ddtree_target_turboquant_bits,
+            "ddtree_fallback_to_dflash": server.ddtree_fallback_to_dflash,
+            "ddtree_retry_without_turboquant": server.ddtree_retry_without_turboquant,
             "disable_thinking": server.disable_thinking,
             "sliding_window_size": server.sliding_window_size,
             "max_tokens_limit": server.max_tokens_limit,
@@ -4297,6 +4454,9 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "dflash_context_window": server.context_window or 0,
             "dflash_max_tokens_limit": server.max_tokens_limit or 0,
             "dflash_block_size": server.block_size,
+            "dflash_generation_engine_ddtree": 1 if server.generation_engine == "ddtree" else 0,
+            "dflash_ddtree_tree_budget": server.ddtree_tree_budget,
+            "dflash_ddtree_target_turboquant_bits": float(server.ddtree_target_turboquant_bits or 0),
             "dflash_adaptive_block_size_enabled": 1 if server.adaptive_block_size_config.enabled else 0,
             "dflash_adaptive_block_size_min": server.adaptive_block_size_config.min_block_size,
             "dflash_adaptive_block_size_max": server.adaptive_block_size_config.max_block_size,
@@ -4696,6 +4856,44 @@ def parse_args() -> argparse.Namespace:
         help="Consecutive low-acceptance steps required before shrinking block size.",
     )
     parser.add_argument(
+        "--generation-engine",
+        choices=("dflash", "ddtree"),
+        default=os.environ.get("LOCAL_DFLASH_ENGINE", "dflash").strip().lower(),
+        help="Generation engine to use. ddtree uses experimental MLX DDTree verification.",
+    )
+    parser.add_argument(
+        "--ddtree-tree-budget",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_DDTREE_TREE_BUDGET", "4")),
+        help="Maximum DDTree candidate nodes to verify per speculative step.",
+    )
+    parser.add_argument(
+        "--ddtree-target-turboquant-bits",
+        type=float,
+        default=(
+            float(os.environ["LOCAL_DFLASH_DDTREE_TARGET_TURBOQUANT_BITS"])
+            if os.environ.get("LOCAL_DFLASH_DDTREE_TARGET_TURBOQUANT_BITS")
+            else (
+                float(os.environ["LOCAL_DFLASH_TURBOQUANT_BITS"])
+                if os.environ.get("LOCAL_DFLASH_TURBOQUANT_BITS")
+                else None
+            )
+        ),
+        help="Optional TurboQuant bit width for DDTree target KV cache. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--ddtree-no-fallback",
+        action="store_true",
+        default=_env_bool("LOCAL_DFLASH_DDTREE_NO_FALLBACK", False),
+        help="Raise DDTree errors instead of falling back to standard DFlash generation.",
+    )
+    parser.add_argument(
+        "--ddtree-no-turboquant-retry",
+        action="store_true",
+        default=_env_bool("LOCAL_DFLASH_DDTREE_NO_TURBOQUANT_RETRY", False),
+        help="Do not retry DDTree with target TurboQuant disabled after a DDTree+TurboQuant failure.",
+    )
+    parser.add_argument(
         "--global-prefix-cache-limit",
         type=int,
         default=int(os.environ.get("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", str(GLOBAL_PREFIX_CACHE_LIMIT))),
@@ -4871,6 +5069,11 @@ def main() -> int:
         target_turboquant_bits=args.target_turboquant_bits,
         draft_turboquant_bits=args.draft_turboquant_bits,
         adaptive_block_size_config=adaptive_block_size_config,
+        generation_engine=args.generation_engine,
+        ddtree_tree_budget=args.ddtree_tree_budget,
+        ddtree_target_turboquant_bits=args.ddtree_target_turboquant_bits,
+        ddtree_fallback_to_dflash=not args.ddtree_no_fallback,
+        ddtree_retry_without_turboquant=not args.ddtree_no_turboquant_retry,
         global_prefix_cache_limit=max(0, args.global_prefix_cache_limit),
         prefix_cache_state_byte_limit=response_prefix_byte_limit,
         global_prefix_cache_byte_limit=prefix_byte_limit,
