@@ -1084,7 +1084,7 @@ def _classify_error_code(message: str, exc: Exception | None = None) -> str:
 
 
 def _is_planning_only_function_call(item: dict[str, Any]) -> bool:
-    if item.get("type") != "function_call":
+    if item.get("type") not in {"function_call", "custom_tool_call"}:
         return False
     name = str(item.get("name") or "").strip().lower()
     return name in PLANNING_ONLY_TOOL_NAMES
@@ -1104,7 +1104,8 @@ def _response_is_followup_candidate(
         return False
 
     has_action_call = any(
-        item.get("type") == "function_call" and not _is_planning_only_function_call(item)
+        item.get("type") in {"function_call", "custom_tool_call"}
+        and not _is_planning_only_function_call(item)
         for item in output_items
     )
     if has_action_call:
@@ -1244,6 +1245,37 @@ def _build_output_items(full_text: str) -> list[dict[str, Any]]:
     return items
 
 
+def _compact_output_items_for_replay(output_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in output_items:
+        item_type = item.get("type")
+        if item_type == "message":
+            compact.append(_make_message_item(_extract_text_from_content(item.get("content"))))
+            continue
+        if item_type == "function_call":
+            compact.append(
+                _make_function_call_item(
+                    str(item.get("name") or "tool"),
+                    item.get("arguments"),
+                    call_id=item.get("call_id"),
+                    item_id=item.get("id"),
+                )
+            )
+            continue
+        if item_type == "custom_tool_call":
+            compact.append(
+                _make_custom_tool_call_item(
+                    str(item.get("name") or "tool"),
+                    _coerce_text(item.get("input")),
+                    call_id=item.get("call_id"),
+                    item_id=item.get("id"),
+                )
+            )
+    if not compact:
+        compact.append(_make_message_item(""))
+    return compact
+
+
 def _messages_from_output_items(output_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for item in output_items:
@@ -1266,6 +1298,22 @@ def _messages_from_output_items(output_items: list[dict[str, Any]]) -> list[dict
                         _make_internal_tool_call(
                             item.get("name") or "tool",
                             item.get("arguments"),
+                            call_id=item.get("call_id"),
+                        )
+                    ],
+                }
+            )
+            continue
+
+        if item_type == "custom_tool_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        _make_internal_tool_call(
+                            item.get("name") or "tool",
+                            {"input": _coerce_text(item.get("input"))},
                             call_id=item.get("call_id"),
                         )
                     ],
@@ -2220,7 +2268,14 @@ class LocalModelServer:
     def _prune_response_states_locked(self) -> None:
         while len(self._response_order) > self.response_history_limit:
             stale_response_id = self._response_order.popleft()
-            self._response_states.pop(stale_response_id, None)
+            stale_state = self._response_states.pop(stale_response_id, None)
+            stale_parent_id = stale_state.get("previous_response_id") if stale_state is not None else None
+            stale_tools = stale_state.get("tools") or [] if stale_state is not None else []
+            for state in self._response_states.values():
+                if state.get("previous_response_id") == stale_response_id:
+                    state["previous_response_id"] = stale_parent_id
+                    if stale_tools and not state.get("tools"):
+                        state["tools"] = list(stale_tools)
             try:
                 self._prefix_state_order.remove(stale_response_id)
             except ValueError:
@@ -2289,11 +2344,17 @@ class LocalModelServer:
     ) -> None:
         with self._lock:
             stored_prompt_cache_state = prompt_cache_state if self.prefix_cache_state_limit > 0 else None
+            previous_tools = []
+            if previous_response_id:
+                previous_state = self._response_states.get(previous_response_id)
+                if previous_state is not None:
+                    previous_tools = previous_state.get("tools") or []
+            stored_tools = list(tools) if tools and previous_tools != tools else []
             self._response_states[response_id] = {
                 "previous_response_id": previous_response_id,
                 "input_messages": list(request_messages),
-                "tools": list(tools),
-                "output_items": list(output_items),
+                "tools": stored_tools,
+                "output_items": _compact_output_items_for_replay(output_items),
                 "prompt_cache_state": stored_prompt_cache_state,
             }
             self._response_order.append(response_id)
@@ -2311,7 +2372,7 @@ class LocalModelServer:
         prompt_cache_state = state.get("prompt_cache_state")
         if prompt_cache_state is None:
             return None
-        return clone_prefill_state_for_reuse(prompt_cache_state)
+        return prompt_cache_state
 
     def build_prompt(
         self,
@@ -2405,7 +2466,7 @@ class LocalModelServer:
         state = self._global_prefix_states.get(stable_prefix_key)
         if state is None:
             return None
-        return clone_prefill_state_for_reuse(state)
+        return state
 
     def _reusable_prefix_state_for_prompt(
         self,
@@ -2423,7 +2484,7 @@ class LocalModelServer:
         if shared_tokens == cached_tokens:
             if shared_tokens == prompt_length and prefix_state.last_logits is None:
                 return None, 0
-            return prefix_state, shared_tokens
+            return clone_prefill_state_for_reuse(prefix_state), shared_tokens
         if shared_tokens >= prompt_length:
             return None, 0
 
@@ -2814,6 +2875,7 @@ class LocalModelServer:
         sampling = _coerce_sampling_arg(sampling, temperature)
         current_messages = list(messages)
         current_previous_response_id = previous_response_id
+        remaining_max_tokens = max(1, int(requested_max_tokens))
 
         for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
             if should_stop is not None:
@@ -2824,16 +2886,22 @@ class LocalModelServer:
                     pass
             _, result = self._generate_locked(
                 current_messages,
-                requested_max_tokens,
+                remaining_max_tokens,
                 sampling,
                 tools=tools,
                 previous_response_id=current_previous_response_id,
                 capture_prompt_cache_state=capture_prompt_cache_state,
                 should_stop=should_stop,
             )
+            remaining_max_tokens = max(
+                0,
+                remaining_max_tokens - max(0, int(result.get("generated_tokens", 0))),
+            )
             output_items = _build_output_items(result["text"])
             output_items = _convert_items_for_custom_tools(output_items, tools)
             if not _response_is_followup_candidate(result, output_items, tools):
+                return result, output_items
+            if remaining_max_tokens <= 0:
                 return result, output_items
 
             assistant_text = _output_text_from_items(output_items).strip()
@@ -4242,7 +4310,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
     @app.post("/v1/messages")
     def anthropic_messages(req: AnthropicRequest) -> Any:
-        _trace_request("messages", req.model_dump(mode="json"))
+        if DEFAULT_TRACE_FILE:
+            _trace_request("messages", req.model_dump(mode="json"))
         if req.model != server.model_name:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
@@ -4294,7 +4363,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
     @app.post("/v1/responses")
     def responses(req: ResponsesRequest) -> Any:
-        _trace_request("responses", req.model_dump(mode="json"))
+        if DEFAULT_TRACE_FILE:
+            _trace_request("responses", req.model_dump(mode="json"))
 
         if req.model != server.model_name:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
@@ -4608,6 +4678,7 @@ def main() -> int:
         "host": args.host,
         "port": args.port,
         "log_level": "info",
+        "access_log": False,
     }
     if importlib.util.find_spec("uvloop") is not None:
         uvicorn_kwargs["loop"] = "uvloop"

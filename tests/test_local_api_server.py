@@ -322,6 +322,26 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(merged_messages[4], {"role": "tool", "content": '[{"path":"README.md"}]'})
         self.assertEqual(merged_tools, tools)
 
+    def test_messages_from_output_items_restores_custom_tool_call(self):
+        output_items = [
+            local_api_server._make_custom_tool_call_item(
+                "apply_patch",
+                "*** Begin Patch\n*** End Patch\n",
+                call_id="call_patch",
+            )
+        ]
+
+        messages = local_api_server._messages_from_output_items(output_items)
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["tool_calls"][0]["id"], "call_patch")
+        self.assertEqual(messages[0]["tool_calls"][0]["function"]["name"], "apply_patch")
+        self.assertEqual(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            {"input": "*** Begin Patch\n*** End Patch\n"},
+        )
+
     def test_normalize_responses_input_preserves_tool_call_ids(self):
         req = SimpleNamespace(
             tools=None,
@@ -597,6 +617,8 @@ class LocalApiServerTests(unittest.TestCase):
         second_call = generate_locked_mock.call_args_list[1]
         self.assertEqual(first_call.kwargs["previous_response_id"], "resp_1")
         self.assertIsNone(second_call.kwargs["previous_response_id"])
+        self.assertEqual(first_call.args[1], 128)
+        self.assertEqual(second_call.args[1], 120)
         second_messages = second_call.args[0]
         self.assertEqual(second_messages[-2]["role"], "assistant")
         self.assertEqual(
@@ -1004,6 +1026,71 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertEqual(server._response_states, {})
         self.assertEqual(list(server._response_order), [])
+
+    def test_remember_response_prunes_parent_but_keeps_latest_tools_and_continuation(self):
+        server = self._make_server()
+        server.response_history_limit = 1
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_files",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        server.remember_response(
+            response_id="resp_1",
+            previous_response_id=None,
+            request_messages=[{"role": "user", "content": "one"}],
+            tools=tools,
+            output_items=[local_api_server._make_message_item("first")],
+        )
+        server.remember_response(
+            response_id="resp_2",
+            previous_response_id="resp_1",
+            request_messages=[{"role": "user", "content": "two"}],
+            tools=tools,
+            output_items=[local_api_server._make_message_item("second")],
+        )
+
+        self.assertNotIn("resp_1", server._response_states)
+        self.assertIsNone(server._response_states["resp_2"]["previous_response_id"])
+        self.assertEqual(server._response_states["resp_2"]["tools"], tools)
+
+        merged_messages, merged_tools = server.resolve_responses_context(
+            request_messages=[{"role": "user", "content": "three"}],
+            request_tools=[],
+            previous_response_id="resp_2",
+        )
+
+        self.assertEqual(
+            merged_messages,
+            [
+                {"role": "user", "content": "two"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "three"},
+            ],
+        )
+        self.assertEqual(merged_tools, tools)
+
+    def test_response_followup_candidate_treats_custom_tool_call_as_action(self):
+        result = {
+            "text": "",
+            "finish_reason": "stop",
+        }
+        tools = [{"type": "custom", "name": "apply_patch"}]
+        output_items = [
+            local_api_server._make_custom_tool_call_item(
+                "apply_patch",
+                "*** Begin Patch\n*** End Patch\n",
+            )
+        ]
+
+        self.assertFalse(
+            local_api_server._response_is_followup_candidate(result, output_items, tools)
+        )
 
     def test_stable_prefix_tokens_are_disabled_when_global_cache_limit_is_zero(self):
         server = self._make_server()
