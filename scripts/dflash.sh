@@ -406,6 +406,8 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
     max_tokens = integer(metrics.get("dflash_max_tokens_limit", health.get("max_tokens_limit", 0)))
     context = integer(metrics.get("dflash_context_window", health.get("context_window", 0)))
     block = integer(metrics.get("dflash_block_size", health.get("block_size", 0)))
+    adaptive_min = integer(metrics.get("dflash_adaptive_block_size_min", health.get("adaptive_block_size_min", 0)))
+    adaptive_max = integer(metrics.get("dflash_adaptive_block_size_max", health.get("adaptive_block_size_max", 0)))
     history = integer(metrics.get("dflash_response_history_entries", health.get("response_history_entries", 0)))
     prefix = integer(metrics.get("dflash_prefix_cache_entries", health.get("prefix_cache_entries", 0)))
     global_prefix = integer(metrics.get("dflash_global_prefix_cache_entries", health.get("global_prefix_cache_entries", 0)))
@@ -419,6 +421,9 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
     last_prompt_tokens = integer(metrics.get("dflash_last_request_prompt_tokens", last.get("prompt_tokens", 0)))
     last_generated_tokens = integer(metrics.get("dflash_last_request_generated_tokens", last.get("generated_tokens", 0)))
     last_accept = num(metrics.get("dflash_last_request_avg_acceptance_ratio", last.get("avg_acceptance_ratio", 0.0)))
+    last_final_block = integer(metrics.get("dflash_last_request_final_block_size", last.get("final_block_size", 0)))
+    last_min_block = integer(metrics.get("dflash_last_request_min_observed_block_size", last.get("min_observed_block_size", 0)))
+    last_max_block = integer(metrics.get("dflash_last_request_max_observed_block_size", last.get("max_observed_block_size", 0)))
     last_finish = last.get("finish_reason", "n/a")
     last_surface = last.get("surface", "n/a")
 
@@ -455,7 +460,7 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
     rows.append(
         metric_row("context", f"{context} ctx / {max_tokens} max", left, "white")
         + gap
-        + metric_row("block", str(block), mid, "white")
+        + metric_row("block", f"{block} cfg / {adaptive_min}-{adaptive_max} adaptive", mid, "white")
         + gap
         + metric_row("history", f"{history} responses", right, "white")
     )
@@ -482,6 +487,13 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
         + metric_row("prefill", f"{last_prompt_tps:.1f} tok/s {bar(last_prompt_tps, 2500, 12)}", mid, "cyan")
         + gap
         + metric_row("accept", f"{last_accept:.2f} {bar(last_accept, 1.0, 12)}", right, "yellow")
+    )
+    rows.append(
+        metric_row("observed block", f"final {last_final_block} / range {last_min_block}-{last_max_block}", left, "white")
+        + gap
+        + metric_row("target accept", ">=0.60 good, >=0.80 fast", mid, "dim")
+        + gap
+        + metric_row("tuning", "low accept => shrink block", right, "dim")
     )
     rows.append(line(width))
 

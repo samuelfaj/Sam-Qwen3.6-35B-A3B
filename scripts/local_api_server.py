@@ -223,8 +223,8 @@ TOOL_CALLING_RULES_PROMPT = (
 TOOL_CALLING_RULES_ENABLED = _env_bool("LOCAL_DFLASH_TOOL_CALLING_RULES", True)
 
 
-DEFAULT_TEMPERATURE_NO_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE", 0.7)
-DEFAULT_TEMPERATURE_WITH_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS", 0.7)
+DEFAULT_TEMPERATURE_NO_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE", 0.6)
+DEFAULT_TEMPERATURE_WITH_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS", 0.3)
 DEFAULT_TOP_P = _env_positive_float("LOCAL_DFLASH_DEFAULT_TOP_P", 0.8)
 DEFAULT_TOP_K = _env_non_negative_int("LOCAL_DFLASH_DEFAULT_TOP_K", 20)
 DEFAULT_MIN_P = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_MIN_P", 0.0)
@@ -235,7 +235,7 @@ DEFAULT_PRESENCE_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_PRESENC
 DEFAULT_REPETITION_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_REPETITION_PENALTY", 1.0)
 DEFAULT_FREQUENCY_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_FREQUENCY_PENALTY", 0.0)
 DEFAULT_MAX_TOKENS_FALLBACK = _env_positive_int("LOCAL_DFLASH_DEFAULT_MAX_TOKENS", 8192)
-MIN_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS", 0.1)
+MIN_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS", 0.0)
 
 
 def _coerce_sampling_arg(sampling: Any, temperature: float | None) -> "SamplingParams":
@@ -2114,6 +2114,11 @@ class LocalModelServer:
             "peak_memory_gb": float(result.get("peak_memory_gb", 0.0) or 0.0),
             "prefix_cache_source": result.get("prefix_cache_source", "none"),
         }
+        block_size_history = result.get("block_size_history") or []
+        if block_size_history:
+            metrics["final_block_size"] = int(block_size_history[-1])
+            metrics["min_observed_block_size"] = int(min(block_size_history))
+            metrics["max_observed_block_size"] = int(max(block_size_history))
         with self._lock:
             self._last_request_metrics = metrics
             self._request_metrics_order.append(metrics)
@@ -4198,6 +4203,12 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "adaptive_block_size": server.adaptive_block_size_config.enabled,
             "adaptive_block_size_min": server.adaptive_block_size_config.min_block_size,
             "adaptive_block_size_max": server.adaptive_block_size_config.max_block_size,
+            "adaptive_block_size_grow_threshold": server.adaptive_block_size_config.grow_threshold,
+            "adaptive_block_size_shrink_threshold": server.adaptive_block_size_config.shrink_threshold,
+            "adaptive_block_size_grow_step": server.adaptive_block_size_config.grow_step,
+            "adaptive_block_size_shrink_step": server.adaptive_block_size_config.shrink_step,
+            "adaptive_block_size_grow_streak": server.adaptive_block_size_config.grow_streak,
+            "adaptive_block_size_shrink_streak": server.adaptive_block_size_config.shrink_streak,
             "request_metrics_entries": len(server._request_metrics_order),
             "last_request_metrics": last_request_metrics,
             "last_used_at": server._last_used_at,
@@ -4252,6 +4263,15 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "dflash_context_window": server.context_window or 0,
             "dflash_max_tokens_limit": server.max_tokens_limit or 0,
             "dflash_block_size": server.block_size,
+            "dflash_adaptive_block_size_enabled": 1 if server.adaptive_block_size_config.enabled else 0,
+            "dflash_adaptive_block_size_min": server.adaptive_block_size_config.min_block_size,
+            "dflash_adaptive_block_size_max": server.adaptive_block_size_config.max_block_size,
+            "dflash_adaptive_block_size_grow_threshold": server.adaptive_block_size_config.grow_threshold,
+            "dflash_adaptive_block_size_shrink_threshold": server.adaptive_block_size_config.shrink_threshold,
+            "dflash_adaptive_block_size_grow_step": server.adaptive_block_size_config.grow_step,
+            "dflash_adaptive_block_size_shrink_step": server.adaptive_block_size_config.shrink_step,
+            "dflash_adaptive_block_size_grow_streak": server.adaptive_block_size_config.grow_streak,
+            "dflash_adaptive_block_size_shrink_streak": server.adaptive_block_size_config.shrink_streak,
             "dflash_keep_alive_seconds": float(server.keep_alive_seconds or 0),
             "dflash_last_used_at": float(server._last_used_at or 0),
             **{
@@ -4586,7 +4606,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=os.environ.get("LOCAL_DFLASH_MODEL_PATH", DEFAULT_MODEL_PATH))
     parser.add_argument("--draft-path", default=os.environ.get("LOCAL_DFLASH_DRAFT_PATH", DEFAULT_DRAFT_PATH))
     parser.add_argument("--model-name", default=os.environ.get("LOCAL_DFLASH_MODEL_NAME", DEFAULT_MODEL_NAME))
-    parser.add_argument("--block-size", type=int, default=int(os.environ.get("LOCAL_DFLASH_BLOCK_SIZE", "15")))
+    parser.add_argument("--block-size", type=int, default=int(os.environ.get("LOCAL_DFLASH_BLOCK_SIZE", "8")))
     parser.add_argument(
         "--adaptive-block-size",
         action="store_true",
@@ -4596,13 +4616,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adaptive-block-size-min",
         type=int,
-        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN", "6")),
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN", "4")),
         help="Lower bound for adaptive speculative block size.",
     )
     parser.add_argument(
         "--adaptive-block-size-max",
         type=int,
-        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX", os.environ.get("LOCAL_DFLASH_BLOCK_SIZE", "15"))),
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX", "12")),
         help="Upper bound for adaptive speculative block size.",
     )
     parser.add_argument(
@@ -4614,8 +4634,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adaptive-block-size-shrink-threshold",
         type=float,
-        default=float(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_THRESHOLD", "0.6")),
+        default=float(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_THRESHOLD", "0.65")),
         help="Shrink block size when accepted/proposed ratio falls at or below this threshold.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-grow-step",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_STEP", "1")),
+        help="How many tokens to add when the adaptive block size grows.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-shrink-step",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_STEP", "2")),
+        help="How many tokens to remove when the adaptive block size shrinks.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-grow-streak",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_STREAK", "2")),
+        help="Consecutive high-acceptance steps required before growing block size.",
+    )
+    parser.add_argument(
+        "--adaptive-block-size-shrink-streak",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_STREAK", "1")),
+        help="Consecutive low-acceptance steps required before shrinking block size.",
     )
     parser.add_argument(
         "--global-prefix-cache-limit",
@@ -4770,6 +4814,10 @@ def main() -> int:
         max_block_size=max(1, args.adaptive_block_size_max),
         grow_threshold=args.adaptive_block_size_grow_threshold,
         shrink_threshold=args.adaptive_block_size_shrink_threshold,
+        grow_step=max(1, args.adaptive_block_size_grow_step),
+        shrink_step=max(1, args.adaptive_block_size_shrink_step),
+        grow_streak=max(1, args.adaptive_block_size_grow_streak),
+        shrink_streak=max(1, args.adaptive_block_size_shrink_streak),
     )
     response_prefix_byte_limit = _gb_to_bytes(getattr(args, "prefix_cache_state_byte_limit_gb", None) or 0) or 0
     prefix_byte_limit = _gb_to_bytes(getattr(args, "global_prefix_cache_byte_limit_gb", None) or 0) or 0
