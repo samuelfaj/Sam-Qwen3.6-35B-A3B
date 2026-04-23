@@ -475,6 +475,12 @@ def _patch_model(model, layer_ids):
         layers[lid] = _LayerHook(layers[lid], i, model._hidden_states)
 
 
+def _clear_model_hidden_states(model):
+    hidden_states = getattr(model, "_hidden_states", None)
+    if isinstance(hidden_states, list):
+        hidden_states[:] = [None] * len(hidden_states)
+
+
 class _GDNStateCapture:
     def __init__(self):
         self.conv_data = []
@@ -820,16 +826,25 @@ def prefill_prompt(
 
     tic = time.perf_counter()
     if reusable_prefix is None:
+        _clear_model_hidden_states(model)
         with mx.stream(generation_stream):
             logits = model(prompt[None], target_cache)
-            hidden = mx.concatenate(model._hidden_states, axis=-1)
+            try:
+                hidden = mx.concatenate(model._hidden_states, axis=-1)
+            finally:
+                _clear_model_hidden_states(model)
         mx.eval(logits, hidden)
     elif reusable_prefix_tokens < prompt.size:
         suffix = prompt[reusable_prefix_tokens:]
+        _clear_model_hidden_states(model)
         with mx.stream(generation_stream):
             logits = model(suffix[None], target_cache)
-            suffix_hidden = mx.concatenate(model._hidden_states, axis=-1)
+            try:
+                suffix_hidden = mx.concatenate(model._hidden_states, axis=-1)
+            finally:
+                _clear_model_hidden_states(model)
         hidden = mx.concatenate([reusable_prefix.hidden, suffix_hidden], axis=1)
+        suffix_hidden = None
         mx.eval(logits, hidden)
     else:
         logits = reusable_prefix.last_logits
@@ -868,13 +883,18 @@ def _clamp_block_size(value: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-def _acceptance_prefix_length(draft_tokens: mx.array, target_tokens: mx.array) -> int:
-    if draft_tokens.shape[-1] == 0:
-        return 0
-    matches = (draft_tokens[0] == target_tokens[0, :-1]).astype(mx.int32)
-    accepted = mx.sum(mx.cumprod(matches, axis=0))
-    mx.eval(accepted)
-    return int(accepted.item())
+def _accepted_tokens_from_cpu_batches(
+    draft_tokens: list[int],
+    target_tokens: list[int],
+) -> tuple[int, list[int]]:
+    if not target_tokens:
+        raise ValueError("target_tokens must not be empty")
+
+    limit = min(len(draft_tokens), max(len(target_tokens) - 1, 0))
+    accepted = 0
+    while accepted < limit and draft_tokens[accepted] == target_tokens[accepted]:
+        accepted += 1
+    return accepted, draft_tokens[:accepted] + [target_tokens[accepted]]
 
 
 def next_adaptive_block_size(
@@ -1025,7 +1045,10 @@ def stream_generate(
 
         decode_tic = time.perf_counter()
         first_logits = _apply_logits_processors(processors, logits[:, -1:], tokens)
-        token = sampler(first_logits)[0, 0].item()
+        token = int(sampler(first_logits)[0, 0].item())
+        prefill.logits = None
+        logits = None
+        first_logits = None
         tokens.append(token)
         n = 1
         current_block_size = int(block_size)
@@ -1118,20 +1141,26 @@ def stream_generate(
                 draft_tokens = sampler(
                     _apply_logits_processors(processors, draft_logits[:, 1 - bs:], tokens)
                 )
-            mx.async_eval(draft_tokens)
 
             if _capture is not None:
                 _capture.clear()
+            _clear_model_hidden_states(model)
             with mx.stream(generation_stream):
                 verify_input = mx.concatenate([mx.array([[tokens[-1]]]), draft_tokens], axis=1)
                 logits = model(verify_input, target_cache)
-                hidden = mx.concatenate(model._hidden_states, axis=-1)
+                try:
+                    hidden = mx.concatenate(model._hidden_states, axis=-1)
+                finally:
+                    _clear_model_hidden_states(model)
                 target_tokens = sampler(_apply_logits_processors(processors, logits, tokens))
-            mx.async_eval(target_tokens, hidden)
+            mx.eval(draft_tokens, target_tokens, hidden)
 
-            accepted = _acceptance_prefix_length(draft_tokens, target_tokens)
-            accepted_prefix = draft_tokens[0, :accepted].tolist() if accepted > 0 else []
-            new_tokens = accepted_prefix + [int(target_tokens[0, accepted].item())]
+            draft_token_values = [int(token_id) for token_id in draft_tokens[0].tolist()]
+            target_token_values = [int(token_id) for token_id in target_tokens[0].tolist()]
+            accepted, new_tokens = _accepted_tokens_from_cpu_batches(
+                draft_token_values,
+                target_token_values,
+            )
             new_tokens = new_tokens[:max_tokens - n]
             accepted_length = len(new_tokens)
             speculative_steps += 1
@@ -1250,5 +1279,7 @@ def stream_generate(
             snapshot_histories=True,
         )
     finally:
+        prefill.logits = None
+        _clear_model_hidden_states(model)
         if _capture is not None:
             _capture.close()

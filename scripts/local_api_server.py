@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -78,6 +80,8 @@ TOOL_BLOCK_MARKERS = (
 VISIBLE_HIDDEN_MARKERS = (("<think>", "</think>"), *TOOL_BLOCK_MARKERS)
 VISIBLE_START_MARKERS = tuple(marker for marker, _ in VISIBLE_HIDDEN_MARKERS)
 VISIBLE_PARTIAL_MARKERS = (*SPECIAL_TOKENS, *VISIBLE_START_MARKERS)
+TOOL_NORMALIZATION_CACHE_LIMIT = 128
+_ANTHROPIC_TOOL_NORMALIZATION_CACHE: dict[str, list[dict[str, Any]]] = {}
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -1420,15 +1424,39 @@ def _longest_common_prefix_tokens(left: list[int], right: list[int]) -> tuple[in
     return tuple(left[:idx])
 
 
+def _shared_prefix_length(left: list[int], right: tuple[int, ...]) -> int:
+    size = min(len(left), len(right))
+    idx = 0
+    while idx < size and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
 def _prompt_startswith(prompt_tokens: list[int], prefix_tokens: tuple[int, ...]) -> bool:
     if len(prefix_tokens) > len(prompt_tokens):
         return False
     return tuple(prompt_tokens[: len(prefix_tokens)]) == prefix_tokens
 
 
+def _hash_json_payload(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if not tools:
+        return []
+    cache_key = _hash_json_payload(tools)
+    cached = _ANTHROPIC_TOOL_NORMALIZATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     normalized: list[dict[str, Any]] = []
-    for tool in tools or []:
+    for tool in tools:
         if not isinstance(tool, dict):
             continue
         name = tool.get("name") or tool.get("tool_name")
@@ -1447,6 +1475,9 @@ def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[
                 "function": function_def,
             }
         )
+    if len(_ANTHROPIC_TOOL_NORMALIZATION_CACHE) >= TOOL_NORMALIZATION_CACHE_LIMIT:
+        _ANTHROPIC_TOOL_NORMALIZATION_CACHE.pop(next(iter(_ANTHROPIC_TOOL_NORMALIZATION_CACHE)), None)
+    _ANTHROPIC_TOOL_NORMALIZATION_CACHE[cache_key] = normalized
     return normalized
 
 
@@ -1996,6 +2027,9 @@ class LocalModelServer:
         self._global_prefix_states.clear()
         self._global_prefix_order.clear()
         self._stable_prefix_tokens_by_key.clear()
+        self._global_prefix_state_bytes.clear()
+        self._global_prefix_cache_bytes = 0
+        self._stable_prefix_tokens_bytes = 0
 
     def _reset_loaded_state_locked(self) -> None:
         self._clear_hidden_states_locked()
@@ -2058,10 +2092,11 @@ class LocalModelServer:
         )
         with self._lock:
             self._last_used_at = time.time()
-            if keep_alive_seconds is None or keep_alive_seconds > 0:
-                # Keep the warm model resident, but drop per-request tensors and free-list
-                # allocations so memory returns close to the loaded baseline after each turn.
-                self._clear_request_state_locked()
+            # Keep the warm model resident, but drop per-request tensors and free-list
+            # allocations so memory returns close to the loaded baseline after each turn.
+            self._clear_request_state_locked()
+            if keep_alive_seconds is not None and keep_alive_seconds <= 0:
+                self._clear_global_prefix_cache_locked()
             self._maybe_clear_mlx_cache_locked()
             self._schedule_unload_locked(keep_alive_seconds)
 
@@ -2096,6 +2131,13 @@ class LocalModelServer:
         self._cancel_unload_timer_locked()
         if self._model is not None and self._draft is not None and self._tokenizer is not None:
             return
+        if any(component is not None for component in (self._model, self._draft, self._tokenizer)):
+            _logger.warning("partial loaded state detected; resetting model and prefix caches before reload")
+            self._reset_loaded_state_locked()
+        elif self._global_prefix_states or self._stable_prefix_tokens_by_key or self._global_prefix_state_bytes:
+            _logger.warning("stale prefix cache detected without a loaded model; clearing cached prefix state")
+            self._clear_cached_prefix_states_locked()
+            self._clear_global_prefix_cache_locked()
         self._model, self._tokenizer = load(self.model_path)
         self._draft = load_draft(
             self.draft_path,
@@ -2322,7 +2364,7 @@ class LocalModelServer:
             "messages": stable_messages,
             "tools": tools or [],
         }
-        return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return f"stable-prefix::{_hash_json_payload(payload)}"
 
     def _stable_prefix_tokens_locked(
         self,
@@ -2365,6 +2407,31 @@ class LocalModelServer:
             return None
         return clone_prefill_state_for_reuse(state)
 
+    def _reusable_prefix_state_for_prompt(
+        self,
+        prompt_tokens: list[int],
+        prefix_state: PromptPrefillState | None,
+    ) -> tuple[PromptPrefillState | None, int]:
+        if prefix_state is None:
+            return None, 0
+        shared_tokens = _shared_prefix_length(prompt_tokens, prefix_state.prompt_tokens)
+        if shared_tokens <= 0:
+            return None, 0
+
+        cached_tokens = len(prefix_state.prompt_tokens)
+        prompt_length = len(prompt_tokens)
+        if shared_tokens == cached_tokens:
+            if shared_tokens == prompt_length and prefix_state.last_logits is None:
+                return None, 0
+            return prefix_state, shared_tokens
+        if shared_tokens >= prompt_length:
+            return None, 0
+
+        derived_state = derive_prefill_prefix_state(prefix_state, shared_tokens)
+        if derived_state is None:
+            return None, 0
+        return derived_state, shared_tokens
+
     def _select_prefix_state_locked(
         self,
         prompt_tokens: list[int],
@@ -2373,17 +2440,26 @@ class LocalModelServer:
     ) -> tuple[PromptPrefillState | None, str]:
         best_state: PromptPrefillState | None = None
         best_source = "none"
+        best_tokens = 0
 
-        response_state = self._prefix_cache_state_for_response_locked(previous_response_id)
-        if response_state is not None and _prompt_startswith(prompt_tokens, response_state.prompt_tokens):
+        response_state, response_tokens = self._reusable_prefix_state_for_prompt(
+            prompt_tokens,
+            self._prefix_cache_state_for_response_locked(previous_response_id),
+        )
+        if response_state is not None:
             best_state = response_state
             best_source = "response"
+            best_tokens = response_tokens
 
-        global_state = self._global_prefix_state_for_key_locked(stable_prefix_key)
-        if global_state is not None and _prompt_startswith(prompt_tokens, global_state.prompt_tokens):
-            if best_state is None or len(global_state.prompt_tokens) > len(best_state.prompt_tokens):
+        global_state, global_tokens = self._reusable_prefix_state_for_prompt(
+            prompt_tokens,
+            self._global_prefix_state_for_key_locked(stable_prefix_key),
+        )
+        if global_state is not None:
+            if best_state is None or global_tokens > best_tokens:
                 best_state = global_state
                 best_source = "global"
+                best_tokens = global_tokens
             self._global_prefix_cache_hits += 1
         elif stable_prefix_key is not None and self.global_prefix_cache_limit > 0:
             self._global_prefix_cache_misses += 1
@@ -2869,24 +2945,24 @@ class LocalModelServer:
             },
         ]
         try:
-            prompt_text = tokenizer.apply_chat_template(
+            prompt_tokens = tokenizer.apply_chat_template(
                 judge_messages,
-                tokenize=False,
+                tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
         except TypeError:
-            prompt_text = tokenizer.apply_chat_template(
+            prompt_tokens = tokenizer.apply_chat_template(
                 judge_messages,
-                tokenize=False,
+                tokenize=True,
                 add_generation_prompt=True,
             )
-
-        prompt_tokens_list = tokenize_prompt(tokenizer, prompt_text).tolist()
+        if hasattr(prompt_tokens, "tolist"):
+            prompt_tokens = prompt_tokens.tolist()
         run = prefill_prompt(
             self._model,
             tokenizer,
-            prompt_tokens_list,
+            prompt_tokens,
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=None,
             capture_prefill_state=False,
@@ -4487,6 +4563,12 @@ def main() -> int:
                 "skipping wired-memory cap (%d GiB requested).",
                 args.mlx_wired_limit_gb,
             )
+        except Exception as exc:
+            _logger.warning(
+                "mx.set_wired_limit(%d GiB) failed: %s",
+                args.mlx_wired_limit_gb,
+                exc,
+            )
 
     detected_context_window = _detect_context_window(args.model_path)
     context_window = args.context_window_override or detected_context_window
@@ -4522,7 +4604,16 @@ def main() -> int:
     if not args.no_preload:
         server.ensure_loaded()
     app = create_app(server)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn_kwargs: dict[str, Any] = {
+        "host": args.host,
+        "port": args.port,
+        "log_level": "info",
+    }
+    if importlib.util.find_spec("uvloop") is not None:
+        uvicorn_kwargs["loop"] = "uvloop"
+    if importlib.util.find_spec("httptools") is not None:
+        uvicorn_kwargs["http"] = "httptools"
+    uvicorn.run(app, **uvicorn_kwargs)
     return 0
 
 
