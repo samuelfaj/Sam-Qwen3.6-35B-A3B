@@ -9,21 +9,20 @@ It is focused on running the MLX path locally with:
 - Backend: `MLX`
 - Main use case: local coding agents and tool-using assistants
 
-The goal is not to be a generic inference stack. The goal is to make the DFlash MLX path usable as a local serving system for real agent workflows, with good streaming behavior, controllable memory usage, and compatibility with Codex, OpenCode, and Distill.
+The goal is not to be a generic inference stack. The goal is to make the DFlash MLX path usable as a local serving system for real agent workflows, with good streaming behavior, controllable memory usage, and compatibility with Codex and OpenCode.
 
 ## What This Fork Adds
 
 Compared with upstream `dflash`, this fork includes:
 
 - A local OpenAI/Anthropic-style API wrapper in `scripts/local_api_server.py`
-- Compatibility wrappers for Codex, OpenCode, and Distill
-- Background service helpers for the main API and the dedicated Distill API
+- Compatibility wrappers for Codex and OpenCode
+- Background service helpers for the main API
 - Lazy loading and keep-alive based unload behavior
 - Streaming heartbeats for long prefills and long-running turns
 - Broader tool-call parsing for real agent traffic
 - TurboQuant support for compatible target-model KV cache layers in the MLX path
 - Prefix reuse controls and health metrics for local serving
-- A separate Distill-oriented API profile on its own port
 - Experimental DDTree MLX integration and test entry points
 
 ## Repository Layout
@@ -40,16 +39,10 @@ Compared with upstream `dflash`, this fork includes:
   Main local API launcher with the default coding-agent profile.
 - `scripts/dflash.sh`
   Background service helper for the main API.
-- `scripts/start_distill_wrapper.sh`
-  Dedicated Distill API launcher on a separate port.
-- `scripts/dflash_distill.sh`
-  Background service helper for the Distill API.
 - `scripts/run_codex_local.sh`
   Writes a local Codex config and points Codex at the main API.
 - `scripts/run_opencode_local.sh`
   Runs OpenCode against the main API.
-- `scripts/run_distill_local.sh`
-  Runs Distill against the dedicated Distill API without rewriting Distill's saved config.
 - `scripts/test_qwen36_dflash_mlx.py`
   Direct MLX DFlash smoke test without the HTTP wrapper.
 - `scripts/test_qwen36_ddtree_mlx.py`
@@ -203,66 +196,6 @@ Typical health fields include:
 - `cache_memory_gb`
 - `peak_memory_gb`
 
-## Dedicated Distill API
-
-This repository also includes a separate API profile for Distill on its own port.
-
-Start it in the foreground:
-
-```bash
-./scripts/start_distill_wrapper.sh
-```
-
-Default endpoint:
-
-```text
-http://127.0.0.1:8011
-```
-
-### Distill API Default Profile
-
-- Model name: `qwen3.6-35b-a3b-dflash-distill-local`
-- Port: `8011`
-- Context window: `8192`
-- Keep-alive: `30s`
-- Single active generation with FIFO queueing
-- Response history limit: `0`
-- Response prefix cache limit: `0`
-- Global prefix cache limit: `0`
-- MLX allocator cache limit: `0`
-- Preload on startup: disabled
-
-This profile is designed for fast repeated Distill calls with a single warm model instance and no conversation memory or reusable request cache between requests.
-
-### Distill API Service Helper
-
-```bash
-./scripts/dflash_distill.sh start
-./scripts/dflash_distill.sh status
-./scripts/dflash_distill.sh logs
-./scripts/dflash_distill.sh stop
-./scripts/dflash_distill.sh restart
-./scripts/dflash_distill.sh kill
-```
-
-The helper stores:
-
-- PID file: `.dflash-distill.pid`
-- Log file: `dflash-distill.log`
-
-### Distill API Health Check
-
-```bash
-curl http://127.0.0.1:8011/health
-```
-
-The same health endpoint also exposes:
-
-- `active_generation_requests`
-- `queued_generation_requests`
-
-Those fields are useful for confirming that the Distill API is queueing work instead of loading multiple model instances.
-
 ## Client Wrappers
 
 ### Codex
@@ -330,28 +263,6 @@ Relevant knobs:
 - `LOCAL_DFLASH_OPENCODE_LOOP_REPEAT_THRESHOLD=3`
 - `LOCAL_DFLASH_OPENCODE_CHECKPOINT_DIR=.opencode-watchdog`
 
-### Distill
-
-Wrapper-based usage:
-
-```bash
-./scripts/run_distill_local.sh "Summarize this build log"
-```
-
-Or through the service helper:
-
-```bash
-./scripts/dflash_distill.sh distill "Summarize this build log"
-```
-
-The Distill wrapper passes:
-
-- `--provider dflash`
-- `--model qwen3.6-35b-a3b-dflash-distill-local`
-- `--host http://127.0.0.1:8011/v1`
-
-This avoids mutating Distill's saved config.
-
 ## Supported API Surfaces
 
 The local API is intended to be usable by real agent clients, not just one-shot demos.
@@ -386,30 +297,16 @@ Main API default memory policy:
 - Keep-alive after request: `60s`
 - Unload after about one minute of inactivity
 
-Distill API default memory policy:
-
-- Preload on startup: off
-- Keep-alive after request: `30s`
-- One loaded model instance at a time
-- No response history or prefix cache reuse
-
 That means:
 
 - The HTTP server can stay online even when the model is unloaded
 - The next generation request can reload the model automatically
 - You can keep a warm model briefly without keeping conversation state
-- The Distill API can queue requests while reusing a single warm model instance
 
 If you want a strict MLX-side memory ceiling, set:
 
 ```bash
 export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=20
-```
-
-For the Distill API only:
-
-```bash
-export LOCAL_DFLASH_DISTILL_MLX_MEMORY_LIMIT_GB=20
 ```
 
 ## Configuration Knobs
@@ -447,23 +344,6 @@ export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=2
 export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=2
 export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB=4
 export LOCAL_DFLASH_STABLE_PREFIX_TOKENS_BYTE_LIMIT_GB=2
-```
-
-Distill API launcher defaults from `scripts/start_distill_wrapper.sh`:
-
-```bash
-export LOCAL_DFLASH_DISTILL_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-4bit
-export LOCAL_DFLASH_DISTILL_DRAFT_PATH=/path/to/Qwen3.6-35B-A3B-DFlash
-export LOCAL_DFLASH_DISTILL_MODEL_NAME=qwen3.6-35b-a3b-dflash-distill-local
-export LOCAL_DFLASH_DISTILL_HOST=127.0.0.1
-export LOCAL_DFLASH_DISTILL_PORT=8011
-export LOCAL_DFLASH_DISTILL_CONTEXT_WINDOW=8192
-export LOCAL_DFLASH_DISTILL_KEEP_ALIVE=30
-export LOCAL_DFLASH_DISTILL_NO_PRELOAD=1
-export LOCAL_DFLASH_DISTILL_RESPONSE_HISTORY_LIMIT=0
-export LOCAL_DFLASH_DISTILL_PREFIX_CACHE_STATE_LIMIT=0
-export LOCAL_DFLASH_DISTILL_GLOBAL_PREFIX_CACHE_LIMIT=0
-export LOCAL_DFLASH_DISTILL_MLX_CACHE_LIMIT_GB=0
 ```
 
 ## Tuning Notes

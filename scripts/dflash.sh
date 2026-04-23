@@ -8,6 +8,7 @@ LOG_FILE="${REPO_ROOT}/dflash.log"
 PORT="${LOCAL_DFLASH_PORT:-8010}"
 HOST="${LOCAL_DFLASH_HOST:-127.0.0.1}"
 HEALTH_URL="http://${HOST}:${PORT}/health"
+METRICS_URL="http://${HOST}:${PORT}/metrics"
 
 get_running_pid() {
   if [[ -f "${PID_FILE}" ]]; then
@@ -145,6 +146,436 @@ cmd_logs() {
   exec tail -f "${LOG_FILE}"
 }
 
+cmd_monitor() {
+  local interval="${1:-${LOCAL_DFLASH_MONITOR_INTERVAL_SECONDS:-1}}"
+  if ! [[ "${interval}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "dflash: monitor interval must be numeric seconds" >&2
+    return 2
+  fi
+
+  local pid
+  pid="$(get_running_pid)"
+  if [[ -z "${pid}" ]]; then
+    echo "dflash: stopped"
+    echo "dflash: run '$0 start' first"
+    return 1
+  fi
+
+  local python_bin="${REPO_ROOT}/.venv/bin/python"
+  if [[ ! -x "${python_bin}" ]]; then
+    python_bin="$(command -v python3 || true)"
+  fi
+  if [[ -z "${python_bin}" ]]; then
+    echo "dflash: python3 not found; cannot format monitor output" >&2
+    return 2
+  fi
+
+  echo "dflash monitor: ${HEALTH_URL} (pid ${pid}, interval ${interval}s, Ctrl-C to stop)"
+  while true; do
+    local health_json metrics_json
+    if ! health_json="$(curl -fsS --max-time 2 "${HEALTH_URL}" 2>/dev/null)"; then
+      printf '%s health=down pid=%s port=%s\n' "$(date '+%H:%M:%S')" "${pid}" "${PORT}"
+      sleep "${interval}"
+      continue
+    fi
+    metrics_json="$(curl -fsS --max-time 2 "${METRICS_URL}" 2>/dev/null || printf '{}')"
+    DFLASH_HEALTH_JSON="${health_json}" DFLASH_METRICS_JSON="${metrics_json}" "${python_bin}" - <<'PY'
+import json
+import os
+import time
+
+
+def load_env_json(name):
+    try:
+        return json.loads(os.environ.get(name, "{}"))
+    except Exception:
+        return {}
+
+
+def gb_from_bytes(value):
+    try:
+        return float(value) / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def fmt_gb(value):
+    return f"{float(value):.2f}GB"
+
+
+health = load_env_json("DFLASH_HEALTH_JSON")
+metrics = load_env_json("DFLASH_METRICS_JSON")
+now = time.strftime("%H:%M:%S")
+loaded = "yes" if int(metrics.get("dflash_model_loaded", 1 if health.get("loaded") else 0) or 0) else "no"
+active = int(metrics.get("dflash_active_generation_requests", health.get("active_generation_requests", 0)) or 0)
+queued = int(metrics.get("dflash_queued_generation_requests", health.get("queued_generation_requests", 0)) or 0)
+age = float(metrics.get("dflash_active_ticket_age_seconds", 0.0) or 0.0)
+uptime = float(metrics.get("dflash_uptime_seconds", 0.0) or 0.0)
+active_gb = gb_from_bytes(metrics.get("mlx_active_memory_bytes", 0.0))
+cache_gb = gb_from_bytes(metrics.get("mlx_cache_memory_bytes", 0.0))
+peak_gb = gb_from_bytes(metrics.get("mlx_peak_memory_bytes", 0.0))
+history = int(metrics.get("dflash_response_history_entries", health.get("response_history_entries", 0)) or 0)
+prefix_entries = int(metrics.get("dflash_prefix_cache_entries", health.get("prefix_cache_entries", 0)) or 0)
+global_entries = int(metrics.get("dflash_global_prefix_cache_entries", health.get("global_prefix_cache_entries", 0)) or 0)
+hits = int(metrics.get("dflash_global_prefix_cache_hits", health.get("global_prefix_cache_hits", 0)) or 0)
+misses = int(metrics.get("dflash_global_prefix_cache_misses", health.get("global_prefix_cache_misses", 0)) or 0)
+block_size = int(metrics.get("dflash_block_size", health.get("block_size", 0)) or 0)
+context_window = int(metrics.get("dflash_context_window", health.get("context_window", 0)) or 0)
+max_tokens = int(metrics.get("dflash_max_tokens_limit", health.get("max_tokens_limit", 0)) or 0)
+last = health.get("last_request_metrics") or {}
+last_prompt_tps = float(metrics.get("dflash_last_request_prompt_tps", last.get("prompt_tps", 0.0)) or 0.0)
+last_generation_tps = float(metrics.get("dflash_last_request_generation_tps", last.get("generation_tps", 0.0)) or 0.0)
+last_prompt_tokens = int(metrics.get("dflash_last_request_prompt_tokens", last.get("prompt_tokens", 0)) or 0)
+last_generated_tokens = int(metrics.get("dflash_last_request_generated_tokens", last.get("generated_tokens", 0)) or 0)
+last_elapsed = float(metrics.get("dflash_last_request_elapsed", last.get("elapsed", 0.0)) or 0.0)
+last_acceptance = float(metrics.get("dflash_last_request_avg_acceptance_ratio", last.get("avg_acceptance_ratio", 0.0)) or 0.0)
+
+print(
+    f"{now} loaded={loaded} active={active} queued={queued} active_age={age:.1f}s "
+    f"mem={fmt_gb(active_gb)} cache={fmt_gb(cache_gb)} peak={fmt_gb(peak_gb)} "
+    f"last={last_generated_tokens}tok/{last_elapsed:.1f}s gen={last_generation_tps:.1f}tok/s "
+    f"prompt={last_prompt_tokens}tok@{last_prompt_tps:.1f}tok/s accept={last_acceptance:.2f} "
+    f"history={history} prefix={prefix_entries}/{global_entries} global_hit/miss={hits}/{misses} "
+    f"block={block_size} ctx={context_window} max={max_tokens} uptime={uptime:.0f}s",
+    flush=True,
+)
+PY
+    sleep "${interval}"
+  done
+}
+
+cmd_monitor_tui() {
+  local interval="${1:-${LOCAL_DFLASH_MONITOR_INTERVAL_SECONDS:-1}}"
+  if ! [[ "${interval}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "dflash: monitor-tui interval must be numeric seconds" >&2
+    return 2
+  fi
+
+  local pid
+  pid="$(get_running_pid)"
+  if [[ -z "${pid}" ]]; then
+    echo "dflash: stopped"
+    echo "dflash: run '$0 start' first"
+    return 1
+  fi
+
+  local python_bin="${REPO_ROOT}/.venv/bin/python"
+  if [[ ! -x "${python_bin}" ]]; then
+    python_bin="$(command -v python3 || true)"
+  fi
+  if [[ -z "${python_bin}" ]]; then
+    echo "dflash: python3 not found; cannot render monitor TUI" >&2
+    return 2
+  fi
+
+  DFLASH_HEALTH_URL="${HEALTH_URL}" \
+  DFLASH_METRICS_URL="${METRICS_URL}" \
+  DFLASH_REQUESTS_URL="http://${HOST}:${PORT}/requests?limit=8" \
+  DFLASH_MONITOR_INTERVAL="${interval}" \
+  DFLASH_MONITOR_PID="${pid}" \
+  "${python_bin}" - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import select
+import shutil
+import sys
+import termios
+import time
+import tty
+import urllib.error
+import urllib.request
+
+
+HEALTH_URL = os.environ["DFLASH_HEALTH_URL"]
+METRICS_URL = os.environ["DFLASH_METRICS_URL"]
+REQUESTS_URL = os.environ["DFLASH_REQUESTS_URL"]
+INTERVAL = max(0.1, float(os.environ.get("DFLASH_MONITOR_INTERVAL", "1")))
+SERVER_PID = os.environ.get("DFLASH_MONITOR_PID", "?")
+TTY = sys.stdout.isatty()
+
+COLORS = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+    "bg": "\033[48;5;236m",
+}
+
+
+def c(name: str, text: str) -> str:
+    if not TTY:
+        return text
+    return f"{COLORS.get(name, '')}{text}{COLORS['reset']}"
+
+
+def fetch_json(url: str, timeout: float = 2.0) -> tuple[dict, str | None]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def num(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def integer(value, default=0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def gb_from_bytes(value) -> float:
+    return num(value) / (1024 ** 3)
+
+
+def fmt_seconds(value) -> str:
+    seconds = max(0.0, num(value))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m{rem:02d}s"
+    hours = minutes // 60
+    minutes %= 60
+    return f"{hours}h{minutes:02d}m"
+
+
+def fmt_gb(value) -> str:
+    return f"{num(value):.2f} GB"
+
+
+def clamp_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def bar(value: float, limit: float, width: int = 18) -> str:
+    if width <= 0:
+        return ""
+    ratio = 0.0 if limit <= 0 else max(0.0, min(1.0, value / limit))
+    fill = int(round(ratio * width))
+    return "[" + "#" * fill + "-" * (width - fill) + "]"
+
+
+def line(width: int, char: str = "-") -> str:
+    return char * max(0, width)
+
+
+def metric_row(label: str, value: str, width: int, color: str = "white") -> str:
+    label_width = min(18, max(10, width // 4))
+    value_width = max(0, width - label_width - 1)
+    return f"{c('dim', label.ljust(label_width))} {c(color, clamp_text(value, value_width))}"
+
+
+def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str]) -> str:
+    width, height = shutil.get_terminal_size((110, 32))
+    width = max(80, width)
+    height = max(24, height)
+
+    loaded = integer(metrics.get("dflash_model_loaded", 1 if health.get("loaded") else 0))
+    active = integer(metrics.get("dflash_active_generation_requests", health.get("active_generation_requests", 0)))
+    queued = integer(metrics.get("dflash_queued_generation_requests", health.get("queued_generation_requests", 0)))
+    age = num(metrics.get("dflash_active_ticket_age_seconds", 0.0))
+    uptime = num(metrics.get("dflash_uptime_seconds", 0.0))
+
+    active_gb = gb_from_bytes(metrics.get("mlx_active_memory_bytes", 0.0))
+    cache_gb = gb_from_bytes(metrics.get("mlx_cache_memory_bytes", 0.0))
+    peak_gb = gb_from_bytes(metrics.get("mlx_peak_memory_bytes", 0.0))
+
+    max_tokens = integer(metrics.get("dflash_max_tokens_limit", health.get("max_tokens_limit", 0)))
+    context = integer(metrics.get("dflash_context_window", health.get("context_window", 0)))
+    block = integer(metrics.get("dflash_block_size", health.get("block_size", 0)))
+    history = integer(metrics.get("dflash_response_history_entries", health.get("response_history_entries", 0)))
+    prefix = integer(metrics.get("dflash_prefix_cache_entries", health.get("prefix_cache_entries", 0)))
+    global_prefix = integer(metrics.get("dflash_global_prefix_cache_entries", health.get("global_prefix_cache_entries", 0)))
+    hits = integer(metrics.get("dflash_global_prefix_cache_hits", health.get("global_prefix_cache_hits", 0)))
+    misses = integer(metrics.get("dflash_global_prefix_cache_misses", health.get("global_prefix_cache_misses", 0)))
+
+    last = health.get("last_request_metrics") or {}
+    last_elapsed = num(metrics.get("dflash_last_request_elapsed", last.get("elapsed", 0.0)))
+    last_prompt_tps = num(metrics.get("dflash_last_request_prompt_tps", last.get("prompt_tps", 0.0)))
+    last_generation_tps = num(metrics.get("dflash_last_request_generation_tps", last.get("generation_tps", 0.0)))
+    last_prompt_tokens = integer(metrics.get("dflash_last_request_prompt_tokens", last.get("prompt_tokens", 0)))
+    last_generated_tokens = integer(metrics.get("dflash_last_request_generated_tokens", last.get("generated_tokens", 0)))
+    last_accept = num(metrics.get("dflash_last_request_avg_acceptance_ratio", last.get("avg_acceptance_ratio", 0.0)))
+    last_finish = last.get("finish_reason", "n/a")
+    last_surface = last.get("surface", "n/a")
+
+    status_text = "RUNNING" if loaded or active else "IDLE"
+    status_color = "green" if active else ("cyan" if loaded else "yellow")
+    if errors:
+        status_text = "DEGRADED"
+        status_color = "red"
+
+    left = 38
+    mid = 38
+    gap = "  "
+    right = max(24, width - left - mid - len(gap) * 2)
+
+    rows: list[str] = []
+    title = f" DFlash Agentic Local Server "
+    subtitle = f"pid {SERVER_PID} | {HEALTH_URL} | refresh {INTERVAL:g}s | q quits"
+    rows.append(c("bold", title) + c("dim", " " + subtitle))
+    rows.append(line(width))
+    rows.append(
+        metric_row("status", status_text, left, status_color)
+        + gap
+        + metric_row("active/queued", f"{active}/{queued}  age {fmt_seconds(age)}", mid, "white")
+        + gap
+        + metric_row("uptime", fmt_seconds(uptime), right, "white")
+    )
+    rows.append(
+        metric_row("memory active", fmt_gb(active_gb), left, "green")
+        + gap
+        + metric_row("cache", fmt_gb(cache_gb), mid, "yellow")
+        + gap
+        + metric_row("peak", fmt_gb(peak_gb), right, "magenta")
+    )
+    rows.append(
+        metric_row("context", f"{context} ctx / {max_tokens} max", left, "white")
+        + gap
+        + metric_row("block", str(block), mid, "white")
+        + gap
+        + metric_row("history", f"{history} responses", right, "white")
+    )
+    rows.append(
+        metric_row("prefix cache", f"{prefix} response / {global_prefix} global", left, "cyan")
+        + gap
+        + metric_row("global hit/miss", f"{hits}/{misses}", mid, "cyan")
+        + gap
+        + metric_row("last surface", str(last_surface), right, "white")
+    )
+    rows.append(line(width))
+
+    rows.append(c("bold", "Last request"))
+    rows.append(
+        metric_row("tokens", f"{last_generated_tokens} out / {last_prompt_tokens} prompt", left, "white")
+        + gap
+        + metric_row("elapsed", fmt_seconds(last_elapsed), mid, "white")
+        + gap
+        + metric_row("finish", str(last_finish), right, "white")
+    )
+    rows.append(
+        metric_row("generation", f"{last_generation_tps:.1f} tok/s {bar(last_generation_tps, 60, 12)}", left, "green")
+        + gap
+        + metric_row("prefill", f"{last_prompt_tps:.1f} tok/s {bar(last_prompt_tps, 2500, 12)}", mid, "cyan")
+        + gap
+        + metric_row("accept", f"{last_accept:.2f} {bar(last_accept, 1.0, 12)}", right, "yellow")
+    )
+    rows.append(line(width))
+
+    rows.append(c("bold", "Recent requests"))
+    entries = list((requests or {}).get("entries") or [])[-8:]
+    if not entries:
+        rows.append(c("dim", "  no completed request metrics yet"))
+    else:
+        header = "  time      surface    out  prompt  gen tok/s  prefill tok/s  accept  finish"
+        rows.append(c("dim", clamp_text(header, width)))
+        for item in reversed(entries):
+            ts = item.get("finished_at") or item.get("ts") or 0
+            try:
+                when = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+            except Exception:
+                when = "--:--:--"
+            row = (
+                f"  {when}  "
+                f"{str(item.get('surface', 'n/a'))[:9].ljust(9)} "
+                f"{integer(item.get('generated_tokens', 0)):>5} "
+                f"{integer(item.get('prompt_tokens', 0)):>7} "
+                f"{num(item.get('generation_tps', 0.0)):>9.1f} "
+                f"{num(item.get('prompt_tps', 0.0)):>13.1f} "
+                f"{num(item.get('avg_acceptance_ratio', 0.0)):>6.2f} "
+                f"{str(item.get('finish_reason', 'n/a'))[:12]}"
+            )
+            rows.append(clamp_text(row, width))
+
+    if errors:
+        rows.append(line(width))
+        rows.append(c("red", "Errors"))
+        for error in errors[-3:]:
+            rows.append(c("red", "  " + clamp_text(error, width - 2)))
+
+    rows.append("")
+    rows.append(c("dim", "Tip: run a Codex/OpenCode request in another terminal; this screen updates when generation finishes."))
+
+    return "\n".join(rows[:height])
+
+
+def read_key() -> str | None:
+    if not sys.stdin.isatty():
+        return None
+    readable, _, _ = select.select([sys.stdin], [], [], 0)
+    if not readable:
+        return None
+    try:
+        return sys.stdin.read(1)
+    except Exception:
+        return None
+
+
+def main() -> int:
+    old_term = None
+    if TTY and sys.stdin.isatty():
+        old_term = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin)
+    try:
+        if TTY:
+            sys.stdout.write("\033[?1049h\033[?25l")
+            sys.stdout.flush()
+        while True:
+            health, health_err = fetch_json(HEALTH_URL)
+            metrics, metrics_err = fetch_json(METRICS_URL)
+            requests, requests_err = fetch_json(REQUESTS_URL)
+            errors = [err for err in (health_err, metrics_err, requests_err) if err]
+            screen = build_screen(health, metrics, requests, errors)
+            if TTY:
+                sys.stdout.write("\033[H\033[2J")
+            sys.stdout.write(screen + "\n")
+            sys.stdout.flush()
+            deadline = time.time() + INTERVAL
+            while time.time() < deadline:
+                key = read_key()
+                if key in {"q", "Q", "\x03"}:
+                    return 0
+                time.sleep(0.05)
+            if not TTY:
+                sys.stdout.write("\n")
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if old_term is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+        if TTY:
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
+    return 0
+
+
+raise SystemExit(main())
+PY
+}
+
 warn_if_not_ready() {
   if ! curl -fsS --max-time 2 "${HEALTH_URL}" >/dev/null 2>&1; then
     echo "dflash: server not responding at ${HEALTH_URL}" >&2
@@ -276,6 +707,9 @@ server commands:
   status    check running process and /health
   kill      SIGKILL the process group, clear port squatters
   logs      tail -f ${LOG_FILE}
+  monitor   poll /health and /metrics live (optional interval seconds)
+  monitor-tui
+            full-screen dynamic monitor (optional interval seconds, q quits)
 
 client commands:
   opencode       launch OpenCode against the local server (forwards extra args)
@@ -317,6 +751,8 @@ main() {
     status)            cmd_status ;;
     kill)              cmd_kill ;;
     logs)              cmd_logs ;;
+    monitor)           cmd_monitor "$@" ;;
+    monitor-tui)       cmd_monitor_tui "$@" ;;
     opencode)          cmd_opencode "$@" ;;
     opencode-auto)     cmd_opencode_auto "$@" ;;
     codex)             cmd_codex "$@" ;;

@@ -139,6 +139,7 @@ STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SE
 STREAM_QUEUE_MAX_CHUNKS = _env_positive_int("LOCAL_DFLASH_STREAM_QUEUE_MAX_CHUNKS", 32)
 STREAM_QUEUE_PUT_TIMEOUT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_QUEUE_PUT_TIMEOUT_SECONDS", 0.5)
 RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 8)
+REQUEST_METRICS_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_REQUEST_METRICS_HISTORY_LIMIT", 50)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 1)
 PREFIX_CACHE_STATE_BYTE_LIMIT = _env_non_negative_int(
     "LOCAL_DFLASH_PREFIX_CACHE_STATE_BYTE_LIMIT",
@@ -2043,6 +2044,8 @@ class LocalModelServer:
         self._last_used_at: float | None = None
         self._response_states: dict[str, dict[str, Any]] = {}
         self._response_order: deque[str] = deque()
+        self._request_metrics_order: deque[dict[str, Any]] = deque(maxlen=max(1, REQUEST_METRICS_HISTORY_LIMIT))
+        self._last_request_metrics: dict[str, Any] | None = None
         self._prefix_state_order: deque[str] = deque()
         self.response_history_limit = RESPONSE_HISTORY_LIMIT
         self.prefix_cache_state_limit = PREFIX_CACHE_STATE_LIMIT
@@ -2089,6 +2092,31 @@ class LocalModelServer:
             if self._active_generation_ticket == ticket:
                 self._active_generation_ticket = None
             self._generation_turn.notify_all()
+
+    def _record_generation_metrics(self, result: dict[str, Any], *, surface: str) -> None:
+        metrics = {
+            "surface": surface,
+            "finished_at": time.time(),
+            "finish_reason": result.get("finish_reason", "stop"),
+            "elapsed": float(result.get("elapsed", 0.0) or 0.0),
+            "prefill_seconds": float(result.get("prefill_seconds", 0.0) or 0.0),
+            "decode_seconds": float(result.get("decode_seconds", 0.0) or 0.0),
+            "prompt_tps": float(result.get("prompt_tps", 0.0) or 0.0),
+            "generation_tps": float(result.get("generation_tps", 0.0) or 0.0),
+            "prompt_tokens": int(result.get("prompt_tokens", 0) or 0),
+            "generated_tokens": int(result.get("generated_tokens", 0) or 0),
+            "reused_prefix_tokens": int(result.get("reused_prefix_tokens", 0) or 0),
+            "speculative_steps": int(result.get("speculative_steps", 0) or 0),
+            "proposed_tokens": int(result.get("proposed_tokens", 0) or 0),
+            "accepted_tokens": int(result.get("accepted_tokens", 0) or 0),
+            "avg_acceptance_length": float(result.get("avg_acceptance_length", 0.0) or 0.0),
+            "avg_acceptance_ratio": float(result.get("avg_acceptance_ratio", 0.0) or 0.0),
+            "peak_memory_gb": float(result.get("peak_memory_gb", 0.0) or 0.0),
+            "prefix_cache_source": result.get("prefix_cache_source", "none"),
+        }
+        with self._lock:
+            self._last_request_metrics = metrics
+            self._request_metrics_order.append(metrics)
 
     def _clear_request_state_locked(self) -> None:
         self._clear_hidden_states_locked()
@@ -2883,6 +2911,7 @@ class LocalModelServer:
                 "elapsed": time.time() - started,
                 "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
             }
+            self._record_generation_metrics(result, surface="stream")
             if not _queue_put(queue, ("result", result), stop_event):
                 return
         except Exception as exc:
@@ -2918,6 +2947,7 @@ class LocalModelServer:
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
                 )
+            self._record_generation_metrics(result, surface="generate")
             return result
         finally:
             try:
@@ -3201,7 +3231,7 @@ class LocalModelServer:
         generation_ticket = self._acquire_generation_turn()
         try:
             with self._lock:
-                return self._generate_response_locked(
+                result, output_items = self._generate_response_locked(
                     messages,
                     max_tokens,
                     sampling,
@@ -3210,6 +3240,8 @@ class LocalModelServer:
                     capture_prompt_cache_state=capture_prompt_cache_state,
                     should_stop=should_stop,
                 )
+            self._record_generation_metrics(result, surface="responses")
+            return result, output_items
         finally:
             try:
                 self.finish_request(keep_alive_override)
@@ -4135,6 +4167,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
+        last_request_metrics = dict(server._last_request_metrics or {})
         return {
             "status": "ok",
             "model": server.model_name,
@@ -4165,6 +4198,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "adaptive_block_size": server.adaptive_block_size_config.enabled,
             "adaptive_block_size_min": server.adaptive_block_size_config.min_block_size,
             "adaptive_block_size_max": server.adaptive_block_size_config.max_block_size,
+            "request_metrics_entries": len(server._request_metrics_order),
+            "last_request_metrics": last_request_metrics,
             "last_used_at": server._last_used_at,
             "active_memory_gb": mx.get_active_memory() / (1024 ** 3),
             "cache_memory_gb": mx.get_cache_memory() / (1024 ** 3),
@@ -4210,6 +4245,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "dflash_stable_prefix_tokens_bytes": server._stable_prefix_tokens_bytes,
             "dflash_global_prefix_cache_hits": server._global_prefix_cache_hits,
             "dflash_global_prefix_cache_misses": server._global_prefix_cache_misses,
+            "dflash_request_metrics_entries": len(server._request_metrics_order),
             "mlx_active_memory_bytes": active_memory,
             "mlx_cache_memory_bytes": cache_memory,
             "mlx_peak_memory_bytes": peak_memory,
@@ -4218,7 +4254,18 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "dflash_block_size": server.block_size,
             "dflash_keep_alive_seconds": float(server.keep_alive_seconds or 0),
             "dflash_last_used_at": float(server._last_used_at or 0),
+            **{
+                f"dflash_last_request_{key}": value
+                for key, value in (server._last_request_metrics or {}).items()
+                if isinstance(value, (int, float))
+            },
         }
+
+    @app.get("/requests")
+    def request_metrics(limit: int = 20) -> dict[str, Any]:
+        bounded_limit = max(1, min(int(limit), max(1, REQUEST_METRICS_HISTORY_LIMIT)))
+        entries = list(server._request_metrics_order)[-bounded_limit:]
+        return {"count": len(entries), "entries": entries}
 
     @app.get("/runs")
     def runs(dir: str = "") -> dict[str, Any]:
