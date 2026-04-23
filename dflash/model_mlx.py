@@ -1,10 +1,18 @@
 import copy
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,7 +21,7 @@ from mlx_lm.generate import generation_stream
 from mlx_lm.models.cache import KVCache, RotatingKVCache, can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 try:
@@ -45,6 +53,7 @@ class DFlashConfig:
     rope_scaling: Optional[Dict[str, Any]] = None
     sliding_window_size: Optional[int] = None
     turboquant_bits: Optional[float] = None
+    rotating_keep_tokens: int = 0
 
 
 def _resolve_local_or_hub_path(model_id_or_path: str, allow_patterns: Optional[List[str]] = None) -> Path:
@@ -349,19 +358,38 @@ class DFlashDraftModel(nn.Module):
         return self
 
     def make_cache(self):
+        keep_tokens = max(0, int(self.config.rotating_keep_tokens or 0))
         if self.config.turboquant_bits is not None:
+            # `_StableRotatingTurboQuantKVCache` explicitly wraps the MLX
+            # limitation around quantized rotating caches (see
+            # lmstudio-ai/mlx-engine#177). The combination is supported here
+            # via that wrapper; callers who want the stricter safety behavior
+            # can set LOCAL_DFLASH_FORBID_ROTATING_TURBOQUANT=1.
+            if (
+                self.config.sliding_window_size is not None
+                and _env_flag("LOCAL_DFLASH_FORBID_ROTATING_TURBOQUANT", False)
+            ):
+                raise RuntimeError(
+                    "TurboQuant KV-cache quantization combined with a rotating "
+                    "sliding-window cache is disabled by "
+                    "LOCAL_DFLASH_FORBID_ROTATING_TURBOQUANT=1. Disable "
+                    "--sliding-window-size or --target-turboquant-bits."
+                )
             return [
                 _make_turboquant_cache_entry(
                     bits=float(self.config.turboquant_bits),
                     head_dim=self.config.head_dim,
                     layer_index=idx,
                     rotating_max_size=self.config.sliding_window_size,
-                    keep=0,
+                    keep=keep_tokens,
                 )
                 for idx, _ in enumerate(self.layers)
             ]
         if self.config.sliding_window_size is not None:
-            return [RotatingKVCache(max_size=self.config.sliding_window_size, keep=0) for _ in self.layers]
+            return [
+                RotatingKVCache(max_size=self.config.sliding_window_size, keep=keep_tokens)
+                for _ in self.layers
+            ]
         return [KVCache() for _ in self.layers]
 
     def __call__(self, inputs, target_hidden, cache):
@@ -381,11 +409,11 @@ def load_draft(
     draft_id: str,
     sliding_window_size: Optional[int] = None,
     turboquant_bits: Optional[float] = None,
+    rotating_keep_tokens: int = 0,
 ) -> DFlashDraftModel:
+    # Treat 0 / negative as "disable sliding window" (full KV retention).
     if sliding_window_size is not None and sliding_window_size <= 0:
-        raise ValueError(
-            f"sliding_window_size must be positive or None, got {sliding_window_size}"
-        )
+        sliding_window_size = None
     if turboquant_bits is not None and turboquant_bits <= 0:
         turboquant_bits = None
     path = _resolve_local_or_hub_path(draft_id, allow_patterns=["*.safetensors", "*.json"])
@@ -408,6 +436,7 @@ def load_draft(
         rope_scaling=cfg.get("rope_scaling"),
         sliding_window_size=sliding_window_size,
         turboquant_bits=turboquant_bits,
+        rotating_keep_tokens=max(0, int(rotating_keep_tokens or 0)),
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
     model = DFlashDraftModel(config)
@@ -601,6 +630,13 @@ class AdaptiveBlockSizeConfig:
     shrink_threshold: float = 0.55
     grow_step: int = 1
     shrink_step: int = 1
+    # Hysteresis: require this many consecutive samples above/below the
+    # thresholds before we actually change block size. Prevents ping-pong
+    # when the acceptance ratio oscillates right around a threshold.
+    # Default 1 = legacy no-hysteresis behavior; raise to 3 for smoother
+    # long-running sessions.
+    grow_streak: int = 1
+    shrink_streak: int = 1
 
 
 @dataclass
@@ -846,6 +882,7 @@ def next_adaptive_block_size(
     acceptance_length: int,
     proposal_tokens: int,
     config: Optional[AdaptiveBlockSizeConfig],
+    hysteresis_state: Optional[dict] = None,
 ) -> int:
     if config is None or not config.enabled:
         return current_block_size
@@ -856,32 +893,102 @@ def next_adaptive_block_size(
         maximum=max(1, config.max_block_size),
     )
     ratio = acceptance_length / max(proposal_tokens, 1)
+    grow_streak = max(1, int(config.grow_streak or 1))
+    shrink_streak = max(1, int(config.shrink_streak or 1))
+
+    state = hysteresis_state if hysteresis_state is not None else {}
+    grow_count = int(state.get("grow", 0))
+    shrink_count = int(state.get("shrink", 0))
+
     if ratio >= config.grow_threshold and acceptance_length >= proposal_tokens:
-        return _clamp_block_size(
+        grow_count += 1
+        shrink_count = 0
+    elif ratio <= config.shrink_threshold:
+        shrink_count += 1
+        grow_count = 0
+    else:
+        grow_count = 0
+        shrink_count = 0
+
+    new_block_size = current_block_size
+    if grow_count >= grow_streak:
+        new_block_size = _clamp_block_size(
             current_block_size + max(1, config.grow_step),
             minimum=max(1, config.min_block_size),
             maximum=max(1, config.max_block_size),
         )
-    if ratio <= config.shrink_threshold:
-        return _clamp_block_size(
+        grow_count = 0
+    elif shrink_count >= shrink_streak:
+        new_block_size = _clamp_block_size(
             current_block_size - max(1, config.shrink_step),
             minimum=max(1, config.min_block_size),
             maximum=max(1, config.max_block_size),
         )
-    return current_block_size
+        shrink_count = 0
+
+    state["grow"] = grow_count
+    state["shrink"] = shrink_count
+    return new_block_size
+
+
+def _apply_logits_processors(
+    processors: List[Any],
+    logits: mx.array,
+    tokens_context: List[int],
+) -> mx.array:
+    if not processors:
+        return logits
+    if logits.ndim == 3:
+        batch, seq_len, vocab = logits.shape
+        reshaped = logits.reshape(batch * seq_len, vocab)
+        for proc in processors:
+            reshaped = proc(tokens_context, reshaped)
+        return reshaped.reshape(batch, seq_len, vocab)
+    for proc in processors:
+        logits = proc(tokens_context, logits)
+    return logits
 
 
 def stream_generate(
     model, draft, tokenizer, prompt,
     block_size=None, max_tokens=256, temperature=0.0, sampler=None,
+    top_p: float = 0.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    presence_penalty: float = 0.0,
+    repetition_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    presence_context_size: int = 20,
+    repetition_context_size: int = 20,
     target_turboquant_bits: Optional[float] = None,
     prefix_state: Optional[PromptPrefillState] = None,
     capture_prefill_state: bool = False,
     adaptive_block_size: Optional[AdaptiveBlockSizeConfig] = None,
+    should_stop: Optional[Any] = None,
 ):
     _patch_model(model, draft.config.target_layer_ids)
     block_size = block_size if block_size is not None else int(draft.config.block_size)
-    sampler = sampler or make_sampler(temp=temperature)
+    if sampler is None:
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=float(top_p or 0.0),
+            min_p=float(min_p or 0.0),
+            top_k=int(top_k or 0),
+        )
+    rep_pen = float(repetition_penalty or 0.0)
+    pres_pen = float(presence_penalty or 0.0)
+    freq_pen = float(frequency_penalty or 0.0)
+    has_rep = rep_pen and abs(rep_pen - 1.0) > 1e-9
+    processors: List[Any] = []
+    if has_rep or pres_pen or freq_pen:
+        processors = make_logits_processors(
+            repetition_penalty=rep_pen if has_rep else None,
+            repetition_context_size=int(repetition_context_size or 20),
+            presence_penalty=pres_pen if pres_pen else None,
+            presence_context_size=int(presence_context_size or 20),
+            frequency_penalty=freq_pen if freq_pen else None,
+            frequency_context_size=int(presence_context_size or 20),
+        )
 
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
@@ -917,13 +1024,15 @@ def stream_generate(
         prompt_state = prefill.prefill_state
 
         decode_tic = time.perf_counter()
-        token = sampler(logits[:, -1:])[0, 0].item()
+        first_logits = _apply_logits_processors(processors, logits[:, -1:], tokens)
+        token = sampler(first_logits)[0, 0].item()
         tokens.append(token)
         n = 1
         current_block_size = int(block_size)
         proposal_history: list[int] = []
         acceptance_lengths: list[int] = []
         acceptance_ratios: list[float] = []
+        _adaptive_hysteresis: dict = {"grow": 0, "shrink": 0}
         speculative_steps = 0
         proposed_tokens = 0
         accepted_tokens = 0
@@ -987,6 +1096,12 @@ def stream_generate(
         )
 
         while n < max_tokens:
+            if should_stop is not None:
+                try:
+                    if should_stop():
+                        break
+                except Exception:
+                    pass
             bs = min(current_block_size, max_tokens - n + 1)
             if bs <= 1:
                 break
@@ -1000,7 +1115,9 @@ def stream_generate(
                     (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0
                 ):
                     trim_prompt_cache(draft_cache, trim_n)
-                draft_tokens = sampler(draft_logits[:, 1 - bs:])
+                draft_tokens = sampler(
+                    _apply_logits_processors(processors, draft_logits[:, 1 - bs:], tokens)
+                )
             mx.async_eval(draft_tokens)
 
             if _capture is not None:
@@ -1009,7 +1126,7 @@ def stream_generate(
                 verify_input = mx.concatenate([mx.array([[tokens[-1]]]), draft_tokens], axis=1)
                 logits = model(verify_input, target_cache)
                 hidden = mx.concatenate(model._hidden_states, axis=-1)
-                target_tokens = sampler(logits)
+                target_tokens = sampler(_apply_logits_processors(processors, logits, tokens))
             mx.async_eval(target_tokens, hidden)
 
             accepted = _acceptance_prefix_length(draft_tokens, target_tokens)
@@ -1102,6 +1219,7 @@ def stream_generate(
                 accepted_length,
                 bs,
                 adaptive_block_size,
+                hysteresis_state=_adaptive_hysteresis,
             )
 
         detokenizer.finalize()

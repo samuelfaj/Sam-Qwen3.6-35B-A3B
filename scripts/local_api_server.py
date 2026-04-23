@@ -5,8 +5,10 @@ import argparse
 import copy
 import gc
 import json
+import logging
 import os
 from collections import deque
+from dataclasses import dataclass
 from queue import Empty, Queue
 import re
 import time
@@ -32,6 +34,9 @@ from dflash.model_mlx import (
     stream_generate,
     tokenize_prompt,
 )
+
+
+_logger = logging.getLogger("dflash.server")
 
 
 DEFAULT_MODEL_PATH = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit"
@@ -108,6 +113,17 @@ def _env_non_negative_int(name: str, default: int) -> int:
     return default if value < 0 else value
 
 
+def _env_non_negative_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return default if value < 0 else value
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -165,6 +181,8 @@ RESPONSES_FOLLOWUP_JUDGE_LOGPROB_SYSTEM_PROMPT = (
     "Reply with EXACTLY one uppercase letter and nothing else.\n"
     "- Y: the agent delivered the final answer, reported a genuine blocker, or asked a real clarifying question.\n"
     "- N: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n"
+    "- N: the agent already called `update_plan` with the same plan as a prior turn but did not actually invoke an action tool (`apply_patch`, `shell`, `container.exec`, etc.).\n"
+    "- N: the agent emitted `update_plan` alone when the user asked for concrete work and there are action tools available.\n"
     "When unsure, answer N."
 )
 RESPONSES_FOLLOWUP_JUDGE_JSON_SYSTEM_PROMPT = (
@@ -174,9 +192,107 @@ RESPONSES_FOLLOWUP_JUDGE_JSON_SYSTEM_PROMPT = (
     "Respond with ONLY a single JSON object and nothing else, matching this schema:\n"
     '{"reason":"<one short sentence>","verdict":"COMPLETE"|"INCOMPLETE"}\n\n'
     "- COMPLETE: the agent delivered the final answer, reported a genuine blocker, or asked a real clarifying question.\n"
-    "- INCOMPLETE: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n\n"
+    "- INCOMPLETE: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n"
+    "- INCOMPLETE: the agent re-emitted the same `update_plan` plan as a prior turn without actually invoking any action tool.\n"
+    "- INCOMPLETE: the agent emitted `update_plan` alone when concrete action tools were available and the user's request required executing something.\n\n"
     "When unsure, answer INCOMPLETE."
 )
+TOOL_CALLING_RULES_PROMPT = (
+    "Tool-calling rules (strict):\n"
+    "- Function calls MUST be wrapped in <tool_call>...</tool_call>. The JSON body must parse as a single object with keys \"name\" and \"arguments\".\n"
+    "- Do NOT omit the opening <tool_call> tag, even after prose.\n"
+    "- You MAY write one short reasoning line BEFORE a tool call, but NEVER after announcing an action without executing it.\n"
+    "- NEVER say \"I will now <do X>\" or \"Next, I'll call <tool>\" without emitting the <tool_call> in the same turn.\n"
+    "- If you have already emitted a plan via update_plan this turn, do NOT re-emit it; proceed directly to apply_patch / shell / container.exec.\n"
+    "- Required parameters MUST be present. Do not emit tool calls with \"arguments\": {} unless the schema has zero required fields.\n"
+    "- When a prior tool_response is available, USE IT. Do not re-issue the identical call with the same arguments.\n"
+    "- Produce a final natural-language answer ONLY when no tool is applicable or the user's task is fully complete.\n"
+    "- Decide and act in the same turn."
+)
+TOOL_CALLING_RULES_ENABLED = _env_bool("LOCAL_DFLASH_TOOL_CALLING_RULES", True)
+
+
+DEFAULT_TEMPERATURE_NO_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE", 0.7)
+DEFAULT_TEMPERATURE_WITH_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS", 0.7)
+DEFAULT_TOP_P = _env_positive_float("LOCAL_DFLASH_DEFAULT_TOP_P", 0.8)
+DEFAULT_TOP_K = _env_non_negative_int("LOCAL_DFLASH_DEFAULT_TOP_K", 20)
+DEFAULT_MIN_P = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_MIN_P", 0.0)
+# Official Qwen3.6-35B-A3B Instruct defaults per the model card: presence_penalty=1.5
+# "to reduce endless repetitions", repetition_penalty=1.0 (disabled — the team
+# explicitly relies on presence_penalty, not repetition_penalty).
+DEFAULT_PRESENCE_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_PRESENCE_PENALTY", 1.5)
+DEFAULT_REPETITION_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_REPETITION_PENALTY", 1.0)
+DEFAULT_FREQUENCY_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_FREQUENCY_PENALTY", 0.0)
+DEFAULT_MAX_TOKENS_FALLBACK = _env_positive_int("LOCAL_DFLASH_DEFAULT_MAX_TOKENS", 16384)
+MIN_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS", 0.1)
+
+
+def _coerce_sampling_arg(sampling: Any, temperature: float | None) -> "SamplingParams":
+    """Back-compat helper: accept either a ready `SamplingParams` OR a plain
+    `temperature` float on the old call sites. Any missing fields fall back
+    to the no-tools defaults.
+    """
+    if isinstance(sampling, SamplingParams):
+        return sampling
+    if isinstance(sampling, (int, float)):
+        return SamplingParams.for_request(
+            temperature=float(sampling),
+            top_p=None, top_k=None, min_p=None,
+            presence_penalty=None, repetition_penalty=None, frequency_penalty=None,
+            has_tools=False,
+        )
+    return SamplingParams.for_request(
+        temperature=temperature,
+        top_p=None, top_k=None, min_p=None,
+        presence_penalty=None, repetition_penalty=None, frequency_penalty=None,
+        has_tools=False,
+    )
+
+
+@dataclass
+class SamplingParams:
+    temperature: float = DEFAULT_TEMPERATURE_NO_TOOLS
+    top_p: float = DEFAULT_TOP_P
+    top_k: int = DEFAULT_TOP_K
+    min_p: float = DEFAULT_MIN_P
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_context_size: int = 20
+    presence_context_size: int = 20
+
+    @classmethod
+    def for_request(
+        cls,
+        *,
+        temperature: float | None,
+        top_p: float | None,
+        top_k: int | None,
+        min_p: float | None,
+        presence_penalty: float | None,
+        repetition_penalty: float | None,
+        frequency_penalty: float | None,
+        has_tools: bool,
+    ) -> "SamplingParams":
+        if has_tools:
+            temp = DEFAULT_TEMPERATURE_WITH_TOOLS if temperature is None else float(temperature)
+            if temp < MIN_TEMPERATURE_WITH_TOOLS:
+                temp = DEFAULT_TEMPERATURE_WITH_TOOLS
+            pp = DEFAULT_PRESENCE_PENALTY if presence_penalty is None else float(presence_penalty)
+            rp = DEFAULT_REPETITION_PENALTY if repetition_penalty is None else float(repetition_penalty)
+        else:
+            temp = DEFAULT_TEMPERATURE_NO_TOOLS if temperature is None else float(temperature)
+            pp = 0.0 if presence_penalty is None else float(presence_penalty)
+            rp = 0.0 if repetition_penalty is None else float(repetition_penalty)
+        return cls(
+            temperature=max(0.0, temp),
+            top_p=DEFAULT_TOP_P if top_p is None else float(top_p),
+            top_k=DEFAULT_TOP_K if top_k is None else int(top_k),
+            min_p=DEFAULT_MIN_P if min_p is None else float(min_p),
+            presence_penalty=pp,
+            repetition_penalty=rp,
+            frequency_penalty=DEFAULT_FREQUENCY_PENALTY if frequency_penalty is None else float(frequency_penalty),
+        )
 
 
 class OpenAIMessage(BaseModel):
@@ -187,9 +303,17 @@ class OpenAIMessage(BaseModel):
 class OpenAIChatRequest(BaseModel):
     model: str
     messages: list[OpenAIMessage]
-    max_tokens: int | None = 512
+    max_tokens: int | None = None
     max_completion_tokens: int | None = None
-    temperature: float = 0.0
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
     stream: bool = False
     keep_alive: str | int | float | None = None
     model_config = ConfigDict(extra="ignore")
@@ -214,10 +338,16 @@ class AnthropicMessage(BaseModel):
 
 class AnthropicRequest(BaseModel):
     model: str
-    max_tokens: int = 512
+    max_tokens: int = DEFAULT_MAX_TOKENS_FALLBACK
     messages: list[AnthropicMessage]
     system: str | list[AnthropicContentBlock] | None = None
-    temperature: float = 0.0
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: dict[str, Any] | None = None
@@ -236,8 +366,14 @@ class ResponsesRequest(BaseModel):
     model: str
     input: str | list[Any]
     instructions: str | None = None
-    max_output_tokens: int | None = 512
-    temperature: float = 0.0
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
@@ -248,6 +384,10 @@ class ResponsesRequest(BaseModel):
     previous_response_id: str | None = None
     include: list[str] | None = None
     reasoning: dict[str, Any] | None = None
+    text: dict[str, Any] | None = None
+    client_metadata: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    truncation: Any = None
     keep_alive: str | int | float | None = None
     model_config = ConfigDict(extra="ignore")
 
@@ -260,6 +400,44 @@ class UnknownPreviousResponseError(LookupError):
     pass
 
 
+TRACE_ROTATE_MAX_BYTES = _env_positive_int("LOCAL_DFLASH_TRACE_ROTATE_MAX_BYTES", 100 * 1024 * 1024)
+TRACE_ROTATE_MAX_AGE_SECONDS = _env_positive_int("LOCAL_DFLASH_TRACE_ROTATE_MAX_AGE_SECONDS", 4 * 60 * 60)
+TRACE_ROTATE_KEEP = _env_non_negative_int("LOCAL_DFLASH_TRACE_ROTATE_KEEP", 5)
+_TRACE_ROTATION_STATE: dict[str, Any] = {"opened_at": None}
+
+
+def _maybe_rotate_trace_file(path: str) -> None:
+    """Rotate the trace file when it grows past `TRACE_ROTATE_MAX_BYTES`
+    or has been open for more than `TRACE_ROTATE_MAX_AGE_SECONDS`. Keeps the
+    last `TRACE_ROTATE_KEEP` rotations.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    opened_at = _TRACE_ROTATION_STATE.get("opened_at")
+    age_exceeded = opened_at is not None and (time.time() - opened_at) >= TRACE_ROTATE_MAX_AGE_SECONDS
+    if size < TRACE_ROTATE_MAX_BYTES and not age_exceeded:
+        if opened_at is None:
+            _TRACE_ROTATION_STATE["opened_at"] = time.time()
+        return
+    # Shift .N → .N+1 up to keep limit; the oldest gets dropped.
+    for idx in range(TRACE_ROTATE_KEEP - 1, 0, -1):
+        src = f"{path}.{idx}"
+        dst = f"{path}.{idx + 1}"
+        try:
+            if os.path.exists(src):
+                os.replace(src, dst)
+        except OSError:
+            pass
+    try:
+        if os.path.exists(path):
+            os.replace(path, f"{path}.1")
+    except OSError:
+        pass
+    _TRACE_ROTATION_STATE["opened_at"] = time.time()
+
+
 def _trace_event(kind: str, payload: dict[str, Any]) -> None:
     if not DEFAULT_TRACE_FILE:
         return
@@ -268,8 +446,12 @@ def _trace_event(kind: str, payload: dict[str, Any]) -> None:
         "kind": kind,
         "payload": payload,
     }
-    with open(DEFAULT_TRACE_FILE, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    _maybe_rotate_trace_file(DEFAULT_TRACE_FILE)
+    try:
+        with open(DEFAULT_TRACE_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        _logger.warning("trace write failed: %s", exc)
 
 
 def _trace_request(kind: str, payload: dict[str, Any]) -> None:
@@ -541,6 +723,96 @@ def _make_function_call_item(
     }
 
 
+def _make_custom_tool_call_item(
+    name: str,
+    raw_input: str,
+    *,
+    call_id: str | None = None,
+    item_id: str | None = None,
+) -> dict[str, Any]:
+    """Emit Codex's `custom_tool_call` shape for tools registered as `type:"custom"`
+    (e.g. freeform `apply_patch`). The raw payload travels in `input` as-is;
+    Codex does NOT JSON-decode it."""
+    return {
+        "type": "custom_tool_call",
+        "id": item_id or f"ctc_{uuid.uuid4().hex}",
+        "call_id": call_id or f"call_{uuid.uuid4().hex}",
+        "name": name,
+        "input": raw_input if isinstance(raw_input, str) else json.dumps(raw_input, ensure_ascii=False),
+        "status": "completed",
+    }
+
+
+def _custom_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    """Collect the names of every tool that was registered with `type:"custom"`."""
+    if not tools:
+        return set()
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = tool.get("type")
+        if tool_type != "custom":
+            continue
+        candidate = tool.get("name")
+        if not candidate:
+            fn = tool.get("function")
+            if isinstance(fn, dict):
+                candidate = fn.get("name")
+        if candidate:
+            names.add(str(candidate))
+    return names
+
+
+def _convert_items_for_custom_tools(
+    items: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Rewrite `function_call` items into `custom_tool_call` when the named
+    tool was registered with `type:"custom"`. Required by Codex 0.122 for
+    freeform `apply_patch`: sending a `function_call` for a custom tool makes
+    `ResponseItem` deserialization fail and the turn stalls."""
+    custom_names = _custom_tool_names(tools)
+    if not custom_names:
+        return items
+    converted: list[dict[str, Any]] = []
+    for item in items:
+        if (
+            item.get("type") == "function_call"
+            and str(item.get("name") or "") in custom_names
+        ):
+            raw_args = item.get("arguments")
+            raw_input: str
+            if isinstance(raw_args, str):
+                try:
+                    parsed = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError:
+                    raw_input = raw_args
+                else:
+                    if isinstance(parsed, dict):
+                        for key in ("input", "patch", "text", "content"):
+                            if key in parsed and isinstance(parsed[key], str):
+                                raw_input = parsed[key]
+                                break
+                        else:
+                            raw_input = raw_args
+                    else:
+                        raw_input = raw_args
+            else:
+                raw_input = json.dumps(raw_args, ensure_ascii=False)
+            converted.append(
+                _make_custom_tool_call_item(
+                    name=str(item.get("name") or ""),
+                    raw_input=raw_input,
+                    call_id=item.get("call_id"),
+                    item_id=item.get("id"),
+                )
+            )
+        else:
+            converted.append(item)
+    return converted
+
+
 def _tool_call_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, str):
         stripped = payload.strip()
@@ -618,15 +890,27 @@ def _tool_call_items_from_payload(payload: Any) -> list[dict[str, Any]]:
 
 def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     cleaned = _clean_output_text(text)
-    parsed_blocks: list[tuple[int, list[dict[str, Any]]]] = []
+    # Track consumed (start, end) spans so we don't double-parse a single
+    # `<tool_call>` that contains both nested `<function=...>` XML (Qwen3-Coder)
+    # and a bare JSON body the outer TAGGED pattern also matches.
+    consumed_spans: list[tuple[int, int]] = []
+    parsed_blocks: list[tuple[int, int, list[dict[str, Any]]]] = []
+
+    def _span_overlaps(start: int, end: int) -> bool:
+        for s, e in consumed_spans:
+            if start < e and end > s:
+                return True
+        return False
 
     for match in TOOL_CALL_RE.finditer(cleaned):
         params: dict[str, Any] = {}
         for param_match in PARAM_RE.finditer(match.group("body")):
             params[param_match.group("name").strip()] = _parse_param_value(param_match.group("value"))
+        consumed_spans.append((match.start(), match.end()))
         parsed_blocks.append(
             (
                 match.start(),
+                match.end(),
                 [
                     _make_function_call_item(
                         match.group("name").strip(),
@@ -637,17 +921,23 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
         )
 
     for match in TAGGED_TOOL_CALL_RE.finditer(cleaned):
+        if _span_overlaps(match.start(), match.end()):
+            continue
         parsed = _tool_call_items_from_payload(match.group("body"))
         if parsed:
-            parsed_blocks.append((match.start(), parsed))
+            consumed_spans.append((match.start(), match.end()))
+            parsed_blocks.append((match.start(), match.end(), parsed))
 
     for match in FENCED_TOOL_CALL_RE.finditer(cleaned):
+        if _span_overlaps(match.start(), match.end()):
+            continue
         parsed = _tool_call_items_from_payload(match.group("body"))
         if parsed:
-            parsed_blocks.append((match.start(), parsed))
+            consumed_spans.append((match.start(), match.end()))
+            parsed_blocks.append((match.start(), match.end(), parsed))
 
     tool_calls: list[dict[str, Any]] = []
-    for _, items in sorted(parsed_blocks, key=lambda entry: entry[0]):
+    for _, _, items in sorted(parsed_blocks, key=lambda entry: entry[0]):
         tool_calls.extend(items)
 
     visible_text = _extract_visible_text(cleaned)
@@ -666,11 +956,33 @@ def _make_internal_tool_call(name: str, arguments: Any, *, call_id: str | None =
     }
 
 
-def _response_usage(result: dict[str, Any]) -> dict[str, int]:
+def _approx_tokens_bytes(tokens: Any) -> int:
+    """Rough byte accounting for a tuple/list of ints. 8 bytes / token is
+    more than a 32-bit int actually costs on CPython but leaves headroom for
+    the surrounding tuple header."""
+    try:
+        return 8 * len(tokens)
+    except Exception:
+        return 0
+
+
+def _response_usage(result: dict[str, Any]) -> dict[str, Any]:
+    input_tokens = int(result.get("prompt_tokens") or 0)
+    output_tokens = int(result.get("generated_tokens") or 0)
+    cached_input_tokens = int(result.get("reused_prefix_tokens") or 0)
+    reasoning_output_tokens = int(result.get("reasoning_tokens") or 0)
     return {
-        "input_tokens": result["prompt_tokens"],
-        "output_tokens": result["generated_tokens"],
-        "total_tokens": result["prompt_tokens"] + result["generated_tokens"],
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "input_tokens_details": {
+            "cached_tokens": cached_input_tokens,
+        },
+        "output_tokens_details": {
+            "reasoning_tokens": reasoning_output_tokens,
+        },
     }
 
 
@@ -739,6 +1051,32 @@ def _response_completion_state(result: dict[str, Any]) -> tuple[str, dict[str, A
         return "incomplete", {"reason": "max_output_tokens"}
 
     return "completed", None
+
+
+def _classify_error_code(message: str, exc: Exception | None = None) -> str:
+    """Map a raw error message/exception to a Codex-recognized error code.
+
+    Codex parses `error.code` to decide retry behavior; without a recognized
+    code it falls back to Retryable which can mask real failures and cause
+    infinite retry loops.
+    """
+    if exc is not None:
+        if isinstance(exc, PromptTooLargeError):
+            return "context_length_exceeded"
+        if isinstance(exc, UnknownPreviousResponseError):
+            return "invalid_prompt"
+    lowered = (message or "").lower()
+    if "context" in lowered and ("length" in lowered or "window" in lowered):
+        return "context_length_exceeded"
+    if "prompt" in lowered and ("too large" in lowered or "too long" in lowered):
+        return "context_length_exceeded"
+    if "quota" in lowered or "rate limit" in lowered:
+        return "rate_limit_exceeded"
+    if "oom" in lowered or "out of memory" in lowered or "insufficient memory" in lowered:
+        return "server_overloaded"
+    if "invalid prompt" in lowered or "invalid input" in lowered:
+        return "invalid_prompt"
+    return "server_error"
 
 
 def _is_planning_only_function_call(item: dict[str, Any]) -> bool:
@@ -864,8 +1202,21 @@ def _output_text_from_items(items: list[dict[str, Any]]) -> str:
     return "".join(texts)
 
 
+def _make_reasoning_item(summary_text: str) -> dict[str, Any]:
+    return {
+        "type": "reasoning",
+        "id": f"rs_{uuid.uuid4().hex}",
+        "summary": [
+            {
+                "type": "summary_text",
+                "text": summary_text,
+            }
+        ],
+    }
+
+
 def _build_output_items(full_text: str) -> list[dict[str, Any]]:
-    _, visible_text = _strip_reasoning_blocks(full_text)
+    reasoning_text, visible_text = _strip_reasoning_blocks(full_text)
     assistant_text, tool_calls = _parse_tool_calls(visible_text)
     deduped_tool_calls: list[dict[str, Any]] = []
     previous_signature: tuple[str, str] | None = None
@@ -879,6 +1230,8 @@ def _build_output_items(full_text: str) -> list[dict[str, Any]]:
         deduped_tool_calls.append(tool_call)
         previous_signature = signature
     items: list[dict[str, Any]] = []
+    if reasoning_text:
+        items.append(_make_reasoning_item(reasoning_text))
     if assistant_text:
         items.append(_make_message_item(assistant_text))
     items.extend(deduped_tool_calls)
@@ -998,6 +1351,53 @@ def _massage_responses_tool_result_messages(messages: list[dict[str, Any]]) -> l
     ]
 
 
+def _synthesize_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Qwen3 chat templates REQUIRE every assistant `tool_calls` block to be
+    followed by a matching `tool` / `<tool_response>` message. If the last
+    assistant message emits tool_calls with no tool_result, Qwen drops into a
+    prefill-only mode (no `<|im_start|>assistant` generation prompt), which
+    surfaces as the "empty-args loop" from turn 3+.
+
+    This function injects synthetic `{error: "tool_result_missing"}` responses
+    for any dangling tool_calls, keeping the conversation template valid so
+    the model resumes generation correctly.
+    """
+    if not messages:
+        return messages
+    last = messages[-1]
+    if last.get("role") != "assistant":
+        return messages
+    tool_calls = last.get("tool_calls") or []
+    if not tool_calls:
+        return messages
+    patched = list(messages)
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id") or call.get("call_id")
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = call.get("name") or (fn.get("name") if isinstance(fn, dict) else None)
+        patched.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": json.dumps({"error": "tool_result_missing"}, ensure_ascii=False),
+            }
+        )
+    patched.append(
+        {
+            "role": "user",
+            "content": (
+                "[System: The previous assistant turn emitted tool calls that were not "
+                "delivered to the environment. Treat the tool results above as authoritative. "
+                "Do not repeat the identical tool calls; decide the next action based on the error.]"
+            ),
+        }
+    )
+    return patched
+
+
 def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     idx = 0
     while idx < len(messages) and messages[idx].get("role") == "system":
@@ -1006,7 +1406,7 @@ def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _responses_max_tokens(requested_max_tokens: int | None, tools: list[dict[str, Any]] | None) -> int:
-    max_tokens = requested_max_tokens or 512
+    max_tokens = requested_max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
     if tools:
         max_tokens = max(max_tokens, MIN_TOOL_RESPONSE_MAX_TOKENS)
     return max_tokens
@@ -1335,6 +1735,45 @@ def _comment_line(comment: str = "heartbeat") -> str:
     return f": {comment}\n\n"
 
 
+def _responses_heartbeat_line(response_id: str, model_name: str) -> str:
+    # Typed heartbeat for the Responses SSE stream. Codex's `stream_idle_timeout`
+    # resets on any SSE event frame, NOT on SSE comment lines, so emitting a
+    # `response.in_progress` event (which Codex already handles) keeps the
+    # stream alive during long prefills / tool-call generations.
+    payload = {
+        "type": "response.in_progress",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": model_name,
+        },
+    }
+    return _json_line("response.in_progress", payload)
+
+
+def _chat_heartbeat_line(completion_id: str, created: int, model_name: str) -> str:
+    payload = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": None,
+            }
+        ],
+    }
+    return _data_line(payload)
+
+
+def _anthropic_heartbeat_line() -> str:
+    # Anthropic Messages SSE has a first-class `ping` event.
+    return _json_line("ping", {"type": "ping"})
+
+
 def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     messages: list[dict[str, Any]] = []
     tools = req.tools or []
@@ -1342,6 +1781,13 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
 
     if req.instructions:
         system_parts.append(req.instructions)
+
+    # Inject the "Tool-calling rules (strict)" block whenever tools are
+    # registered. This single block removes most of Qwen3's "plan-and-announce"
+    # failure mode in agentic Codex runs. Opt out via
+    # LOCAL_DFLASH_TOOL_CALLING_RULES=0 for diagnostics.
+    if tools and TOOL_CALLING_RULES_ENABLED:
+        system_parts.append(TOOL_CALLING_RULES_PROMPT)
 
     if isinstance(req.input, str):
         messages.append({"role": "user", "content": req.input})
@@ -1405,6 +1851,29 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
             continue
 
         if item_type == "reasoning":
+            # Preserve any encrypted_content / summary text so it can be
+            # replayed if we ever gain access to the target model's cached
+            # thinking. For now we keep the item as a hint in the assistant
+            # history (wrapped in <think>…</think>) so Qwen sees the previous
+            # deliberation when continuing a multi-turn reasoning turn.
+            summary_parts: list[str] = []
+            for content_block in item.get("summary") or []:
+                if isinstance(content_block, dict):
+                    text = content_block.get("text")
+                    if text:
+                        summary_parts.append(str(text))
+            for content_block in item.get("content") or []:
+                if isinstance(content_block, dict):
+                    text = content_block.get("text")
+                    if text:
+                        summary_parts.append(str(text))
+            encrypted = item.get("encrypted_content")
+            if encrypted and not summary_parts:
+                # Nothing readable to splice in; drop it (agrees with prior behavior).
+                continue
+            if summary_parts:
+                think_block = "<think>\n" + "\n\n".join(summary_parts) + "\n</think>"
+                messages.append({"role": "assistant", "content": think_block})
             continue
 
         content = _extract_text_from_content(item.get("content"))
@@ -1431,9 +1900,13 @@ class LocalModelServer:
         context_reserve: int,
         keep_alive_seconds: float | None,
         target_turboquant_bits: float | None,
+        rotating_keep_tokens: int = 0,
         draft_turboquant_bits: float | None = None,
         adaptive_block_size_config: AdaptiveBlockSizeConfig | None = None,
         global_prefix_cache_limit: int = GLOBAL_PREFIX_CACHE_LIMIT,
+        global_prefix_cache_byte_limit: int | None = None,
+        stable_prefix_tokens_byte_limit: int | None = None,
+        mlx_clear_cache_threshold: float | None = 0.9,
     ) -> None:
         self.model_path = model_path
         self.draft_path = draft_path
@@ -1441,6 +1914,7 @@ class LocalModelServer:
         self.block_size = block_size
         self.disable_thinking = disable_thinking
         self.sliding_window_size = sliding_window_size
+        self.rotating_keep_tokens = max(0, int(rotating_keep_tokens or 0))
         self.max_tokens_limit = max_tokens_limit
         self.context_window = context_window
         self.context_reserve = context_reserve
@@ -1477,6 +1951,12 @@ class LocalModelServer:
         self._next_generation_ticket = 0
         self._active_generation_ticket: int | None = None
         self._queued_generation_tickets: deque[int] = deque()
+        self.mlx_clear_cache_threshold = mlx_clear_cache_threshold
+        self.global_prefix_cache_byte_limit = max(0, int(global_prefix_cache_byte_limit or 0))
+        self.stable_prefix_tokens_byte_limit = max(0, int(stable_prefix_tokens_byte_limit or 0))
+        self._global_prefix_cache_bytes = 0
+        self._global_prefix_state_bytes: dict[str, int] = {}
+        self._stable_prefix_tokens_bytes = 0
 
     def _clear_hidden_states_locked(self) -> None:
         hidden_states = getattr(self._model, "_hidden_states", None)
@@ -1532,12 +2012,26 @@ class LocalModelServer:
             self._unload_timer.cancel()
             self._unload_timer = None
 
+    def _unload_from_timer(self, scheduled_timer: Timer) -> None:
+        # Timer callbacks run in background threads. Grab the lock and only
+        # proceed if the pending timer is still us — otherwise a newer
+        # `finish_request` has already rescheduled and we must not double-
+        # unload.
+        with self._lock:
+            if self._unload_timer is not scheduled_timer:
+                return
+            self._cancel_unload_timer_locked()
+            self._reset_loaded_state_locked()
+
     def unload(self) -> None:
         with self._lock:
             self._cancel_unload_timer_locked()
             self._reset_loaded_state_locked()
 
     def _schedule_unload_locked(self, keep_alive_seconds: float | None) -> None:
+        # Called under `self._lock`. Creating and starting the Timer here
+        # (rather than in a separate method) avoids a race where two
+        # concurrent `finish_request` calls each fire a fresh Timer.
         self._cancel_unload_timer_locked()
         if self._model is None:
             return
@@ -1547,10 +2041,16 @@ class LocalModelServer:
             self._reset_loaded_state_locked()
             return
 
-        timer = Timer(keep_alive_seconds, self.unload)
+        timer: Timer | None = None
+
+        def _fire() -> None:
+            if timer is not None:
+                self._unload_from_timer(timer)
+
+        timer = Timer(keep_alive_seconds, _fire)
         timer.daemon = True
-        timer.start()
         self._unload_timer = timer
+        timer.start()
 
     def finish_request(self, keep_alive_override: Any = None) -> None:
         keep_alive_seconds = (
@@ -1562,7 +2062,35 @@ class LocalModelServer:
                 # Keep the warm model resident, but drop per-request tensors and free-list
                 # allocations so memory returns close to the loaded baseline after each turn.
                 self._clear_request_state_locked()
+            self._maybe_clear_mlx_cache_locked()
             self._schedule_unload_locked(keep_alive_seconds)
+
+    def _maybe_clear_mlx_cache_locked(self) -> None:
+        """Called between requests. When the Metal allocator cache exceeds
+        `mlx_clear_cache_threshold * cache_limit`, flush it so long-running
+        24h sessions don't fragment into OOM. Also resets the peak-memory
+        counter so `/metrics` reports the recent window, not lifetime.
+        """
+        threshold = getattr(self, "mlx_clear_cache_threshold", None)
+        if threshold is None or threshold <= 0:
+            return
+        try:
+            cache_bytes = int(mx.get_cache_memory())
+            cache_limit_bytes = int(mx.metal.get_cache_limit()) if hasattr(mx, "metal") and hasattr(mx.metal, "get_cache_limit") else 0
+        except Exception:
+            cache_bytes = 0
+            cache_limit_bytes = 0
+        if cache_limit_bytes <= 0:
+            return
+        if cache_bytes >= threshold * cache_limit_bytes:
+            try:
+                mx.clear_cache()
+                if hasattr(mx, "reset_peak_memory"):
+                    mx.reset_peak_memory()
+                elif hasattr(mx.metal, "reset_peak_memory"):
+                    mx.metal.reset_peak_memory()
+            except Exception as exc:
+                _logger.debug("mx.clear_cache() failed: %s", exc)
 
     def ensure_loaded(self) -> None:
         self._cancel_unload_timer_locked()
@@ -1573,7 +2101,25 @@ class LocalModelServer:
             self.draft_path,
             sliding_window_size=self.sliding_window_size,
             turboquant_bits=self.draft_turboquant_bits,
+            rotating_keep_tokens=self.rotating_keep_tokens,
         )
+        # Make sure the Qwen3 stop tokens `<|im_end|>` and `<|endoftext|>` are
+        # in the EOS set. Most Qwen3 chat tokenizers only expose `<|im_end|>`
+        # by default, which means a runaway <|endoftext|> isn't caught. We do
+        # NOT add `</tool_call>` — the agent audit flagged that as a footgun
+        # (it would chop off the closing tag and trip unterminated-call logic).
+        try:
+            existing = set(self._tokenizer.eos_token_ids or [])
+            for literal in ("<|im_end|>", "<|endoftext|>"):
+                try:
+                    tok = self._tokenizer.encode(literal, add_special_tokens=False)
+                except TypeError:
+                    tok = self._tokenizer.encode(literal)
+                if tok and len(tok) == 1:
+                    existing.add(int(tok[0]))
+            self._tokenizer.eos_token_ids = sorted(existing)
+        except Exception as exc:
+            _logger.debug("failed to augment eos_token_ids: %s", exc)
 
     def _prune_prefix_cache_states_locked(self) -> None:
         while len(self._prefix_state_order) > self.prefix_cache_state_limit:
@@ -1586,7 +2132,48 @@ class LocalModelServer:
         while len(self._global_prefix_order) > self.global_prefix_cache_limit:
             stale_key = self._global_prefix_order.popleft()
             self._global_prefix_states.pop(stale_key, None)
-            self._stable_prefix_tokens_by_key.pop(stale_key, None)
+            stale_bytes = self._global_prefix_state_bytes.pop(stale_key, 0)
+            self._global_prefix_cache_bytes = max(0, self._global_prefix_cache_bytes - stale_bytes)
+            stale_tokens = self._stable_prefix_tokens_by_key.pop(stale_key, None)
+            if stale_tokens is not None:
+                self._stable_prefix_tokens_bytes = max(
+                    0,
+                    self._stable_prefix_tokens_bytes - _approx_tokens_bytes(stale_tokens),
+                )
+        if self.global_prefix_cache_byte_limit > 0:
+            while (
+                self._global_prefix_cache_bytes > self.global_prefix_cache_byte_limit
+                and self._global_prefix_order
+            ):
+                stale_key = self._global_prefix_order.popleft()
+                self._global_prefix_states.pop(stale_key, None)
+                stale_bytes = self._global_prefix_state_bytes.pop(stale_key, 0)
+                self._global_prefix_cache_bytes = max(0, self._global_prefix_cache_bytes - stale_bytes)
+                stale_tokens = self._stable_prefix_tokens_by_key.pop(stale_key, None)
+                if stale_tokens is not None:
+                    self._stable_prefix_tokens_bytes = max(
+                        0,
+                        self._stable_prefix_tokens_bytes - _approx_tokens_bytes(stale_tokens),
+                    )
+
+    def _prune_stable_prefix_tokens_locked(self) -> None:
+        if self.stable_prefix_tokens_byte_limit <= 0:
+            return
+        while (
+            self._stable_prefix_tokens_bytes > self.stable_prefix_tokens_byte_limit
+            and self._stable_prefix_tokens_by_key
+        ):
+            # Drop the first-inserted key we still have.
+            try:
+                stale_key = next(iter(self._stable_prefix_tokens_by_key))
+            except StopIteration:
+                break
+            stale_tokens = self._stable_prefix_tokens_by_key.pop(stale_key, None)
+            if stale_tokens is not None:
+                self._stable_prefix_tokens_bytes = max(
+                    0,
+                    self._stable_prefix_tokens_bytes - _approx_tokens_bytes(stale_tokens),
+                )
 
     def _prune_response_states_locked(self) -> None:
         while len(self._response_order) > self.response_history_limit:
@@ -1697,10 +2284,24 @@ class LocalModelServer:
         }
         if tools:
             kwargs["tools"] = tools
+        enable_thinking = not self.disable_thinking
+        # `preserve_thinking=True` keeps the last assistant `<think>` block on
+        # Qwen3 thinking-mode templates; stripping it from turn 3+ causes the
+        # known empty-args tool-call loop. Older templates don't accept the
+        # kwarg, so we fall back in stages.
         try:
             return self._tokenizer.apply_chat_template(
                 messages,
-                enable_thinking=not self.disable_thinking,
+                enable_thinking=enable_thinking,
+                preserve_thinking=True,
+                **kwargs,
+            )
+        except TypeError:
+            pass
+        try:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                enable_thinking=enable_thinking,
                 **kwargs,
             )
         except TypeError:
@@ -1746,7 +2347,14 @@ class LocalModelServer:
             self.tokenize_prompt(prompt_a),
             self.tokenize_prompt(prompt_b),
         )
+        existing = self._stable_prefix_tokens_by_key.get(stable_prefix_key)
+        if existing is not None:
+            self._stable_prefix_tokens_bytes = max(
+                0, self._stable_prefix_tokens_bytes - _approx_tokens_bytes(existing)
+            )
         self._stable_prefix_tokens_by_key[stable_prefix_key] = prefix_tokens
+        self._stable_prefix_tokens_bytes += _approx_tokens_bytes(prefix_tokens)
+        self._prune_stable_prefix_tokens_locked()
         return prefix_tokens
 
     def _global_prefix_state_for_key_locked(self, stable_prefix_key: str | None) -> PromptPrefillState | None:
@@ -1814,7 +2422,17 @@ class LocalModelServer:
         if derived_state is None:
             return
 
+        previous = self._global_prefix_states.get(stable_prefix_key)
+        if previous is not None:
+            prev_bytes = self._global_prefix_state_bytes.pop(stable_prefix_key, 0)
+            self._global_prefix_cache_bytes = max(0, self._global_prefix_cache_bytes - prev_bytes)
+        try:
+            state_bytes = int(estimate_memory_bytes(derived_state))
+        except Exception:
+            state_bytes = 0
         self._global_prefix_states[stable_prefix_key] = derived_state
+        self._global_prefix_state_bytes[stable_prefix_key] = state_bytes
+        self._global_prefix_cache_bytes += state_bytes
         try:
             self._global_prefix_order.remove(stable_prefix_key)
         except ValueError:
@@ -1849,11 +2467,15 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         requested_max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        should_stop: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
         prompt_tokens_list = self.tokenize_prompt(prompt)
@@ -1877,11 +2499,20 @@ class LocalModelServer:
             prompt_tokens_list,
             block_size=self.block_size,
             max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            top_k=sampling.top_k,
+            min_p=sampling.min_p,
+            presence_penalty=sampling.presence_penalty,
+            repetition_penalty=sampling.repetition_penalty,
+            frequency_penalty=sampling.frequency_penalty,
+            repetition_context_size=sampling.repetition_context_size,
+            presence_context_size=sampling.presence_context_size,
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=prefix_state,
             capture_prefill_state=capture_prefill_state,
             adaptive_block_size=self.adaptive_block_size_config,
+            should_stop=should_stop,
         ):
             if chunk.text:
                 text_parts.append(chunk.text)
@@ -1929,11 +2560,15 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         requested_max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        should_stop: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> tuple[Iterator[Any], int, float, str | None, tuple[int, ...], str]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
         prompt_tokens_list = self.tokenize_prompt(prompt)
@@ -1955,11 +2590,20 @@ class LocalModelServer:
             prompt_tokens_list,
             block_size=self.block_size,
             max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            top_k=sampling.top_k,
+            min_p=sampling.min_p,
+            presence_penalty=sampling.presence_penalty,
+            repetition_penalty=sampling.repetition_penalty,
+            frequency_penalty=sampling.frequency_penalty,
+            repetition_context_size=sampling.repetition_context_size,
+            presence_context_size=sampling.presence_context_size,
             target_turboquant_bits=self.target_turboquant_bits,
             prefix_state=prefix_state,
             capture_prefill_state=capture_prefill_state,
             adaptive_block_size=self.adaptive_block_size_config,
+            should_stop=should_stop,
         )
         return iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source
 
@@ -1968,11 +2612,12 @@ class LocalModelServer:
         queue: Queue,
         messages: list[dict[str, Any]],
         requested_max_tokens: int,
-        temperature: float,
+        sampling: SamplingParams,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        stop_event: Any = None,
     ) -> None:
         generation_ticket: int | None = None
         text_parts: list[str] = []
@@ -1988,10 +2633,11 @@ class LocalModelServer:
                 iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source = self._stream_generate_locked(
                     messages,
                     requested_max_tokens,
-                    temperature,
+                    sampling,
                     tools=tools,
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
+                    should_stop=(stop_event.is_set if stop_event is not None else None),
                 )
                 for chunk in iterator:
                     if chunk.text:
@@ -2052,19 +2698,22 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        *,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
         generation_ticket = self._acquire_generation_turn()
         try:
             with self._lock:
                 _, result = self._generate_locked(
                     messages,
                     max_tokens,
-                    temperature,
+                    sampling,
                     tools=tools,
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
@@ -2078,24 +2727,36 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         requested_max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        should_stop: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
         current_messages = list(messages)
         current_previous_response_id = previous_response_id
 
         for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
+            if should_stop is not None:
+                try:
+                    if should_stop():
+                        break
+                except Exception:
+                    pass
             _, result = self._generate_locked(
                 current_messages,
                 requested_max_tokens,
-                temperature,
+                sampling,
                 tools=tools,
                 previous_response_id=current_previous_response_id,
                 capture_prompt_cache_state=capture_prompt_cache_state,
+                should_stop=should_stop,
             )
             output_items = _build_output_items(result["text"])
+            output_items = _convert_items_for_custom_tools(output_items, tools)
             if not _response_is_followup_candidate(result, output_items, tools):
                 return result, output_items
 
@@ -2140,7 +2801,8 @@ class LocalModelServer:
             logprob_verdict, logprob_margin = self._judge_verdict_via_logprobs(
                 last_user_text, tool_names, assistant_text
             )
-        except Exception:
+        except Exception as exc:
+            _logger.warning("judge logprob path failed: %s", exc)
             logprob_verdict, logprob_margin = None, 0.0
 
         if (
@@ -2149,11 +2811,33 @@ class LocalModelServer:
         ):
             return logprob_verdict
 
-        reasoning_verdict = self._judge_verdict_via_reasoning(
-            last_user_text, tool_names, assistant_text
-        )
-        if reasoning_verdict is not None:
-            return reasoning_verdict
+        # Low-margin or no logprob signal — consult the reasoning judge.
+        # `LOCAL_DFLASH_FOLLOWUP_JUDGE_TIEBREAK_VOTES` toggles best-of-N voting
+        # (default 1 = legacy single-call behavior). Set to 3 for stronger
+        # tie-breaking at the cost of extra tokens per judge invocation.
+        votes_target = max(1, int(os.environ.get("LOCAL_DFLASH_FOLLOWUP_JUDGE_TIEBREAK_VOTES", "1")))
+        reasoning_votes: list[bool] = []
+        for _ in range(votes_target):
+            verdict = self._judge_verdict_via_reasoning(
+                last_user_text, tool_names, assistant_text
+            )
+            if verdict is None:
+                break
+            reasoning_votes.append(verdict)
+            # Short-circuit: once the first 2 votes agree we already have a
+            # majority for best-of-3.
+            if (
+                votes_target >= 3
+                and len(reasoning_votes) == 2
+                and reasoning_votes[0] == reasoning_votes[1]
+            ):
+                return reasoning_votes[0]
+        if reasoning_votes:
+            incomplete_count = sum(1 for v in reasoning_votes if v)
+            complete_count = len(reasoning_votes) - incomplete_count
+            if incomplete_count != complete_count:
+                return incomplete_count > complete_count
+            return reasoning_votes[0]
 
         if logprob_verdict is not None:
             return logprob_verdict
@@ -2237,9 +2921,18 @@ class LocalModelServer:
             _, judge_result = self._generate_locked(
                 judge_messages,
                 RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS,
-                0.0,
+                SamplingParams(
+                    temperature=0.0,
+                    top_p=1.0,
+                    top_k=0,
+                    min_p=0.0,
+                    presence_penalty=0.0,
+                    repetition_penalty=0.0,
+                    frequency_penalty=0.0,
+                ),
             )
-        except Exception:
+        except Exception as exc:
+            _logger.warning("judge reasoning generation failed: %s", exc)
             return None
         raw = _coerce_text(judge_result.get("text", ""))
         _, visible = _strip_reasoning_blocks(raw)
@@ -2258,21 +2951,23 @@ class LocalModelServer:
         queue: Queue,
         messages: list[dict[str, Any]],
         requested_max_tokens: int,
-        temperature: float,
+        sampling: SamplingParams,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        stop_event: Any = None,
     ) -> None:
         try:
             result, output_items = self.generate_response(
                 messages,
                 requested_max_tokens,
-                temperature,
+                sampling,
                 tools=tools,
                 keep_alive_override=keep_alive_override,
                 previous_response_id=previous_response_id,
                 capture_prompt_cache_state=capture_prompt_cache_state,
+                should_stop=(stop_event.is_set if stop_event is not None else None),
             )
             queue.put(("result", (result, output_items)))
         except Exception as exc:
@@ -2284,22 +2979,27 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        should_stop: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
         generation_ticket = self._acquire_generation_turn()
         try:
             with self._lock:
                 return self._generate_response_locked(
                     messages,
                     max_tokens,
-                    temperature,
+                    sampling,
                     tools=tools,
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
+                    should_stop=should_stop,
                 )
         finally:
             try:
@@ -2311,75 +3011,91 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         keep_alive_override: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> Iterator[str]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
+        from threading import Event as _Event
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         event_queue: Queue = Queue()
+        stop_event = _Event()
         worker = Thread(
             target=self._generation_worker,
-            args=(event_queue, messages, max_tokens, temperature, None, keep_alive_override, None, False),
+            args=(event_queue, messages, max_tokens, sampling, None, keep_alive_override, None, False, stop_event),
             daemon=True,
         )
         worker.start()
 
-        visible_stream = _IncrementalVisibleTextStream(strip_edges=True)
-        emitted_role = False
-        result: dict[str, Any] | None = None
-        done = False
+        try:
+            visible_stream = _IncrementalVisibleTextStream(strip_edges=True)
+            emitted_role = False
+            result: dict[str, Any] | None = None
+            done = False
 
-        while not done:
-            try:
-                kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
-            except Empty:
-                yield _comment_line()
-                continue
-
-            if kind == "text":
-                delta = visible_stream.feed(payload)
-                if not delta:
+            while not done:
+                try:
+                    kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
+                except Empty:
+                    yield _chat_heartbeat_line(completion_id, created, self.model_name)
                     continue
 
-                chunk_delta: dict[str, Any] = {"content": delta}
-                if not emitted_role:
-                    chunk_delta = {"role": "assistant", "content": delta}
-                    emitted_role = True
+                if kind == "text":
+                    delta = visible_stream.feed(payload)
+                    if not delta:
+                        continue
 
-                yield _data_line(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": self.model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": chunk_delta,
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                )
-                continue
+                    chunk_delta: dict[str, Any] = {"content": delta}
+                    if not emitted_role:
+                        chunk_delta = {"role": "assistant", "content": delta}
+                        emitted_role = True
 
-            if kind == "result":
-                result = payload
-                continue
-
-            if kind == "error":
-                yield _data_line(
-                    {
-                        "error": {
-                            "message": payload,
+                    yield _data_line(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": self.model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": chunk_delta,
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
-                    }
-                )
-                yield _done_line()
-                return
+                    )
+                    continue
 
-            if kind == "done":
-                done = True
+                if kind == "result":
+                    result = payload
+                    continue
+
+                if kind == "error":
+                    yield _data_line(
+                        {
+                            "error": {
+                                "message": payload,
+                            }
+                        }
+                    )
+                    yield _done_line()
+                    return
+
+                if kind == "done":
+                    done = True
+        except GeneratorExit:
+            # Client disconnected — signal worker to stop ASAP.
+            stop_event.set()
+            raise
+        finally:
+            stop_event.set()
+            try:
+                worker.join(timeout=30.0)
+            except Exception:
+                pass
 
         if result is None:
             yield _data_line(
@@ -2455,12 +3171,15 @@ class LocalModelServer:
         self,
         messages: list[dict[str, Any]],
         max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         request_messages: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         keep_alive_override: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> Iterator[str]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
         response_id = f"resp_{uuid.uuid4().hex}"
         created_response = {
             "id": response_id,
@@ -2484,14 +3203,49 @@ class LocalModelServer:
                 "response": created_response,
             },
         )
+        from threading import Event as _Event
         event_queue: Queue = Queue()
+        stop_event = _Event()
         worker = Thread(
             target=self._responses_generation_worker,
-            args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override, previous_response_id, True),
+            args=(event_queue, messages, max_tokens, sampling, tools, keep_alive_override, previous_response_id, True, stop_event),
             daemon=True,
         )
         worker.start()
+        try:
+            yield from self._stream_response_events_body(
+                response_id=response_id,
+                previous_response_id=previous_response_id,
+                event_queue=event_queue,
+                messages=messages,
+                max_tokens=max_tokens,
+                sampling=sampling,
+                tools=tools,
+                request_messages=request_messages,
+            )
+        except GeneratorExit:
+            stop_event.set()
+            raise
+        finally:
+            stop_event.set()
+            try:
+                worker.join(timeout=30.0)
+            except Exception:
+                pass
+        return
 
+    def _stream_response_events_body(
+        self,
+        *,
+        response_id: str,
+        previous_response_id: str | None,
+        event_queue: Queue,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        sampling: SamplingParams,
+        tools: list[dict[str, Any]] | None,
+        request_messages: list[dict[str, Any]] | None,
+    ) -> Iterator[str]:
         message_item_id: str | None = None
         result: dict[str, Any] | None = None
         output_items: list[dict[str, Any]] | None = None
@@ -2501,7 +3255,7 @@ class LocalModelServer:
             try:
                 kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
             except Empty:
-                yield _comment_line()
+                yield _responses_heartbeat_line(response_id, self.model_name)
                 continue
 
             if kind == "text":
@@ -2512,6 +3266,8 @@ class LocalModelServer:
                 continue
 
             if kind == "error":
+                err_message = str(payload)
+                err_code = _classify_error_code(err_message)
                 yield _json_line(
                     "response.failed",
                     {
@@ -2521,9 +3277,14 @@ class LocalModelServer:
                             "object": "response",
                             "status": "failed",
                             "model": self.model_name,
+                            "error": {
+                                "code": err_code,
+                                "message": err_message,
+                            },
                         },
                         "error": {
-                            "message": payload,
+                            "code": err_code,
+                            "message": err_message,
                         },
                     },
                 )
@@ -2534,6 +3295,8 @@ class LocalModelServer:
                 done = True
 
         if result is None:
+            err_message = "Generation completed without a final result"
+            err_code = "server_error"
             yield _json_line(
                 "response.failed",
                 {
@@ -2543,9 +3306,14 @@ class LocalModelServer:
                         "object": "response",
                         "status": "failed",
                         "model": self.model_name,
+                        "error": {
+                            "code": err_code,
+                            "message": err_message,
+                        },
                     },
                     "error": {
-                        "message": "Generation completed without a final result",
+                        "code": err_code,
+                        "message": err_message,
                     },
                 },
             )
@@ -2618,6 +3386,60 @@ class LocalModelServer:
 
         next_output_index = 0
         for item in output_items:
+            if item["type"] == "reasoning":
+                reasoning_text = ""
+                for part in item.get("summary") or []:
+                    if isinstance(part, dict):
+                        reasoning_text += str(part.get("text") or "")
+                yield _json_line(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "response_id": response_id,
+                        "output_index": next_output_index,
+                        "item": {
+                            "id": item["id"],
+                            "type": "reasoning",
+                            "summary": [],
+                            "status": "in_progress",
+                        },
+                    },
+                )
+                if reasoning_text:
+                    yield _json_line(
+                        "response.reasoning_summary_part.added",
+                        {
+                            "type": "response.reasoning_summary_part.added",
+                            "response_id": response_id,
+                            "output_index": next_output_index,
+                            "item_id": item["id"],
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": ""},
+                        },
+                    )
+                    yield _json_line(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "response_id": response_id,
+                            "output_index": next_output_index,
+                            "item_id": item["id"],
+                            "summary_index": 0,
+                            "delta": reasoning_text,
+                        },
+                    )
+                yield _json_line(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "response_id": response_id,
+                        "output_index": next_output_index,
+                        "item": item,
+                    },
+                )
+                next_output_index += 1
+                continue
+
             if item["type"] == "message":
                 if message_item_id is None:
                     if _output_text_from_items([item]):
@@ -2704,6 +3526,9 @@ class LocalModelServer:
             if pending_item["type"] == "function_call":
                 pending_item["status"] = "in_progress"
                 pending_item["arguments"] = ""
+            elif pending_item["type"] == "custom_tool_call":
+                pending_item["status"] = "in_progress"
+                pending_item["input"] = ""
             yield _json_line(
                 "response.output_item.added",
                 {
@@ -2734,6 +3559,29 @@ class LocalModelServer:
                         "arguments": item["arguments"],
                     },
                 )
+            elif item["type"] == "custom_tool_call" and item.get("input"):
+                yield _json_line(
+                    "response.custom_tool_call_input.delta",
+                    {
+                        "type": "response.custom_tool_call_input.delta",
+                        "response_id": response_id,
+                        "output_index": next_output_index,
+                        "item_id": item["id"],
+                        "call_id": item.get("call_id"),
+                        "delta": item["input"],
+                    },
+                )
+                yield _json_line(
+                    "response.custom_tool_call_input.done",
+                    {
+                        "type": "response.custom_tool_call_input.done",
+                        "response_id": response_id,
+                        "output_index": next_output_index,
+                        "item_id": item["id"],
+                        "call_id": item.get("call_id"),
+                        "input": item["input"],
+                    },
+                )
             yield _json_line(
                 "response.output_item.done",
                 {
@@ -2746,12 +3594,16 @@ class LocalModelServer:
             next_output_index += 1
 
         response_status, incomplete_details = _response_completion_state(result)
+        # Codex 0.122's `ResponseCompleted` deserializer accepts `status="completed"`
+        # even when `incomplete_details` signals that generation hit a limit.
+        # Keep the wire-level status `completed` so Codex does not error out;
+        # the telemetry below still records the "real" state for our own logs.
         terminal_payload = _build_response_payload(
             response_id=response_id,
             model_name=self.model_name,
             result=result,
             output_items=output_items,
-            status=response_status,
+            status="completed",
             previous_response_id=previous_response_id,
             incomplete_details=incomplete_details,
         )
@@ -2761,46 +3613,44 @@ class LocalModelServer:
                 "response_id": response_id,
                 "previous_response_id": previous_response_id,
                 "max_output_tokens": max_tokens,
-                "temperature": temperature,
+                "temperature": sampling.temperature,
+                "top_p": sampling.top_p,
+                "top_k": sampling.top_k,
+                "min_p": sampling.min_p,
+                "presence_penalty": sampling.presence_penalty,
+                "repetition_penalty": sampling.repetition_penalty,
                 "request_messages": effective_request_messages,
                 "tools": tools or [],
                 "raw_text": result["text"],
                 "response": terminal_payload,
             },
         )
-        if response_status == "incomplete":
-            yield _json_line(
-                "response.incomplete",
-                {
-                    "type": "response.incomplete",
-                    "response": terminal_payload,
-                },
-            )
-            yield _json_line(
-                "response.completed",
-                {
-                    "type": "response.completed",
-                    "response": terminal_payload,
-                },
-            )
-        else:
-            yield _json_line(
-                "response.completed",
-                {
-                    "type": "response.completed",
-                    "response": terminal_payload,
-                },
-            )
+        # NOTE: Codex 0.122 treats `response.incomplete` as a terminal error
+        # (ApiError::Stream). For `max_output_tokens` / `truncated_tool_call`
+        # we must only emit `response.completed` with `incomplete_details`
+        # inside the response payload itself. The `status` field already
+        # reflects "incomplete" for client-side UI.
+        yield _json_line(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": terminal_payload,
+            },
+        )
         yield _done_line()
 
     def stream_anthropic_events(
         self,
         messages: list[dict[str, Any]],
         max_tokens: int,
-        temperature: float,
+        sampling: "SamplingParams | float | None" = None,
         tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
+        *,
+        temperature: float | None = None,
     ) -> Iterator[str]:
+        sampling = _coerce_sampling_arg(sampling, temperature)
+        from threading import Event as _Event
         message_id = f"msg_{uuid.uuid4().hex}"
         yield _json_line(
             "message_start",
@@ -2822,13 +3672,28 @@ class LocalModelServer:
             },
         )
         event_queue: Queue = Queue()
+        stop_event = _Event()
         worker = Thread(
             target=self._generation_worker,
-            args=(event_queue, messages, max_tokens, temperature, tools, keep_alive_override, None, False),
+            args=(event_queue, messages, max_tokens, sampling, tools, keep_alive_override, None, False, stop_event),
             daemon=True,
         )
         worker.start()
 
+        try:
+            yield from self._stream_anthropic_events_body(event_queue)
+        except GeneratorExit:
+            stop_event.set()
+            raise
+        finally:
+            stop_event.set()
+            try:
+                worker.join(timeout=30.0)
+            except Exception:
+                pass
+        return
+
+    def _stream_anthropic_events_body(self, event_queue: Queue) -> Iterator[str]:
         visible_stream = _IncrementalVisibleTextStream(strip_edges=False)
         text_block_open = False
         result: dict[str, Any] | None = None
@@ -2838,7 +3703,7 @@ class LocalModelServer:
             try:
                 kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
             except Empty:
-                yield _comment_line()
+                yield _anthropic_heartbeat_line()
                 continue
 
             if kind == "text":
@@ -3098,6 +3963,80 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "peak_memory_gb": mx.get_peak_memory() / (1024 ** 3),
         }
 
+    _server_started_at = time.time()
+
+    @app.get("/metrics")
+    def metrics() -> dict[str, Any]:
+        """Time-series-friendly gauges for a watchdog / observability scraper.
+        All values are numeric; no strings in values.
+        """
+        active_pid_age = 0.0
+        if server._active_generation_ticket is not None and server._last_used_at:
+            active_pid_age = max(0.0, time.time() - float(server._last_used_at))
+        cache_memory = 0.0
+        try:
+            cache_memory = float(mx.get_cache_memory())
+        except Exception:
+            pass
+        active_memory = 0.0
+        try:
+            active_memory = float(mx.get_active_memory())
+        except Exception:
+            pass
+        peak_memory = 0.0
+        try:
+            peak_memory = float(mx.get_peak_memory())
+        except Exception:
+            pass
+        return {
+            "dflash_uptime_seconds": time.time() - _server_started_at,
+            "dflash_model_loaded": 1 if server._model is not None else 0,
+            "dflash_active_generation_requests": 1 if server._active_generation_ticket is not None else 0,
+            "dflash_queued_generation_requests": len(server._queued_generation_tickets),
+            "dflash_active_ticket_age_seconds": active_pid_age,
+            "dflash_response_history_entries": len(server._response_order),
+            "dflash_prefix_cache_entries": len(server._prefix_state_order),
+            "dflash_global_prefix_cache_entries": len(server._global_prefix_order),
+            "dflash_global_prefix_cache_bytes": server._global_prefix_cache_bytes,
+            "dflash_stable_prefix_tokens_bytes": server._stable_prefix_tokens_bytes,
+            "dflash_global_prefix_cache_hits": server._global_prefix_cache_hits,
+            "dflash_global_prefix_cache_misses": server._global_prefix_cache_misses,
+            "mlx_active_memory_bytes": active_memory,
+            "mlx_cache_memory_bytes": cache_memory,
+            "mlx_peak_memory_bytes": peak_memory,
+            "dflash_context_window": server.context_window or 0,
+            "dflash_max_tokens_limit": server.max_tokens_limit or 0,
+            "dflash_block_size": server.block_size,
+            "dflash_keep_alive_seconds": float(server.keep_alive_seconds or 0),
+            "dflash_last_used_at": float(server._last_used_at or 0),
+        }
+
+    @app.get("/runs")
+    def runs(dir: str = "") -> dict[str, Any]:
+        """Return the last entries from `.agent-queue/run.jsonl` in the given
+        workdir. This is what the autonomy queue appends per task start/end,
+        budget events, replan triggers, etc."""
+        if not dir:
+            raise HTTPException(status_code=400, detail="missing 'dir' query param")
+        path = os.path.join(dir, ".agent-queue", "run.jsonl")
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail=f"no run.jsonl at {path}")
+        entries: list[dict[str, Any]] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        entries = entries[-500:]
+        return {"dir": dir, "count": len(entries), "entries": entries}
+
     @app.get("/")
     @app.head("/")
     def root() -> dict[str, Any]:
@@ -3107,18 +4046,30 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "model": server.model_name,
         }
 
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    _MODELS_ETAG = f"W/\"local-dflash-{server.model_name}-v1\""
+    _MODELS_HEADERS = {"X-Models-Etag": _MODELS_ETAG, "ETag": _MODELS_ETAG}
+
     @app.get("/v1/models")
-    def list_models() -> dict[str, Any]:
-        return {
+    def list_models():
+        payload = {
             "object": "list",
             "data": [_model_detail_payload(server)],
         }
+        # Direct return for test harnesses that call the endpoint as a plain
+        # function; JSONResponse wrapping attaches the ETag headers in real
+        # HTTP flows.
+        return _JSONResponse(content=payload, headers=_MODELS_HEADERS)
 
     @app.get("/v1/models/{model_id}")
-    def get_model(model_id: str) -> dict[str, Any]:
+    def get_model(model_id: str):
         if model_id != server.model_name:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
-        return _model_detail_payload(server)
+        return _JSONResponse(
+            content=_model_detail_payload(server),
+            headers=_MODELS_HEADERS,
+        )
 
     @app.get("/api/v1/models")
     def lm_studio_models() -> dict[str, Any]:
@@ -3144,15 +4095,26 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: OpenAIChatRequest) -> dict[str, Any]:
+        has_tools = bool(req.tools)
+        sampling = SamplingParams.for_request(
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=req.top_k,
+            min_p=req.min_p,
+            presence_penalty=req.presence_penalty,
+            repetition_penalty=req.repetition_penalty,
+            frequency_penalty=req.frequency_penalty,
+            has_tools=has_tools,
+        )
         if req.stream:
             if req.model != server.model_name:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
-            max_tokens = req.max_completion_tokens or req.max_tokens or 512
+            max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
             return StreamingResponse(
                 server.stream_chat_completions(
                     [m.model_dump() for m in req.messages],
                     max_tokens,
-                    req.temperature,
+                    sampling,
                     keep_alive_override=req.keep_alive,
                 ),
                 media_type="text/event-stream",
@@ -3165,12 +4127,12 @@ def create_app(server: LocalModelServer) -> FastAPI:
         if req.model != server.model_name:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
-        max_tokens = req.max_completion_tokens or req.max_tokens or 512
+        max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
         try:
             result = server.generate(
                 [m.model_dump() for m in req.messages],
                 max_tokens,
-                req.temperature,
+                sampling,
                 keep_alive_override=req.keep_alive,
             )
         except PromptTooLargeError as exc:
@@ -3210,10 +4172,21 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
         messages, tools = _normalize_anthropic_messages(req)
         max_tokens = req.max_tokens
+        has_tools = bool(tools)
+        sampling = SamplingParams.for_request(
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=req.top_k,
+            min_p=req.min_p,
+            presence_penalty=req.presence_penalty,
+            repetition_penalty=req.repetition_penalty,
+            frequency_penalty=req.frequency_penalty,
+            has_tools=has_tools,
+        )
 
         if req.stream:
             return StreamingResponse(
-                server.stream_anthropic_events(messages, max_tokens, req.temperature, tools=tools, keep_alive_override=req.keep_alive),
+                server.stream_anthropic_events(messages, max_tokens, sampling, tools=tools, keep_alive_override=req.keep_alive),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -3223,7 +4196,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             )
 
         try:
-            result = server.generate(messages, max_tokens, req.temperature, tools=tools, keep_alive_override=req.keep_alive)
+            result = server.generate(messages, max_tokens, sampling, tools=tools, keep_alive_override=req.keep_alive)
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         content_blocks = _build_anthropic_content_blocks(result["text"])
@@ -3261,14 +4234,26 @@ def create_app(server: LocalModelServer) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         messages = _massage_responses_continuation_messages(messages)
         messages = _massage_responses_tool_result_messages(messages)
+        messages = _synthesize_orphan_tool_results(messages)
         max_tokens = _responses_max_tokens(req.max_output_tokens, tools)
+        has_tools = bool(tools)
+        sampling = SamplingParams.for_request(
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=req.top_k,
+            min_p=req.min_p,
+            presence_penalty=req.presence_penalty,
+            repetition_penalty=req.repetition_penalty,
+            frequency_penalty=req.frequency_penalty,
+            has_tools=has_tools,
+        )
 
         if req.stream:
             return StreamingResponse(
                 server.stream_response_events(
                     messages,
                     max_tokens,
-                    req.temperature,
+                    sampling,
                     tools=tools,
                     request_messages=request_messages,
                     previous_response_id=req.previous_response_id,
@@ -3286,7 +4271,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             result, output_items = server.generate_response(
                 messages,
                 max_tokens,
-                req.temperature,
+                sampling,
                 tools=tools,
                 keep_alive_override=req.keep_alive,
                 previous_response_id=req.previous_response_id,
@@ -3319,7 +4304,12 @@ def create_app(server: LocalModelServer) -> FastAPI:
                 "response_id": response_id,
                 "previous_response_id": req.previous_response_id,
                 "max_output_tokens": max_tokens,
-                "temperature": req.temperature,
+                "temperature": sampling.temperature,
+                "top_p": sampling.top_p,
+                "top_k": sampling.top_k,
+                "min_p": sampling.min_p,
+                "presence_penalty": sampling.presence_penalty,
+                "repetition_penalty": sampling.repetition_penalty,
                 "request_messages": request_messages,
                 "tools": tools,
                 "raw_text": result["text"],
@@ -3386,6 +4376,12 @@ def parse_args() -> argparse.Namespace:
         default=(int(os.environ["LOCAL_DFLASH_SLIDING_WINDOW_SIZE"]) if os.environ.get("LOCAL_DFLASH_SLIDING_WINDOW_SIZE") else 4096),
     )
     parser.add_argument(
+        "--rotating-keep-tokens",
+        type=int,
+        default=int(os.environ.get("LOCAL_DFLASH_ROTATING_KEEP_TOKENS", "1024")),
+        help="Number of leading tokens (typically the system prompt) the rotating KV cache must never evict. Prevents Codex base_instructions from being dropped mid-session.",
+    )
+    parser.add_argument(
         "--max-tokens-limit",
         type=int,
         default=(int(os.environ["LOCAL_DFLASH_MAX_TOKENS"]) if os.environ.get("LOCAL_DFLASH_MAX_TOKENS") else 32768),
@@ -3441,6 +4437,30 @@ def parse_args() -> argparse.Namespace:
         help="Optional MLX free-cache limit in GiB. Set 0 to disable allocator cache retention.",
     )
     parser.add_argument(
+        "--mlx-wired-limit-gb",
+        type=float,
+        default=(float(os.environ["LOCAL_DFLASH_MLX_WIRED_LIMIT_GB"]) if os.environ.get("LOCAL_DFLASH_MLX_WIRED_LIMIT_GB") else None),
+        help="Optional MLX wired-memory (non-swappable) limit in GiB. Default MLX wires ~75% of RAM which on large Macs is dangerous; set this to ~60%% of total RAM for stable 24h runs.",
+    )
+    parser.add_argument(
+        "--mlx-clear-cache-threshold",
+        type=float,
+        default=float(os.environ.get("LOCAL_DFLASH_MLX_CLEAR_CACHE_THRESHOLD", "0.9")),
+        help="When cache memory exceeds this fraction of the cache limit, call mx.clear_cache() between requests.",
+    )
+    parser.add_argument(
+        "--global-prefix-cache-byte-limit-gb",
+        type=float,
+        default=(float(os.environ["LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB"]) if os.environ.get("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB") else 12.0),
+        help="Byte ceiling (GiB) for the global prompt-cache state dict. Prevents slow leaks over 24h.",
+    )
+    parser.add_argument(
+        "--stable-prefix-tokens-byte-limit-gb",
+        type=float,
+        default=(float(os.environ["LOCAL_DFLASH_STABLE_PREFIX_TOKENS_BYTE_LIMIT_GB"]) if os.environ.get("LOCAL_DFLASH_STABLE_PREFIX_TOKENS_BYTE_LIMIT_GB") else 2.0),
+        help="Byte ceiling (GiB) for the stable-prefix token memoization dict.",
+    )
+    parser.add_argument(
         "--no-preload",
         action="store_true",
         default=os.environ.get("LOCAL_DFLASH_NO_PRELOAD", "").lower() in {"1", "true", "yes", "on"},
@@ -3457,6 +4477,16 @@ def main() -> int:
     mlx_cache_limit = _gb_to_bytes(args.mlx_cache_limit_gb)
     if mlx_cache_limit is not None:
         mx.set_cache_limit(mlx_cache_limit)
+    mlx_wired_limit = _gb_to_bytes(args.mlx_wired_limit_gb)
+    if mlx_wired_limit is not None:
+        try:
+            mx.set_wired_limit(mlx_wired_limit)
+        except AttributeError:
+            _logger.warning(
+                "mx.set_wired_limit is unavailable in this MLX build; "
+                "skipping wired-memory cap (%d GiB requested).",
+                args.mlx_wired_limit_gb,
+            )
 
     detected_context_window = _detect_context_window(args.model_path)
     context_window = args.context_window_override or detected_context_window
@@ -3467,6 +4497,8 @@ def main() -> int:
         grow_threshold=args.adaptive_block_size_grow_threshold,
         shrink_threshold=args.adaptive_block_size_shrink_threshold,
     )
+    prefix_byte_limit = _gb_to_bytes(getattr(args, "global_prefix_cache_byte_limit_gb", None) or 0) or 0
+    stable_prefix_byte_limit = _gb_to_bytes(getattr(args, "stable_prefix_tokens_byte_limit_gb", None) or 0) or 0
     server = LocalModelServer(
         model_path=args.model_path,
         draft_path=args.draft_path,
@@ -3474,6 +4506,7 @@ def main() -> int:
         block_size=args.block_size,
         disable_thinking=args.disable_thinking,
         sliding_window_size=args.sliding_window_size,
+        rotating_keep_tokens=args.rotating_keep_tokens,
         max_tokens_limit=args.max_tokens_limit,
         context_window=context_window,
         context_reserve=args.context_reserve,
@@ -3482,6 +4515,9 @@ def main() -> int:
         draft_turboquant_bits=args.draft_turboquant_bits,
         adaptive_block_size_config=adaptive_block_size_config,
         global_prefix_cache_limit=max(0, args.global_prefix_cache_limit),
+        global_prefix_cache_byte_limit=prefix_byte_limit,
+        stable_prefix_tokens_byte_limit=stable_prefix_byte_limit,
+        mlx_clear_cache_threshold=args.mlx_clear_cache_threshold,
     )
     if not args.no_preload:
         server.ensure_loaded()

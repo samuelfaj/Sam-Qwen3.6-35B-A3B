@@ -49,6 +49,17 @@ PLANNER_MAX_TOKENS = int(
 JUDGE_MAX_TOKENS = int(os.environ.get("LOCAL_DFLASH_QUEUE_JUDGE_MAX_TOKENS", "128"))
 PLANNER_RETRIES = int(os.environ.get("LOCAL_DFLASH_QUEUE_PLANNER_RETRIES", "2"))
 
+# Phase 2B — 24h autonomy knobs.
+WALLCLOCK_HOURS = float(os.environ.get("LOCAL_DFLASH_QUEUE_WALLCLOCK_HOURS", "24"))
+TOKEN_BUDGET = int(os.environ.get("LOCAL_DFLASH_QUEUE_TOKEN_BUDGET", "0"))  # 0 = unbounded
+EXECUTOR_TIMEOUT = int(os.environ.get("LOCAL_DFLASH_QUEUE_EXECUTOR_TIMEOUT", "3600"))
+REPLAN_AFTER_FAILURES = int(os.environ.get("LOCAL_DFLASH_QUEUE_REPLAN_AFTER_FAILURES", "2"))
+REPLAN_MAX = int(os.environ.get("LOCAL_DFLASH_QUEUE_REPLAN_MAX", "3"))
+SHARED_MEMORY_MAX_BYTES = int(os.environ.get("LOCAL_DFLASH_QUEUE_SHARED_MEMORY_BYTES", "65536"))
+HEARTBEAT_FILENAME = "heartbeat"
+RUN_JSONL_FILENAME = "run.jsonl"
+ROLLOUTS_DIRNAME = "rollouts"
+
 
 PLANNER_SYSTEM = (
     "You are a planning module for a local coding agent. "
@@ -145,6 +156,10 @@ class QueueState:
     created_at: int
     updated_at: int
     tasks: list[Task]
+    tokens_used: int = 0
+    replan_count: int = 0
+    consecutive_failures: int = 0
+    shared_memory: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "QueueState":
@@ -154,12 +169,19 @@ class QueueState:
             checks_raw = raw.pop("dod_checks", [])
             raw["dod_checks"] = [DoDCheck(**c) for c in checks_raw]
             tasks.append(Task(**raw))
+        shared_memory = data.get("shared_memory") or {}
+        if not isinstance(shared_memory, dict):
+            shared_memory = {}
         return cls(
             goal=data.get("goal", ""),
             workdir=data.get("workdir", ""),
             created_at=data.get("created_at", int(time.time())),
             updated_at=data.get("updated_at", int(time.time())),
             tasks=tasks,
+            tokens_used=int(data.get("tokens_used") or 0),
+            replan_count=int(data.get("replan_count") or 0),
+            consecutive_failures=int(data.get("consecutive_failures") or 0),
+            shared_memory=shared_memory,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -169,6 +191,10 @@ class QueueState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "tasks": [dataclasses.asdict(t) for t in self.tasks],
+            "tokens_used": self.tokens_used,
+            "replan_count": self.replan_count,
+            "consecutive_failures": self.consecutive_failures,
+            "shared_memory": self.shared_memory,
         }
 
 
@@ -182,6 +208,40 @@ def _state_path(workdir: Path) -> Path:
 
 def _log_dir(workdir: Path) -> Path:
     return _queue_dir(workdir) / LOG_DIRNAME
+
+
+def _rollouts_dir(workdir: Path) -> Path:
+    return _queue_dir(workdir) / ROLLOUTS_DIRNAME
+
+
+def _heartbeat_path(workdir: Path) -> Path:
+    return _queue_dir(workdir) / HEARTBEAT_FILENAME
+
+
+def _run_jsonl_path(workdir: Path) -> Path:
+    return _queue_dir(workdir) / RUN_JSONL_FILENAME
+
+
+def _touch_heartbeat(workdir: Path) -> None:
+    path = _heartbeat_path(workdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    try:
+        path.write_text(str(now), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _record_run_event(workdir: Path, event: dict[str, Any]) -> None:
+    path = _run_jsonl_path(workdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(event)
+    payload.setdefault("ts", time.time())
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def load_state(workdir: Path) -> QueueState | None:
@@ -235,6 +295,13 @@ def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 def _chat_completion(
     messages: list[dict[str, Any]], max_tokens: int, temperature: float = 0.0
 ) -> str:
+    text, _ = _chat_completion_with_usage(messages, max_tokens, temperature)
+    return text
+
+
+def _chat_completion_with_usage(
+    messages: list[dict[str, Any]], max_tokens: int, temperature: float = 0.0
+) -> tuple[str, int]:
     payload = {
         "model": LOCAL_MODEL_NAME,
         "messages": messages,
@@ -244,10 +311,13 @@ def _chat_completion(
     }
     result = _post_json("/chat/completions", payload)
     choices = result.get("choices") or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
-    return str(message.get("content") or "")
+    text = ""
+    if choices:
+        message = choices[0].get("message") or {}
+        text = str(message.get("content") or "")
+    usage = result.get("usage") or {}
+    tokens_used = int(usage.get("total_tokens") or 0)
+    return text, tokens_used
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
@@ -397,10 +467,32 @@ def _format_dod_for_prompt(checks: list[DoDCheck]) -> str:
     return "\n".join(lines)
 
 
-def execute_task(task: Task, workdir: Path, script_dir: Path) -> Path:
-    hint_block = ""
+def _build_executor_hint_block(task: Task, shared_memory: dict[str, Any]) -> str:
+    parts: list[str] = []
     if task.last_hint:
-        hint_block = f"\nPrevious attempt failed. Judge hint: {task.last_hint}\n"
+        parts.append(f"Previous attempt failed. Judge hint: {task.last_hint}")
+    if shared_memory:
+        mem_parts: list[str] = []
+        for key in ("last_summary", "known_failing_paths", "files_touched"):
+            val = shared_memory.get(key)
+            if val:
+                mem_parts.append(f"- {key}: {val}")
+        if mem_parts:
+            parts.append("Shared memory from prior tasks:\n" + "\n".join(mem_parts))
+    if not parts:
+        return ""
+    return "\n" + "\n\n".join(parts) + "\n"
+
+
+def execute_task(
+    task: Task,
+    workdir: Path,
+    script_dir: Path,
+    *,
+    shared_memory: dict[str, Any] | None = None,
+    timeout_seconds: int = EXECUTOR_TIMEOUT,
+) -> tuple[Path, bool]:
+    hint_block = _build_executor_hint_block(task, shared_memory or {})
     prompt = EXECUTOR_PROMPT_TEMPLATE.format(
         workdir=str(workdir),
         title=task.title,
@@ -412,6 +504,12 @@ def execute_task(task: Task, workdir: Path, script_dir: Path) -> Path:
     log_dir = _log_dir(workdir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}-attempt-{task.attempts}.log"
+
+    # Snapshot the executor log under .agent-queue/rollouts/ so retries can
+    # see what the previous attempt tried. The main log stays truncated to
+    # the latest attempt; rollouts keep history.
+    rollouts_dir = _rollouts_dir(workdir)
+    rollouts_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         str(script_dir / "run_opencode_local.sh"),
@@ -425,15 +523,29 @@ def execute_task(task: Task, workdir: Path, script_dir: Path) -> Path:
     env.setdefault("LOCAL_DFLASH_OPENCODE_MAX_RESTARTS", "3")
     env.setdefault("LOCAL_DFLASH_AUTOSTART", "1")
 
+    timed_out = False
     with log_path.open("wb") as log_file:
-        subprocess.run(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env=env,
-            check=False,
-        )
-    return log_path
+        try:
+            subprocess.run(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=False,
+                timeout=timeout_seconds if timeout_seconds > 0 else None,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            log_file.write(
+                f"\n[agent_queue] executor timed out after {timeout_seconds}s\n".encode()
+            )
+    # Save a rollout snapshot so future retries get the trace.
+    try:
+        rollout_path = rollouts_dir / f"{task.id}-attempt-{task.attempts}.log"
+        rollout_path.write_bytes(log_path.read_bytes())
+    except OSError:
+        pass
+    return log_path, timed_out
 
 
 def extract_executor_final_text(log_path: Path, limit_chunks: int = 12) -> str:
@@ -518,6 +630,120 @@ def judge_task(
     return verdict, hint
 
 
+def _update_shared_memory(
+    state: QueueState,
+    task: Task,
+    check_results: list[dict[str, Any]],
+    final_text: str,
+    verdict: str,
+) -> None:
+    mem = state.shared_memory
+    if verdict == "DONE":
+        summary = (
+            final_text.strip().splitlines()[-5:] if final_text.strip() else []
+        )
+        mem["last_summary"] = f"[{task.id}] {task.title}: " + " | ".join(summary)[:500]
+    failing = [
+        str(r.get("check", {}).get("description") or r.get("check", {}).get("command"))
+        for r in check_results
+        if not r.get("passed")
+    ]
+    if failing:
+        known = mem.setdefault("known_failing_paths", [])
+        if isinstance(known, list):
+            for item in failing[:3]:
+                if item and item not in known:
+                    known.append(item)
+            del known[:max(0, len(known) - 25)]
+    # Cap total size so shared memory doesn't grow unboundedly.
+    serialized = json.dumps(mem, ensure_ascii=False)
+    if len(serialized.encode("utf-8")) > SHARED_MEMORY_MAX_BYTES:
+        mem.pop("known_failing_paths", None)
+
+
+def _replan_remaining_tasks(state: QueueState) -> int:
+    """When REPLAN_AFTER_FAILURES consecutive failures happen, ask the planner
+    to rewrite the remaining tasks given the accumulated failure context.
+    Returns the number of tasks replaced.
+    """
+    if state.replan_count >= REPLAN_MAX:
+        return 0
+    remaining = [t for t in state.tasks if t.state == "pending"]
+    if not remaining:
+        return 0
+    failure_reasons: list[str] = []
+    for t in state.tasks:
+        if t.state in {"failed", "blocked"} and (t.last_hint or t.last_verdict):
+            failure_reasons.append(
+                f"[{t.state}] {t.id} ({t.title}): {t.last_hint or t.last_verdict}"
+            )
+    try:
+        messages = [
+            {"role": "system", "content": PLANNER_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Original goal:\n{state.goal}\n\n"
+                    f"Failed / blocked tasks so far:\n"
+                    + ("\n".join(failure_reasons) or "(none)")
+                    + "\n\nRemaining pending tasks:\n"
+                    + "\n".join(f"- {t.id}: {t.title}" for t in remaining)
+                    + "\n\nReturn a NEW JSON task list that replaces the remaining ones. "
+                    "Keep the same id prefix discipline but feel free to restructure. "
+                    "Acknowledge the failure reasons in your plan."
+                ),
+            },
+        ]
+        raw = _chat_completion(messages, max_tokens=PLANNER_MAX_TOKENS, temperature=0.0)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0
+    parsed = _extract_json(raw)
+    if not parsed or not isinstance(parsed.get("tasks"), list):
+        return 0
+    new_tasks: list[Task] = []
+    for idx, raw_task in enumerate(parsed["tasks"]):
+        if not isinstance(raw_task, dict):
+            continue
+        task_id = str(raw_task.get("id") or f"r{state.replan_count + 1}t{idx + 1}")
+        checks: list[DoDCheck] = []
+        for raw_check in raw_task.get("dod_checks") or []:
+            if not isinstance(raw_check, dict):
+                continue
+            command = str(raw_check.get("command") or "").strip()
+            if not command:
+                continue
+            try:
+                expect_exit = int(raw_check.get("expect_exit", 0))
+            except (TypeError, ValueError):
+                expect_exit = 0
+            checks.append(
+                DoDCheck(
+                    type=str(raw_check.get("type") or "bash"),
+                    command=command,
+                    expect_exit=expect_exit,
+                    description=str(raw_check.get("description") or ""),
+                )
+            )
+        new_tasks.append(
+            Task(
+                id=task_id,
+                title=str(raw_task.get("title") or task_id),
+                instruction=str(raw_task.get("instruction") or ""),
+                dod_checks=checks,
+                depends_on=[
+                    str(d) for d in raw_task.get("depends_on") or [] if d
+                ],
+            )
+        )
+    if not new_tasks:
+        return 0
+    # Replace pending tasks with the new ones.
+    state.tasks = [t for t in state.tasks if t.state != "pending"] + new_tasks
+    state.replan_count += 1
+    state.consecutive_failures = 0
+    return len(new_tasks)
+
+
 def _next_runnable_task(state: QueueState) -> Task | None:
     completed = {t.id for t in state.tasks if t.state == "completed"}
     for task in state.tasks:
@@ -545,11 +771,32 @@ def _mark_unreachable_as_skipped(state: QueueState) -> None:
                 )
 
 
+def _budget_exhausted(state: QueueState, started_wallclock: float) -> tuple[bool, str]:
+    if WALLCLOCK_HOURS > 0:
+        elapsed_h = (time.time() - started_wallclock) / 3600.0
+        if elapsed_h >= WALLCLOCK_HOURS:
+            return True, f"wall-clock budget exhausted ({elapsed_h:.2f}h >= {WALLCLOCK_HOURS}h)"
+    if TOKEN_BUDGET > 0 and state.tokens_used >= TOKEN_BUDGET:
+        return True, f"token budget exhausted ({state.tokens_used} >= {TOKEN_BUDGET})"
+    return False, ""
+
+
 def run_queue(state: QueueState, workdir: Path, script_dir: Path) -> int:
     total = len(state.tasks)
-    started = time.time()
+    started_wallclock = time.time()
+    _record_run_event(
+        workdir,
+        {"type": "queue_started", "goal": state.goal, "tasks": total},
+    )
+    _touch_heartbeat(workdir)
 
     while True:
+        exhausted, why = _budget_exhausted(state, started_wallclock)
+        if exhausted:
+            print(f"[queue] {why}; saving state and exiting.", flush=True)
+            _record_run_event(workdir, {"type": "budget_exhausted", "reason": why})
+            break
+
         task = _next_runnable_task(state)
         if task is None:
             break
@@ -557,13 +804,26 @@ def run_queue(state: QueueState, workdir: Path, script_dir: Path) -> int:
         task.state = "in_progress"
         task.attempts += 1
         save_state(state, workdir)
+        _touch_heartbeat(workdir)
 
         print(
-            f"\n=== [{task.id}] attempt {task.attempts}/{MAX_ATTEMPTS}: {task.title} ===",
+            f"\n=== [{task.id}] attempt {task.attempts}/{MAX_ATTEMPTS}: {task.title} "
+            f"(tokens_used={state.tokens_used}, elapsed={int(time.time() - started_wallclock)}s) ===",
             flush=True,
         )
-        log_path = execute_task(task, workdir, script_dir)
+        _record_run_event(
+            workdir,
+            {"type": "task_start", "task_id": task.id, "attempt": task.attempts},
+        )
+        log_path, timed_out = execute_task(
+            task,
+            workdir,
+            script_dir,
+            shared_memory=state.shared_memory,
+            timeout_seconds=EXECUTOR_TIMEOUT,
+        )
         task.last_log_path = str(log_path)
+        _touch_heartbeat(workdir)
 
         print(f"[{task.id}] running {len(task.dod_checks)} DoD check(s)...", flush=True)
         check_results = run_all_checks(task.dod_checks, workdir)
@@ -578,29 +838,69 @@ def run_queue(state: QueueState, workdir: Path, script_dir: Path) -> int:
             print(f"  [{status}] {label}", flush=True)
 
         final_text = extract_executor_final_text(log_path) or _fallback_log_tail(log_path)
-        verdict, hint = judge_task(task, check_results, final_text)
+        if timed_out:
+            final_text = (final_text or "") + "\n[agent_queue] executor timed out."
+        try:
+            verdict, hint = judge_task(task, check_results, final_text)
+        except Exception as exc:
+            verdict, hint = "CONTINUE", f"judge exception: {exc}"
+        # Judge itself also burns tokens; track approximately.
+        state.tokens_used += JUDGE_MAX_TOKENS
         task.last_verdict = verdict
         task.last_hint = hint
         print(
             f"[{task.id}] judge: {verdict}{(' — ' + hint) if hint else ''}",
             flush=True,
         )
+        _update_shared_memory(state, task, check_results, final_text, verdict)
 
         if verdict == "DONE" and all_passed:
             task.state = "completed"
+            state.consecutive_failures = 0
         elif verdict == "BLOCKED":
             task.state = "blocked"
+            state.consecutive_failures += 1
         elif task.attempts >= MAX_ATTEMPTS:
             task.state = "failed"
+            state.consecutive_failures += 1
         else:
             task.state = "pending"
 
+        _record_run_event(
+            workdir,
+            {
+                "type": "task_end",
+                "task_id": task.id,
+                "attempt": task.attempts,
+                "state": task.state,
+                "verdict": verdict,
+                "timed_out": timed_out,
+                "tokens_used_so_far": state.tokens_used,
+            },
+        )
         save_state(state, workdir)
+        _touch_heartbeat(workdir)
+
+        if (
+            state.consecutive_failures >= REPLAN_AFTER_FAILURES
+            and state.replan_count < REPLAN_MAX
+        ):
+            print(
+                f"[queue] {state.consecutive_failures} consecutive failures; "
+                f"triggering dynamic replan ({state.replan_count + 1}/{REPLAN_MAX}).",
+                flush=True,
+            )
+            replaced = _replan_remaining_tasks(state)
+            _record_run_event(
+                workdir,
+                {"type": "replan", "round": state.replan_count, "replaced": replaced},
+            )
+            save_state(state, workdir)
 
     _mark_unreachable_as_skipped(state)
     save_state(state, workdir)
 
-    duration = int(time.time() - started)
+    duration = int(time.time() - started_wallclock)
     completed = [t for t in state.tasks if t.state == "completed"]
     blocked = [t for t in state.tasks if t.state == "blocked"]
     failed = [t for t in state.tasks if t.state == "failed"]
@@ -643,6 +943,51 @@ def _script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _load_fallback_plan(path: Path) -> list[Task]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    raw_tasks = data.get("tasks") if isinstance(data, dict) else data
+    if not isinstance(raw_tasks, list):
+        raise RuntimeError(f"fallback plan at {path} must have a top-level 'tasks' array")
+    tasks: list[Task] = []
+    for idx, raw_task in enumerate(raw_tasks):
+        if not isinstance(raw_task, dict):
+            continue
+        task_id = str(raw_task.get("id") or f"f{idx + 1}")
+        checks: list[DoDCheck] = []
+        for raw_check in raw_task.get("dod_checks") or []:
+            if not isinstance(raw_check, dict):
+                continue
+            command = str(raw_check.get("command") or "").strip()
+            if not command:
+                continue
+            try:
+                expect_exit = int(raw_check.get("expect_exit", 0))
+            except (TypeError, ValueError):
+                expect_exit = 0
+            checks.append(
+                DoDCheck(
+                    type=str(raw_check.get("type") or "bash"),
+                    command=command,
+                    expect_exit=expect_exit,
+                    description=str(raw_check.get("description") or ""),
+                )
+            )
+        tasks.append(
+            Task(
+                id=task_id,
+                title=str(raw_task.get("title") or task_id),
+                instruction=str(raw_task.get("instruction") or ""),
+                dod_checks=checks,
+                depends_on=[
+                    str(d) for d in raw_task.get("depends_on") or [] if d
+                ],
+            )
+        )
+    if not tasks:
+        raise RuntimeError(f"fallback plan at {path} contained no valid tasks")
+    return tasks
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.dir).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -653,9 +998,22 @@ def cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    fallback_path: Path | None = None
+    if getattr(args, "fallback_plan", None):
+        fallback_path = Path(args.fallback_plan).expanduser()
+        if not fallback_path.exists():
+            print(f"fallback plan not found at {fallback_path}", file=sys.stderr)
+            return 2
     ensure_local_server()
-    print(f"planning goal against {LOCAL_API_BASE} ...", flush=True)
-    tasks = plan_tasks(args.goal)
+    tasks: list[Task]
+    try:
+        print(f"planning goal against {LOCAL_API_BASE} ...", flush=True)
+        tasks = plan_tasks(args.goal)
+    except RuntimeError as exc:
+        if fallback_path is None:
+            raise
+        print(f"planner failed ({exc}); loading fallback plan from {fallback_path}", file=sys.stderr)
+        tasks = _load_fallback_plan(fallback_path)
     print(f"planner produced {len(tasks)} task(s).", flush=True)
     state = QueueState(
         goal=args.goal,
@@ -721,6 +1079,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="Plan a new queue and execute it")
     p_run.add_argument("--dir", required=True, help="Working directory for the run")
+    p_run.add_argument(
+        "--fallback-plan",
+        default=None,
+        help="Path to a pre-written JSON plan used if the planner fails to produce valid JSON.",
+    )
     p_run.add_argument("goal", help="High-level goal")
     p_run.set_defaults(func=cmd_run)
 

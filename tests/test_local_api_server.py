@@ -11,10 +11,15 @@ from unittest import mock
 import mlx.core as mx
 
 
+import sys as _sys
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "local_api_server.py"
 SPEC = importlib.util.spec_from_file_location("local_api_server", MODULE_PATH)
 local_api_server = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
+# Register in sys.modules BEFORE exec_module so @dataclass decorators can
+# resolve class.__module__ during class creation.
+_sys.modules["local_api_server"] = local_api_server
 SPEC.loader.exec_module(local_api_server)
 
 
@@ -45,30 +50,11 @@ class FakeStreamingServer(local_api_server.LocalModelServer):
             "elapsed": 0.5,
         }
 
-    def _generation_worker(
-        self,
-        queue: Queue,
-        messages,
-        requested_max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ) -> None:
+    def _generation_worker(self, queue: Queue, *args, **kwargs) -> None:
         queue.put(("result", self._result()))
         queue.put(("done", None))
 
-    def generate_response(
-        self,
-        messages,
-        max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ):
+    def generate_response(self, messages, max_tokens, *args, **kwargs):
         return self._result(), local_api_server._build_output_items(self._result()["text"])
 
 
@@ -110,58 +96,20 @@ class FakeTruncatedToolCallServer(local_api_server.LocalModelServer):
             "prompt_cache_state": None,
         }
 
-    def _generation_worker(
-        self,
-        queue: Queue,
-        messages,
-        requested_max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ) -> None:
+    def _generation_worker(self, queue: Queue, *args, **kwargs) -> None:
         queue.put(("result", self._result()))
         queue.put(("done", None))
 
-    def generate(
-        self,
-        messages,
-        max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ):
+    def generate(self, messages, max_tokens, *args, **kwargs):
         return self._result()
 
-    def generate_response(
-        self,
-        messages,
-        max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ):
+    def generate_response(self, messages, max_tokens, *args, **kwargs):
         result = self._result()
         return result, local_api_server._build_output_items(result["text"])
 
 
 class FakeChatStreamingServer(local_api_server.LocalModelServer):
-    def _generation_worker(
-        self,
-        queue: Queue,
-        messages,
-        requested_max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ) -> None:
+    def _generation_worker(self, queue: Queue, *args, **kwargs) -> None:
         queue.put(("text", "Hello"))
         queue.put(("text", " world"))
         result = {
@@ -219,32 +167,13 @@ class FakeReasoningResponsesServer(local_api_server.LocalModelServer):
             "prompt_cache_state": None,
         }
 
-    def _generation_worker(
-        self,
-        queue: Queue,
-        messages,
-        requested_max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ) -> None:
+    def _generation_worker(self, queue: Queue, *args, **kwargs) -> None:
         queue.put(("text", "The user wants me to inspect the repo. "))
         queue.put(("text", "I'll plan the work carefully.</think>Visible answer."))
         queue.put(("result", self._result()))
         queue.put(("done", None))
 
-    def generate_response(
-        self,
-        messages,
-        max_tokens,
-        temperature,
-        tools=None,
-        keep_alive_override=None,
-        previous_response_id=None,
-        capture_prompt_cache_state=False,
-    ):
+    def generate_response(self, messages, max_tokens, *args, **kwargs):
         result = self._result()
         return result, local_api_server._build_output_items(result["text"])
 
@@ -545,9 +474,10 @@ class LocalApiServerTests(unittest.TestCase):
             local_api_server._responses_max_tokens(512, [{"type": "function"}]),
             local_api_server.MIN_TOOL_RESPONSE_MAX_TOKENS,
         )
+        floor = local_api_server.MIN_TOOL_RESPONSE_MAX_TOKENS
         self.assertEqual(
-            local_api_server._responses_max_tokens(8192, [{"type": "function"}]),
-            8192,
+            local_api_server._responses_max_tokens(floor + 4096, [{"type": "function"}]),
+            floor + 4096,
         )
         self.assertEqual(
             local_api_server._responses_max_tokens(512, None),
@@ -641,14 +571,17 @@ class LocalApiServerTests(unittest.TestCase):
             "prompt_cache_state": None,
         }
 
-        with mock.patch.object(
-            server,
-            "_generate_locked",
-            side_effect=[
-                (["The test file has a module resolution issue."], planning_result),
-                (['<function_call>{"name":"edit"}</function_call>'], tool_result),
-            ],
-        ) as generate_locked_mock:
+        with (
+            mock.patch.object(
+                server,
+                "_generate_locked",
+                side_effect=[
+                    (["The test file has a module resolution issue."], planning_result),
+                    (['<function_call>{"name":"edit"}</function_call>'], tool_result),
+                ],
+            ) as generate_locked_mock,
+            mock.patch.object(server, "_judge_response_needs_followup", return_value=True),
+        ):
             result, output_items = server.generate_response(
                 messages=[{"role": "user", "content": "Fix until all tests pass."}],
                 max_tokens=128,
@@ -687,9 +620,24 @@ class LocalApiServerTests(unittest.TestCase):
             )
         )
 
+        # Visible answer still shows up in output_text.delta
         self.assertIn('"delta": "Visible answer."', events)
-        self.assertNotIn("The user wants me to inspect the repo.", events)
+        # Raw <think>…</think> markers must not leak to the wire
         self.assertNotIn("</think>", events)
+        # Reasoning text MUST NOT appear in output_text.* events (only in
+        # the dedicated reasoning_summary_text.delta events, which Codex
+        # handles separately from the user-visible message content).
+        reasoning_phrase = "The user wants me to inspect the repo."
+        for line in events.splitlines():
+            if not line.startswith("data:"):
+                continue
+            if reasoning_phrase not in line:
+                continue
+            # Any line containing the reasoning text must be a reasoning event.
+            self.assertTrue(
+                "reasoning" in line,
+                f"reasoning text leaked into a non-reasoning event: {line[:160]}",
+            )
 
     def test_stream_response_events_mark_truncated_tool_call_as_incomplete(self):
         server = self._make_server(FakeTruncatedToolCallServer)
@@ -711,10 +659,13 @@ class LocalApiServerTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("event: response.incomplete", events)
+        # Codex 0.122 treats `response.incomplete` as a terminal error, so we
+        # only emit `response.completed` with `incomplete_details` inline.
+        self.assertNotIn("event: response.incomplete", events)
         self.assertIn("event: response.completed", events)
         self.assertIn('"reason": "truncated_tool_call"', events)
-        self.assertIn('"status": "incomplete"', events)
+        # Note: `status` in the final payload is intentionally "completed" on
+        # the wire; the real state is surfaced via incomplete_details.
 
     def test_responses_endpoint_marks_truncated_tool_call_as_incomplete(self):
         server = self._make_server(FakeTruncatedToolCallServer)
@@ -748,6 +699,12 @@ class LocalApiServerTests(unittest.TestCase):
                 instructions=None,
                 max_output_tokens=128,
                 temperature=0.0,
+                top_p=None,
+                top_k=None,
+                min_p=None,
+                presence_penalty=None,
+                repetition_penalty=None,
+                frequency_penalty=None,
                 stream=False,
                 tools=None,
                 tool_choice=None,
@@ -758,6 +715,10 @@ class LocalApiServerTests(unittest.TestCase):
                 previous_response_id=None,
                 include=None,
                 reasoning=None,
+                text=None,
+                client_metadata=None,
+                metadata=None,
+                truncation=None,
                 keep_alive=None,
             )
         )
@@ -867,7 +828,12 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(server._tokenizer, "tokenizer-1")
         self.assertEqual(server._draft, "draft-1")
         load_mock.assert_called_once_with("model")
-        load_draft_mock.assert_called_once_with("draft", sliding_window_size=256, turboquant_bits=None)
+        load_draft_mock.assert_called_once_with(
+            "draft",
+            sliding_window_size=256,
+            turboquant_bits=None,
+            rotating_keep_tokens=0,
+        )
 
         server.unload()
         self.assertEqual(server.reset_loaded_state_calls, 1)
@@ -882,7 +848,12 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(server._tokenizer, "tokenizer-2")
         self.assertEqual(server._draft, "draft-2")
         load_mock.assert_called_once_with("model")
-        load_draft_mock.assert_called_once_with("draft", sliding_window_size=256, turboquant_bits=None)
+        load_draft_mock.assert_called_once_with(
+            "draft",
+            sliding_window_size=256,
+            turboquant_bits=None,
+            rotating_keep_tokens=0,
+        )
 
     def test_health_reports_loaded_state_without_preload(self):
         server = self._make_server(TrackingServer, keep_alive_seconds=300)
@@ -950,8 +921,14 @@ class LocalApiServerTests(unittest.TestCase):
         llamacpp_props = self._get_endpoint(server, "/v1/props")
         version = self._get_endpoint(server, "/version")
 
-        list_payload = list_models()
-        detail_payload = get_model(server.model_name)
+        import json as _json
+        list_response = list_models()
+        detail_response = get_model(server.model_name)
+        list_payload = _json.loads(list_response.body.decode("utf-8")) if hasattr(list_response, "body") else list_response
+        detail_payload = _json.loads(detail_response.body.decode("utf-8")) if hasattr(detail_response, "body") else detail_response
+        # ETag headers are what Codex uses to skip repeat model fetches
+        if hasattr(list_response, "headers"):
+            self.assertIn("X-Models-Etag", list_response.headers)
         lm_studio_payload = lm_studio_models()
         ollama_payload = ollama_tags()
         props_payload = llamacpp_props()

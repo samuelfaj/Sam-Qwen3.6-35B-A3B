@@ -47,14 +47,37 @@ ACTION_INTENT_MARKERS = (
     "eu devo",
     "vamos",
 )
-PROGRESS_EVENT_TYPES = {"step_start", "text", "tool_use", "step_finish"}
+PROGRESS_EVENT_TYPES = {"step_start", "text", "tool_use", "step_finish", "tool_result"}
 DEFAULT_STALL_TIMEOUT_SECONDS = 900
+DEFAULT_STALL_TIMEOUT_LONG_RUNNING_SECONDS = 1800
 DEFAULT_RESTART_DELAY_SECONDS = 5
 DEFAULT_MAX_RESTARTS = 12
 DEFAULT_LOOP_REPEAT_THRESHOLD = 3
 DEFAULT_RECENT_EVENT_LIMIT = 64
 DEFAULT_RECENT_TEXT_LIMIT = 8
 DEFAULT_RECENT_TOOL_LIMIT = 8
+DEFAULT_ALTERNATION_THRESHOLD = 6
+DEFAULT_TOOL_ERROR_REPEAT_THRESHOLD = 3
+HEARTBEAT_RELATIVE_PATH = ".agent-queue/heartbeat"
+LONG_RUNNING_COMMAND_TOKENS = (
+    "pytest",
+    "cargo",
+    "npm run",
+    "npm test",
+    "pnpm",
+    "yarn",
+    "bun test",
+    "bun run",
+    "mvn",
+    "gradle",
+    "go test",
+    "make",
+    "sleep",
+    "docker build",
+    "terraform apply",
+    "python -m unittest",
+    "python setup.py",
+)
 
 
 def _env_non_negative_int(name: str, default: int) -> int:
@@ -234,11 +257,45 @@ def _write_checkpoint(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _is_long_running_command(signature: str) -> bool:
+    lowered = signature.lower()
+    return any(token in lowered for token in LONG_RUNNING_COMMAND_TOKENS)
+
+
+def _touch_heartbeat_for_workdir(workdir: str) -> None:
+    if not workdir:
+        return
+    try:
+        path = Path(workdir) / HEARTBEAT_RELATIVE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _detect_alternation_loop(buffer: deque[str], threshold: int) -> bool:
+    if len(buffer) < threshold:
+        return False
+    items = list(buffer)[-threshold:]
+    # Look for strict ABAB... alternation between two distinct signatures.
+    if len(set(items)) != 2:
+        return False
+    a, b = items[0], items[1]
+    if a == b:
+        return False
+    for i, value in enumerate(items):
+        expected = a if i % 2 == 0 else b
+        if value != expected:
+            return False
+    return True
+
+
 def _handle_json_event(event: dict[str, Any], state: dict[str, Any]) -> str | None:
     event_type = str(event.get("type") or "")
     if event_type in PROGRESS_EVENT_TYPES:
         state["last_progress_at"] = time.time()
         state["last_progress_event"] = event_type
+        _touch_heartbeat_for_workdir(str(state.get("workdir") or ""))
 
     state["recent_events"].append(
         {
@@ -271,6 +328,34 @@ def _handle_json_event(event: dict[str, Any], state: dict[str, Any]) -> str | No
             state["last_tool_at"] = time.time()
             if _repeat_count(state["recent_tool_signatures_deque"]) >= state["loop_repeat_threshold"]:
                 return "repeated_tool_loop"
+            if _detect_alternation_loop(
+                state["recent_tool_signatures_deque"],
+                state["alternation_threshold"],
+            ):
+                return "tool_alternation_loop"
+            # Detect pending long-running command so stall timeout is extended.
+            if _is_long_running_command(signature):
+                state["pending_long_running_signature"] = signature
+                state["pending_long_running_at"] = time.time()
+
+    if event_type == "tool_result":
+        state["pending_long_running_signature"] = None
+        state["pending_long_running_at"] = 0.0
+        # Repeated-error detection: record (tool_sig, is_error) pair and fire
+        # when the same tool fails `tool_error_repeat_threshold` times in a row.
+        is_error = bool(part.get("error") or part.get("is_error"))
+        signature = _tool_signature(part) or str(state.get("last_tool_signature") or "")
+        err_key = f"{signature}|err={is_error}"
+        errors_deque = state["recent_tool_errors_deque"]
+        _append_recent(errors_deque, err_key, state["recent_tool_limit"])
+        if is_error:
+            errors_count = sum(
+                1
+                for entry in errors_deque
+                if entry == err_key
+            )
+            if errors_count >= state["tool_error_repeat_threshold"]:
+                return "repeated_tool_error"
 
     if event_type == "step_finish":
         state["last_step_reason"] = str(part.get("reason") or "")
@@ -326,7 +411,16 @@ def _monitor_attempt(
         except Empty:
             if process.poll() is not None and stdout_closed and stderr_closed:
                 break
-            if time.time() - float(state["last_progress_at"]) > state["stall_timeout_seconds"]:
+            pending_since = float(state.get("pending_long_running_at") or 0.0)
+            if pending_since > 0 and state.get("pending_long_running_signature"):
+                effective_stall = max(
+                    state["stall_timeout_seconds"],
+                    state.get("stall_timeout_long_running_seconds")
+                    or DEFAULT_STALL_TIMEOUT_LONG_RUNNING_SECONDS,
+                )
+            else:
+                effective_stall = state["stall_timeout_seconds"]
+            if time.time() - float(state["last_progress_at"]) > effective_stall:
                 loop_reason = "stall_timeout"
                 _kill_process_tree(process)
                 break
@@ -390,7 +484,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
     checkpoint_path = _build_checkpoint_path(checkpoint_dir, workdir, started_at)
 
     state: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "started_at": started_at,
         "updated_at": started_at,
         "workdir": workdir,
@@ -398,14 +492,18 @@ def run_watchdog(args: argparse.Namespace) -> int:
         "attempt": 0,
         "max_restarts": args.max_restarts,
         "stall_timeout_seconds": args.stall_timeout_seconds,
+        "stall_timeout_long_running_seconds": args.stall_timeout_long_running_seconds,
         "restart_delay_seconds": args.restart_delay_seconds,
         "loop_repeat_threshold": args.loop_repeat_threshold,
+        "alternation_threshold": args.alternation_threshold,
+        "tool_error_repeat_threshold": args.tool_error_repeat_threshold,
         "recent_event_limit": DEFAULT_RECENT_EVENT_LIMIT,
         "recent_text_limit": DEFAULT_RECENT_TEXT_LIMIT,
         "recent_tool_limit": DEFAULT_RECENT_TOOL_LIMIT,
         "recent_events": [],
         "recent_texts": [],
         "recent_tool_signatures": [],
+        "recent_tool_errors": [],
         "last_failure_reason": None,
         "last_resume_prompt": None,
         "last_progress_event": None,
@@ -420,9 +518,12 @@ def run_watchdog(args: argparse.Namespace) -> int:
         "active_pid": None,
         "completed": False,
         "base_run_args": list(args.run_args),
+        "pending_long_running_signature": None,
+        "pending_long_running_at": 0.0,
     }
     state["recent_texts_deque"] = deque(maxlen=DEFAULT_RECENT_TEXT_LIMIT)
     state["recent_tool_signatures_deque"] = deque(maxlen=DEFAULT_RECENT_TOOL_LIMIT)
+    state["recent_tool_errors_deque"] = deque(maxlen=DEFAULT_RECENT_TOOL_LIMIT)
     _write_checkpoint(checkpoint_path, state)
 
     exit_code = 1
@@ -476,6 +577,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_positive_int("LOCAL_DFLASH_OPENCODE_LOOP_REPEAT_THRESHOLD", DEFAULT_LOOP_REPEAT_THRESHOLD),
         help="Treat repeated identical text/tool events at or above this threshold as a loop.",
+    )
+    parser.add_argument(
+        "--stall-timeout-long-running-seconds",
+        type=int,
+        default=_env_positive_int(
+            "LOCAL_DFLASH_OPENCODE_STALL_TIMEOUT_LONG_RUNNING_SECONDS",
+            DEFAULT_STALL_TIMEOUT_LONG_RUNNING_SECONDS,
+        ),
+        help=(
+            "Stall timeout to use when a tool_use for a long-running command "
+            "(pytest/cargo/npm/build/sleep/etc.) is pending without a tool_result yet."
+        ),
+    )
+    parser.add_argument(
+        "--alternation-threshold",
+        type=int,
+        default=_env_positive_int(
+            "LOCAL_DFLASH_OPENCODE_ALTERNATION_THRESHOLD",
+            DEFAULT_ALTERNATION_THRESHOLD,
+        ),
+        help="Number of ABAB tool-call alternations before firing an alternation-loop restart.",
+    )
+    parser.add_argument(
+        "--tool-error-repeat-threshold",
+        type=int,
+        default=_env_positive_int(
+            "LOCAL_DFLASH_OPENCODE_TOOL_ERROR_REPEAT_THRESHOLD",
+            DEFAULT_TOOL_ERROR_REPEAT_THRESHOLD,
+        ),
+        help="Same tool erroring this many times in a row is treated as a loop.",
     )
     parser.add_argument("run_args", nargs=argparse.REMAINDER, help="Arguments forwarded to 'opencode run'.")
     return parser
