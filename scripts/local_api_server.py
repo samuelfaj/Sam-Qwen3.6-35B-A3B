@@ -168,6 +168,13 @@ RESPONSES_ACTION_PROMPT = (
     "Only produce a final text answer if no tool call is possible. "
     "Do not stop after announcing what you will do next.]"
 )
+RESPONSES_EMPTY_OUTPUT_PROMPT = (
+    "[System: Your previous response was empty or too short to be actionable. "
+    "The task is not complete. Continue the agentic workflow now. "
+    "If work remains, call the appropriate tool immediately. "
+    "If you need context, inspect files or run commands. "
+    "Do not emit an empty response, a single token, or a final answer unless the task is actually complete.]"
+)
 PLANNING_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "update_plan",
@@ -1145,6 +1152,23 @@ def _response_is_followup_candidate(
         return False
 
     return True
+
+
+def _response_needs_empty_output_followup(
+    result: dict[str, Any],
+    output_items: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> bool:
+    if not tools:
+        return False
+    response_status, _ = _response_completion_state(result)
+    if response_status != "completed":
+        return False
+    if any(item.get("type") in {"function_call", "custom_tool_call"} for item in output_items):
+        return False
+    assistant_text = _output_text_from_items(output_items).strip()
+    generated_tokens = int(result.get("generated_tokens", 0) or 0)
+    return generated_tokens <= 2 or len(assistant_text) <= 2
 
 
 def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
@@ -2999,6 +3023,16 @@ class LocalModelServer:
             )
             output_items = _build_output_items(result["text"])
             output_items = _convert_items_for_custom_tools(output_items, tools)
+            if _response_needs_empty_output_followup(result, output_items, tools):
+                current_messages = [
+                    *current_messages,
+                    {
+                        "role": "user",
+                        "content": RESPONSES_EMPTY_OUTPUT_PROMPT,
+                    },
+                ]
+                current_previous_response_id = None
+                continue
             if not _response_is_followup_candidate(result, output_items, tools):
                 return result, output_items
             if remaining_max_tokens <= 0:

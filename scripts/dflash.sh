@@ -138,6 +138,28 @@ cmd_restart() {
   cmd_start "$@"
 }
 
+apply_profile_114() {
+  export LOCAL_DFLASH_BLOCK_SIZE=8
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE=1
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN=4
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MAX=12
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_THRESHOLD=0.95
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_THRESHOLD=0.65
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_STEP=1
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_STEP=2
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_GROW_STREAK=2
+  export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_SHRINK_STREAK=1
+  export LOCAL_DFLASH_DEFAULT_TEMPERATURE=0.6
+  export LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS=0.3
+  export LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS=0
+  export LOCAL_DFLASH_KEEP_ALIVE=60
+}
+
+cmd_restart_114() {
+  apply_profile_114
+  cmd_restart "$@"
+}
+
 cmd_logs() {
   if [[ ! -f "${LOG_FILE}" ]]; then
     echo "dflash: no log file at ${LOG_FILE}"
@@ -716,6 +738,8 @@ server commands:
   start     start the server in background, wait for /health (up to 120s)
   stop      graceful SIGTERM, wait up to 30s
   restart   stop then start
+  restart-114
+            restart with the profile that produced the 114 tok/s spike
   status    check running process and /health
   kill      SIGKILL the process group, clear port squatters
   logs      tail -f ${LOG_FILE}
@@ -760,6 +784,7 @@ main() {
     start)             cmd_start "$@" ;;
     stop)              cmd_stop ;;
     restart)           cmd_restart "$@" ;;
+    restart-114)       cmd_restart_114 "$@" ;;
     status)            cmd_status ;;
     kill)              cmd_kill ;;
     logs)              cmd_logs ;;
