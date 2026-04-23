@@ -144,15 +144,16 @@ http://127.0.0.1:8010
 - Thinking mode: disabled
 - TurboQuant target KV: `3.5`
 - TurboQuant draft KV: `3.5`
-- MLX memory limit: `36 GiB`
-- MLX allocator cache limit: `10 GiB`
-- MLX wired limit: `24 GiB`
-- Keep-alive: `120s`
+- MLX memory limit: `32 GiB`
+- MLX allocator cache limit: `4 GiB`
+- MLX clear-cache threshold: `0.7`
+- Keep-alive: `60s`
 - Stream heartbeat: `10s`
 - Preload on startup: disabled
-- Response history limit: `16`
-- Response prefix cache limit: `8`
-- Global prefix cache limit: `4` (byte cap `8 GiB`)
+- Response history limit: `4`
+- Response prefix cache limit: `2`
+- Global prefix cache limit: `2` (byte cap `4 GiB`)
+- Stable prefix tokens byte cap: `2 GiB`
 
 ### Main API Service Helper
 
@@ -433,18 +434,19 @@ export LOCAL_DFLASH_DISABLE_THINKING=1
 export LOCAL_DFLASH_MAX_TOKENS=4096
 export LOCAL_DFLASH_CONTEXT_RESERVE=256
 export LOCAL_DFLASH_CONTEXT_WINDOW=98304
-export LOCAL_DFLASH_KEEP_ALIVE=120
+export LOCAL_DFLASH_KEEP_ALIVE=60
 export LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS=10
 export LOCAL_DFLASH_TURBOQUANT_BITS=3.5
 export LOCAL_DFLASH_DRAFT_TURBOQUANT_BITS=3.5
-export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=36
-export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=10
-export LOCAL_DFLASH_MLX_WIRED_LIMIT_GB=24
+export LOCAL_DFLASH_MLX_MEMORY_LIMIT_GB=32
+export LOCAL_DFLASH_MLX_CACHE_LIMIT_GB=4
+export LOCAL_DFLASH_MLX_CLEAR_CACHE_THRESHOLD=0.7
 export LOCAL_DFLASH_NO_PRELOAD=1
-export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=16
-export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=8
-export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=4
-export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB=8
+export LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT=4
+export LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT=2
+export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT=2
+export LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_BYTE_LIMIT_GB=4
+export LOCAL_DFLASH_STABLE_PREFIX_TOKENS_BYTE_LIMIT_GB=2
 ```
 
 Distill API launcher defaults from `scripts/start_distill_wrapper.sh`:
