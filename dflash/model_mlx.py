@@ -100,6 +100,14 @@ class _StableTurboQuantKVCache:
     def __init__(self, inner: Any):
         self._inner = inner
 
+    @property
+    def offset(self):
+        return self._inner.offset
+
+    @offset.setter
+    def offset(self, value):
+        self._inner.offset = int(value)
+
     def update_and_fetch(self, keys, values):
         deq_keys, deq_values = self._inner.update_and_fetch(keys, values)
         return deq_keys.astype(keys.dtype), deq_values.astype(values.dtype)
@@ -135,7 +143,15 @@ class _StableRotatingTurboQuantKVCache(_StableTurboQuantKVCache):
         super().__init__(inner)
         self.max_size = max_size
         self.keep = keep
-        self.offset = 0
+        self._offset = 0
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @offset.setter
+    def offset(self, value):
+        self._offset = int(value)
 
     def _trim_return(self, trim_size: int, value: mx.array) -> mx.array:
         if trim_size <= 0:
@@ -166,7 +182,7 @@ class _StableRotatingTurboQuantKVCache(_StableTurboQuantKVCache):
         copied._inner = copy.deepcopy(self._inner, memo)
         copied.max_size = self.max_size
         copied.keep = self.keep
-        copied.offset = self.offset
+        copied._offset = self._offset
         return copied
 
 

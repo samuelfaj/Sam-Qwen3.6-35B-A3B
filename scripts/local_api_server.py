@@ -2159,7 +2159,23 @@ class LocalModelServer:
             "prefix_cache_source": result.get("prefix_cache_source", "none"),
             "engine": result.get("engine", self.generation_engine),
             "ddtree_commit": result.get("ddtree_commit"),
+            "tree_budget": int(result.get("tree_budget", 0) or 0),
+            "target_turboquant_bits": float(result.get("target_turboquant_bits", 0.0) or 0.0),
+            "ddtree_fast_path_ratio": float(result.get("ddtree_fast_path_ratio", 0.0) or 0.0),
+            "avg_tree_node_count": float(result.get("avg_tree_node_count", 0.0) or 0.0),
+            "max_tree_node_count": int(result.get("max_tree_node_count", 0) or 0),
         }
+        phase_timings = result.get("ddtree_phase_timings_us") or {}
+        if isinstance(phase_timings, dict):
+            phase_total = 0.0
+            for key, value in phase_timings.items():
+                try:
+                    numeric = float(value or 0.0)
+                except Exception:
+                    numeric = 0.0
+                metrics[f"ddtree_phase_{key}_us"] = numeric
+                phase_total += numeric
+            metrics["ddtree_phase_total_us"] = phase_total
         block_size_history = result.get("block_size_history") or []
         if block_size_history:
             metrics["final_block_size"] = int(block_size_history[-1])
@@ -2745,6 +2761,8 @@ class LocalModelServer:
         messages: list[dict[str, Any]],
         requested_max_tokens: int,
         tools: list[dict[str, Any]] | None = None,
+        previous_response_id: str | None = None,
+        capture_prompt_cache_state: bool = False,
     ) -> tuple[dict[str, Any], int, float]:
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
@@ -2752,6 +2770,14 @@ class LocalModelServer:
         prompt_tokens = len(prompt_tokens_list)
         max_tokens = self._effective_max_tokens(requested_max_tokens, prompt_tokens)
         started = time.time()
+        stable_prefix_key = self._stable_prefix_key(messages, tools=tools)
+        stable_prefix_tokens = self._stable_prefix_tokens_locked(messages, tools=tools)
+        capture_prefill_state = capture_prompt_cache_state and self._should_capture_prompt_cache_state(stable_prefix_tokens)
+        prefix_state, prefix_cache_source = self._select_prefix_state_locked(
+            prompt_tokens_list,
+            previous_response_id,
+            stable_prefix_key,
+        )
 
         target_turboquant_bits = (
             None if self._ddtree_target_turboquant_failed else self.ddtree_target_turboquant_bits
@@ -2772,22 +2798,30 @@ class LocalModelServer:
                     tree_budget=self.ddtree_tree_budget,
                     block_size=self.block_size,
                     adaptive_block_size=self.adaptive_block_size_config,
+                    prefix_state=prefix_state,
+                    capture_prefill_state=capture_prefill_state,
                     target_turboquant_bits=target_turboquant_bits,
                 )
                 result.update(
                     {
                         "engine": engine_name,
                         "prompt_tokens": prompt_tokens,
-                        "prefix_cache_source": "none",
-                        "prefill_hidden_bytes": 0,
-                        "prefill_target_cache_bytes": 0,
-                        "prefill_logits_bytes": 0,
-                        "prefill_working_set_bytes": 0,
-                        "prompt_cache_state_bytes": 0,
-                        "prompt_cache_state": None,
+                        "prefix_cache_source": prefix_cache_source,
+                        "prefill_hidden_bytes": int(result.get("prefill_hidden_bytes", 0) or 0),
+                        "prefill_target_cache_bytes": int(result.get("prefill_target_cache_bytes", 0) or 0),
+                        "prefill_logits_bytes": int(result.get("prefill_logits_bytes", 0) or 0),
+                        "prefill_working_set_bytes": int(result.get("prefill_working_set_bytes", 0) or 0),
+                        "prompt_cache_state_bytes": int(result.get("prompt_cache_state_bytes", 0) or 0),
+                        "prompt_cache_state": result.get("prompt_cache_state") if capture_prefill_state else None,
                         "elapsed": time.time() - started,
                     }
                 )
+                if stable_prefix_tokens and result.get("prompt_cache_state") is not None:
+                    self._remember_global_prefix_state_locked(
+                        stable_prefix_key,
+                        stable_prefix_tokens,
+                        result.get("prompt_cache_state"),
+                    )
                 return result, prompt_tokens, started
             except Exception as exc:
                 last_error = exc
@@ -2823,12 +2857,21 @@ class LocalModelServer:
             block_size_history=tuple(result.get("block_size_history", ()) or ()),
             adaptive_block_size=False,
             finish_reason=str(result.get("finish_reason", "stop")),
-            prefill_state=None,
+            prefill_state=result.get("prompt_cache_state"),
         )
         response.extra_result_fields = {
             key: value
             for key, value in result.items()
-            if key.startswith("ddtree_") or key in {"engine", "tree_budget", "target_turboquant_bits"}
+            if key.startswith("ddtree_")
+            or key
+            in {
+                "engine",
+                "tree_budget",
+                "target_turboquant_bits",
+                "tree_node_count_history",
+                "avg_tree_node_count",
+                "max_tree_node_count",
+            }
         }
         return response
 
@@ -2851,6 +2894,8 @@ class LocalModelServer:
                     messages,
                     requested_max_tokens,
                     tools=tools,
+                    previous_response_id=previous_response_id,
+                    capture_prompt_cache_state=capture_prompt_cache_state,
                 )
                 return [str(result.get("text", ""))], result
             except Exception:
@@ -2958,6 +3003,8 @@ class LocalModelServer:
                     messages,
                     requested_max_tokens,
                     tools=tools,
+                    previous_response_id=previous_response_id,
+                    capture_prompt_cache_state=capture_prompt_cache_state,
                 )
                 return (
                     iter((self._ddtree_result_to_response(result),)),
@@ -2965,7 +3012,7 @@ class LocalModelServer:
                     started,
                     None,
                     (),
-                    "none",
+                    result.get("prefix_cache_source", "none"),
                 )
             except Exception:
                 if not self.ddtree_fallback_to_dflash:
