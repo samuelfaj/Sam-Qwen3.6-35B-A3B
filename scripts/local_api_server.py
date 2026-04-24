@@ -150,6 +150,7 @@ PREFIX_CACHE_STATE_BYTE_LIMIT = _env_non_negative_int(
 GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 1)
 MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 2)
+ALLOW_APPLY_PATCH_TOOL = _env_bool("LOCAL_DFLASH_ALLOW_APPLY_PATCH_TOOL", False)
 RESPONSES_CONTINUE_PROMPT = (
     "[System: Continue the previous incomplete response now. "
     "Do not repeat prior acknowledgements, summaries, or bullet lists. "
@@ -159,16 +160,33 @@ RESPONSES_CONTINUE_PROMPT = (
 RESPONSES_TOOL_RESULT_PROMPT = (
     "[System: The previous tool call already completed and its result is available above. "
     "Use that result to continue. "
-    "Do not immediately repeat the exact same tool call with identical arguments unless the tool output "
-    "explicitly shows a failure, truncation, or asks for a retry.]"
+    "Do not immediately repeat the exact same tool call with identical arguments. "
+    "If the tool output shows a failure, read the error and choose a different corrective action. "
+    "If a scaffold command reports Operation cancelled because the target already exists, inspect the "
+    "existing files and continue from them instead of running the scaffold command again. "
+    "If a dev-server command such as npm run dev, vite, or next dev times out after printing a ready/local URL, "
+    "treat the server startup as verified; do not retry it, and continue with build/check or final. "
+    "After tests pass for a generated app, still run npm run build before final.]"
+)
+CHAT_TOOL_RESULT_PROMPT = (
+    "[System: The previous tool call already completed and its result is available above. "
+    "Use that result to continue. Do not immediately repeat the exact same tool call or shell command with identical arguments. "
+    "If a file write command succeeded, move to the next different required file, package script, test, build, or verification step. "
+    "If the user asked for tests, create test files, add a finite test script such as vitest run, and run it. "
+    "After tests pass for a generated app, still run npm run build before final. "
+    "If a command fails, read the error and choose a different corrective action.]"
 )
 RESPONSES_ACTION_PROMPT = (
     "[System: You just stated the next action but did not execute it. "
     "Do not repeat or re-emit the plan; do not call update_plan again on this turn. "
-    "If files need to change, call apply_patch now. "
-    "If a command must run, call shell now. "
+    "If files need to change, use an available editing-capable tool or shell command now. "
+    "If a command must run, call the available shell tool now. "
     "Only produce a final text answer if no tool call is possible. "
-    "Do not stop after announcing what you will do next.]"
+    "Do not stop after announcing what you will do next. "
+    "For generated apps, do not finish until you have run the relevant build/check command or identified a real blocker. "
+    "Prefer finite commands such as npm run build or npm test -- --run over long-running dev servers such as npm run dev. "
+    "For Vitest projects, use npm test -- --run or npx vitest run; do not run bare npm test because it can enter watch mode. "
+    "If tests passed but npm run build has not run yet, run npm run build next.]"
 )
 RESPONSES_EMPTY_OUTPUT_PROMPT = (
     "[System: Your previous response was empty or too short to be actionable. "
@@ -223,11 +241,20 @@ TOOL_CALLING_RULES_PROMPT = (
     "- Do NOT omit the opening <tool_call> tag, even after prose.\n"
     "- You MAY write one short reasoning line BEFORE a tool call, but NEVER after announcing an action without executing it.\n"
     "- NEVER say \"I will now <do X>\" or \"Next, I'll call <tool>\" without emitting the <tool_call> in the same turn.\n"
-    "- If you have already emitted a plan via update_plan this turn, do NOT re-emit it; proceed directly to apply_patch / shell / container.exec.\n"
+    "- If you have already emitted a plan via update_plan this turn, do NOT re-emit it; proceed directly to an available file-editing or shell tool.\n"
+    "- Use the <cwd> from environment_context as the project root for shell workdir and file paths. Never create or edit user projects under CODEX_HOME, /tmp/codex-local-dflash, /private/tmp/codex-local-dflash, plugin directories, or skill directories unless the user explicitly asks.\n"
     "- Required parameters MUST be present. Do not emit tool calls with \"arguments\": {} unless the schema has zero required fields.\n"
     "- When a prior tool_response is available, USE IT. Do not re-issue the identical call with the same arguments.\n"
+    "- When a command fails, read the error and change strategy; do not retry the same failing command unchanged.\n"
+    "- If a project scaffold command reports Operation cancelled because the target exists, inspect and modify the existing project instead of scaffolding again.\n"
+    "- For buildable apps, run the relevant build/check command before the final answer unless a real blocker prevents it.\n"
+    "- Do not use long-running dev servers such as npm run dev, vite, or next dev as the final verification step; prefer finite build/check/test commands.\n"
+    "- For Vitest projects, run npm test -- --run or npx vitest run. Do not run bare npm test because it can enter watch mode.\n"
     "- Produce a final natural-language answer ONLY when no tool is applicable or the user's task is fully complete.\n"
     "- Decide and act in the same turn."
+)
+TOOL_CALLING_RULES_APPLY_PATCH_PROMPT = (
+    "\n- The apply_patch tool is available. Use it for precise repository file edits when appropriate."
 )
 TOOL_CALLING_RULES_ENABLED = _env_bool("LOCAL_DFLASH_TOOL_CALLING_RULES", True)
 
@@ -1173,6 +1200,94 @@ def _response_needs_empty_output_followup(
     return generated_tokens <= 2 or len(assistant_text) <= 2
 
 
+def _assistant_text_promises_action(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if not normalized:
+        return False
+
+    promise_patterns = (
+        r"\blet me\b",
+        r"\bi(?:'ll| will)\b",
+        r"\bi(?:'m| am) going to\b",
+        r"\bi need to\b",
+        r"\bnow i(?:'ll| will)\b",
+        r"\bnext i(?:'ll| will)\b",
+        r"\bvou\b",
+        r"\bvou agora\b",
+        r"\bdeixe-me\b",
+        r"\bagora vou\b",
+    )
+    if not any(re.search(pattern, normalized) for pattern in promise_patterns):
+        return False
+
+    action_patterns = (
+        r"\b(add|build|building|check|create|edit|explore|fix|implement|inspect|install|modify|read|run|start|test|update|verify|write)\b",
+        r"\b(criar|editar|executar|implementar|instalar|ler|modificar|rodar|verificar)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in action_patterns)
+
+
+def _chat_result_needs_action_followup(
+    result: dict[str, Any],
+    tools: list[dict[str, Any]] | None,
+    messages: list[dict[str, Any]] | None = None,
+) -> bool:
+    if not tools:
+        return False
+    if str(result.get("finish_reason") or "").strip() != "stop":
+        return False
+    visible_text, tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
+    if tool_calls:
+        return False
+    return _assistant_text_promises_action(
+        visible_text
+    ) or _task_history_requires_completion_followup(messages or [], visible_text)
+
+
+def _task_history_requires_completion_followup(
+    messages: list[dict[str, Any]],
+    assistant_text: str,
+) -> bool:
+    last_user_text = _last_user_message_text(messages).lower()
+    if not last_user_text:
+        return False
+    blob = (
+        json.dumps(messages, ensure_ascii=False, default=str)
+        + "\n"
+        + assistant_text
+    ).lower()
+    wants_buildable_app = any(
+        marker in last_user_text
+        for marker in ("react", "vite", "typescript", "app", "game")
+    )
+    if wants_buildable_app and not any(
+        marker in blob for marker in ("npm run build", "vite build")
+    ):
+        return True
+    wants_tests = "test" in last_user_text
+    if wants_tests and not any(
+        marker in blob
+        for marker in ("vitest run", "npm test -- --run", "npm run test -- --run")
+    ):
+        return True
+    return False
+
+
+def _massage_chat_tool_result_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    last = messages[-1]
+    if str(last.get("role") or "").lower() != "tool":
+        return messages
+    return [
+        *messages,
+        {
+            "role": "user",
+            "content": CHAT_TOOL_RESULT_PROMPT,
+        },
+    ]
+
+
 def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -1198,6 +1313,59 @@ def _summarize_tool_names(tools: list[dict[str, Any]] | None) -> str:
         if candidate:
             names.append(str(candidate))
     return ", ".join(names) if names else "(none)"
+
+
+def _tool_name(tool: Any) -> str | None:
+    if not isinstance(tool, dict):
+        return None
+    candidate = tool.get("name")
+    if not candidate:
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            candidate = fn.get("name")
+    return str(candidate) if candidate else None
+
+
+def _available_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    if not tools:
+        return set()
+    names: set[str] = set()
+    for tool in tools:
+        candidate = _tool_name(tool)
+        if candidate:
+            names.add(candidate)
+    return names
+
+
+def _filter_disabled_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if ALLOW_APPLY_PATCH_TOOL:
+        return tools
+    return [tool for tool in tools if _tool_name(tool) != "apply_patch"]
+
+
+def _filter_disabled_tool_calls(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if ALLOW_APPLY_PATCH_TOOL:
+        return items
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("type") in {"function_call", "custom_tool_call"} and item.get("name") == "apply_patch":
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _tool_calling_rules_prompt(tools: list[dict[str, Any]] | None) -> str:
+    prompt = TOOL_CALLING_RULES_PROMPT
+    if "apply_patch" in _available_tool_names(tools):
+        prompt += TOOL_CALLING_RULES_APPLY_PATCH_PROMPT
+    return prompt
+
+
+def _responses_action_prompt(tools: list[dict[str, Any]] | None) -> str:
+    prompt = RESPONSES_ACTION_PROMPT
+    if "apply_patch" in _available_tool_names(tools):
+        prompt += " [System: The apply_patch tool is available for precise file edits.]"
+    return prompt
 
 
 def _first_encoded_token_id(tokenizer: Any, text: str) -> int | None:
@@ -1275,6 +1443,7 @@ def _make_reasoning_item(summary_text: str) -> dict[str, Any]:
 def _build_output_items(full_text: str) -> list[dict[str, Any]]:
     reasoning_text, visible_text = _strip_reasoning_blocks(full_text)
     assistant_text, tool_calls = _parse_tool_calls(visible_text)
+    tool_calls = _filter_disabled_tool_calls(tool_calls)
     deduped_tool_calls: list[dict[str, Any]] = []
     previous_signature: tuple[str, str] | None = None
     for tool_call in tool_calls:
@@ -1907,7 +2076,7 @@ def _anthropic_heartbeat_line() -> str:
 
 def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     messages: list[dict[str, Any]] = []
-    tools = req.tools or []
+    tools = _filter_disabled_tools(req.tools or [])
     system_parts: list[str] = []
 
     if req.instructions:
@@ -1918,7 +2087,7 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
     # failure mode in agentic Codex runs. Opt out via
     # LOCAL_DFLASH_TOOL_CALLING_RULES=0 for diagnostics.
     if tools and TOOL_CALLING_RULES_ENABLED:
-        system_parts.append(TOOL_CALLING_RULES_PROMPT)
+        system_parts.append(_tool_calling_rules_prompt(tools))
 
     if isinstance(req.input, str):
         messages.append({"role": "user", "content": req.input})
@@ -3166,15 +3335,39 @@ class LocalModelServer:
         sampling = _coerce_sampling_arg(sampling, temperature)
         generation_ticket = self._acquire_generation_turn()
         try:
+            current_messages = list(messages)
+            remaining_max_tokens = max_tokens
+            result: dict[str, Any] | None = None
             with self._lock:
-                _, result = self._generate_locked(
-                    messages,
-                    max_tokens,
-                    sampling,
-                    tools=tools,
-                    previous_response_id=previous_response_id,
-                    capture_prompt_cache_state=capture_prompt_cache_state,
-                )
+                for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
+                    _, result = self._generate_locked(
+                        current_messages,
+                        remaining_max_tokens,
+                        sampling,
+                        tools=tools,
+                        previous_response_id=previous_response_id,
+                        capture_prompt_cache_state=capture_prompt_cache_state,
+                    )
+                    remaining_max_tokens = max(
+                        0,
+                        remaining_max_tokens - max(0, int(result.get("generated_tokens", 0))),
+                    )
+                    previous_response_id = None
+                    if (
+                        remaining_max_tokens <= 0
+                        or not _chat_result_needs_action_followup(
+                            result, tools, current_messages
+                        )
+                    ):
+                        break
+                    visible_text, _ = _parse_tool_calls(_coerce_text(result.get("text", "")))
+                    current_messages = [
+                        *current_messages,
+                        {"role": "assistant", "content": visible_text},
+                        {"role": "user", "content": _responses_action_prompt(tools)},
+                    ]
+            if result is None:
+                raise RuntimeError("Model returned no output")
             self._record_generation_metrics(result, surface="generate")
             return result
         finally:
@@ -3238,9 +3431,17 @@ class LocalModelServer:
                 return result, output_items
 
             assistant_text = _output_text_from_items(output_items).strip()
-            if not self._judge_response_needs_followup(
-                current_messages, assistant_text, tools
+            if _assistant_text_promises_action(assistant_text):
+                need_followup = True
+            elif _task_history_requires_completion_followup(
+                current_messages, assistant_text
             ):
+                need_followup = True
+            else:
+                need_followup = self._judge_response_needs_followup(
+                    current_messages, assistant_text, tools
+                )
+            if not need_followup:
                 return result, output_items
 
             carry_items = [
@@ -3253,7 +3454,7 @@ class LocalModelServer:
                 *_messages_from_output_items(carry_items),
                 {
                     "role": "user",
-                    "content": RESPONSES_ACTION_PROMPT,
+                    "content": _responses_action_prompt(tools),
                 },
             ]
             current_previous_response_id = None
@@ -3491,6 +3692,7 @@ class LocalModelServer:
         messages: list[dict[str, Any]],
         max_tokens: int,
         sampling: "SamplingParams | float | None" = None,
+        tools: list[dict[str, Any]] | None = None,
         keep_alive_override: Any = None,
         *,
         temperature: float | None = None,
@@ -3503,7 +3705,7 @@ class LocalModelServer:
         stop_event = _Event()
         worker = Thread(
             target=self._generation_worker,
-            args=(event_queue, messages, max_tokens, sampling, None, keep_alive_override, None, False, stop_event),
+            args=(event_queue, messages, max_tokens, sampling, tools, keep_alive_override, None, False, stop_event),
             daemon=True,
         )
         worker.start()
@@ -4612,7 +4814,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: OpenAIChatRequest) -> dict[str, Any]:
-        has_tools = bool(req.tools)
+        tools = _filter_disabled_tools(req.tools or [])
+        has_tools = bool(tools)
         sampling = SamplingParams.for_request(
             temperature=req.temperature,
             top_p=req.top_p,
@@ -4627,11 +4830,15 @@ def create_app(server: LocalModelServer) -> FastAPI:
             if req.model != server.model_name:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
             max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
+            chat_messages = _massage_chat_tool_result_messages(
+                [m.model_dump() for m in req.messages]
+            )
             return StreamingResponse(
                 server.stream_chat_completions(
-                    [m.model_dump() for m in req.messages],
+                    chat_messages,
                     max_tokens,
                     sampling,
+                    tools=tools,
                     keep_alive_override=req.keep_alive,
                 ),
                 media_type="text/event-stream",
@@ -4645,11 +4852,15 @@ def create_app(server: LocalModelServer) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
         max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
+        chat_messages = _massage_chat_tool_result_messages(
+            [m.model_dump() for m in req.messages]
+        )
         try:
             result = server.generate(
-                [m.model_dump() for m in req.messages],
+                chat_messages,
                 max_tokens,
                 sampling,
+                tools=tools,
                 keep_alive_override=req.keep_alive,
             )
         except PromptTooLargeError as exc:

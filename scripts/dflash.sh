@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PID_FILE="${REPO_ROOT}/.dflash.pid"
+FINGERPRINT_FILE="${REPO_ROOT}/.dflash.fingerprint"
 LOG_FILE="${REPO_ROOT}/dflash.log"
 PORT="${LOCAL_DFLASH_PORT:-8010}"
 HOST="${LOCAL_DFLASH_HOST:-127.0.0.1}"
@@ -21,6 +22,25 @@ get_running_pid() {
     rm -f "${PID_FILE}"
   fi
   { lsof -ti:"${PORT}" -sTCP:LISTEN 2>/dev/null || true; } | head -1 || true
+}
+
+server_fingerprint() {
+  (
+    cksum \
+      "${SCRIPT_DIR}/dflash.sh" \
+      "${SCRIPT_DIR}/start_local_wrapper.sh" \
+      "${SCRIPT_DIR}/run_codex_local.sh" \
+      "${SCRIPT_DIR}/run_opencode_local.sh" \
+      "${SCRIPT_DIR}/local_api_server.py" 2>/dev/null || true
+  ) | cksum | awk '{print $1 ":" $2}'
+}
+
+server_fingerprint_matches() {
+  [[ -f "${FINGERPRINT_FILE}" ]] || return 1
+  local current stored
+  current="$(server_fingerprint)"
+  stored="$(cat "${FINGERPRINT_FILE}" 2>/dev/null || true)"
+  [[ -n "${current}" && "${current}" == "${stored}" ]]
 }
 
 kill_tree() {
@@ -52,22 +72,47 @@ cmd_status() {
 }
 
 cmd_start() {
+  prepare_profile_114_args "$@"
+  if ((${#DFLASH_PROFILE_114_PASSTHROUGH[@]})); then
+    set -- "${DFLASH_PROFILE_114_PASSTHROUGH[@]}"
+  else
+    set --
+  fi
+
   local pid
+  pid="$(get_running_pid)"
+  if [[ -n "${pid}" ]]; then
+    if ! server_fingerprint_matches; then
+      echo "dflash: running server is stale; restarting (pid ${pid})"
+      kill_tree "${pid}" TERM
+      local waited=0
+      while (( waited < 30 )); do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+      done
+      if kill -0 "${pid}" 2>/dev/null; then
+        echo "dflash: stale server still alive; force-killing pid ${pid}"
+        kill_tree "${pid}" KILL
+      fi
+      rm -f "${PID_FILE}" "${FINGERPRINT_FILE}"
+    else
+      echo "dflash: already running (pid ${pid})"
+      return 0
+    fi
+  fi
   pid="$(get_running_pid)"
   if [[ -n "${pid}" ]]; then
     echo "dflash: already running (pid ${pid})"
     return 0
   fi
   echo "dflash: starting, logging to ${LOG_FILE}"
-  local caffeinate_wrap=()
-  if [[ "${DFLASH_NO_CAFFEINATE:-0}" != "1" ]] && command -v caffeinate >/dev/null 2>&1; then
-    # -d prevent display sleep, -i prevent idle sleep, -m prevent disk sleep,
-    # -s prevent system sleep on AC, -u declare user activity.
-    caffeinate_wrap=(caffeinate -dimsu)
-  fi
-  nohup "${caffeinate_wrap[@]}" "${SCRIPT_DIR}/start_local_wrapper_supervised.sh" "$@" >"${LOG_FILE}" 2>&1 &
+  nohup env DFLASH_NO_CAFFEINATE=1 "${SCRIPT_DIR}/start_local_wrapper.sh" "$@" >"${LOG_FILE}" 2>&1 &
   local new_pid=$!
   echo "${new_pid}" > "${PID_FILE}"
+  server_fingerprint > "${FINGERPRINT_FILE}"
   disown "${new_pid}" 2>/dev/null || true
   echo "dflash: pid ${new_pid}"
   local waited=0
@@ -78,7 +123,7 @@ cmd_start() {
     fi
     if ! kill -0 "${new_pid}" 2>/dev/null; then
       echo "dflash: process died during startup; see ${LOG_FILE}"
-      rm -f "${PID_FILE}"
+      rm -f "${PID_FILE}" "${FINGERPRINT_FILE}"
       return 1
     fi
     sleep 1
@@ -101,7 +146,7 @@ cmd_stop() {
   local waited=0
   while (( waited < 30 )); do
     if ! kill -0 "${pid}" 2>/dev/null; then
-      rm -f "${PID_FILE}"
+      rm -f "${PID_FILE}" "${FINGERPRINT_FILE}"
       echo "dflash: stopped"
       return 0
     fi
@@ -122,7 +167,7 @@ cmd_kill() {
   fi
   echo "dflash: force-killing pid ${pid} (SIGKILL)"
   kill_tree "${pid}" KILL
-  rm -f "${PID_FILE}"
+  rm -f "${PID_FILE}" "${FINGERPRINT_FILE}"
   local stragglers
   stragglers="$(lsof -ti:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
   if [[ -n "${stragglers}" ]]; then
@@ -158,11 +203,89 @@ apply_profile_114() {
   export LOCAL_DFLASH_DEFAULT_TEMPERATURE=0.6
   export LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS=0.3
   export LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS=0
+  export LOCAL_DFLASH_DISABLE_THINKING=0
+  export LOCAL_DFLASH_CONTEXT_WINDOW=32768
+  export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=32768
   export LOCAL_DFLASH_KEEP_ALIVE=60
 }
 
-cmd_restart_114() {
+prepare_profile_114_args() {
+  local thinking=true
+  local context=32k
+  local passthrough=()
+
+  while (($#)); do
+    case "$1" in
+      --thinking=*)
+        thinking="${1#*=}"
+        ;;
+      --thinking)
+        if [[ $# -lt 2 ]]; then
+          echo "dflash: --thinking requires true or false" >&2
+          return 2
+        fi
+        shift
+        thinking="$1"
+        ;;
+      --context=*)
+        context="${1#*=}"
+        ;;
+      --context)
+        if [[ $# -lt 2 ]]; then
+          echo "dflash: --context requires 32k or 64k" >&2
+          return 2
+        fi
+        shift
+        context="$1"
+        ;;
+      *)
+        passthrough+=("$1")
+        ;;
+    esac
+    shift
+  done
+
   apply_profile_114
+
+  local thinking_normalized context_normalized
+  thinking_normalized="$(printf '%s' "${thinking}" | tr '[:upper:]' '[:lower:]')"
+  context_normalized="$(printf '%s' "${context}" | tr '[:upper:]' '[:lower:]')"
+
+  case "${thinking_normalized}" in
+    true|1|yes|on)
+      export LOCAL_DFLASH_DISABLE_THINKING=0
+      ;;
+    false|0|no|off)
+      export LOCAL_DFLASH_DISABLE_THINKING=1
+      ;;
+    *)
+      echo "dflash: --thinking must be true or false" >&2
+      return 2
+      ;;
+  esac
+
+  case "${context_normalized}" in
+    32k|32768)
+      export LOCAL_DFLASH_CONTEXT_WINDOW=32768
+      export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=32768
+      ;;
+    64k|65536)
+      export LOCAL_DFLASH_CONTEXT_WINDOW=65536
+      export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=65536
+      ;;
+    *)
+      echo "dflash: --context must be 32k or 64k" >&2
+      return 2
+      ;;
+  esac
+
+  DFLASH_PROFILE_114_PASSTHROUGH=()
+  if ((${#passthrough[@]})); then
+    DFLASH_PROFILE_114_PASSTHROUGH=("${passthrough[@]}")
+  fi
+}
+
+cmd_restart_114() {
   cmd_restart "$@"
 }
 
@@ -278,6 +401,10 @@ cmd_monitor_tui() {
     echo "dflash: monitor-tui interval must be numeric seconds" >&2
     return 2
   fi
+  local request_metrics_limit="${LOCAL_DFLASH_REQUEST_METRICS_HISTORY_LIMIT:-50}"
+  if ! [[ "${request_metrics_limit}" =~ ^[0-9]+$ ]]; then
+    request_metrics_limit=50
+  fi
 
   local pid
   pid="$(get_running_pid)"
@@ -298,7 +425,7 @@ cmd_monitor_tui() {
 
   DFLASH_HEALTH_URL="${HEALTH_URL}" \
   DFLASH_METRICS_URL="${METRICS_URL}" \
-  DFLASH_REQUESTS_URL="http://${HOST}:${PORT}/requests?limit=8" \
+  DFLASH_REQUESTS_URL="http://${HOST}:${PORT}/requests?limit=${request_metrics_limit}" \
   DFLASH_MONITOR_INTERVAL="${interval}" \
   DFLASH_MONITOR_PID="${pid}" \
   "${python_bin}" - <<'PY'
@@ -416,6 +543,10 @@ def metric_row(label: str, value: str, width: int, color: str = "white") -> str:
     return f"{c('dim', label.ljust(label_width))} {c(color, clamp_text(value, value_width))}"
 
 
+def mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
 def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str]) -> str:
     width, height = shutil.get_terminal_size((110, 32))
     width = max(80, width)
@@ -525,14 +656,36 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
     )
     rows.append(line(width))
 
-    rows.append(c("bold", "Recent requests"))
-    entries = list((requests or {}).get("entries") or [])[-8:]
+    entries = list((requests or {}).get("entries") or [])
+    rows.append(c("bold", f"Averages so far ({len(entries)} requests)"))
     if not entries:
+        rows.append(c("dim", "  no completed request metrics yet"))
+    else:
+        avg_out = mean([num(item.get("generated_tokens", 0)) for item in entries])
+        avg_prompt = mean([num(item.get("prompt_tokens", 0)) for item in entries])
+        avg_generation_tps = mean([num(item.get("generation_tps", 0.0)) for item in entries])
+        avg_prompt_tps = mean([num(item.get("prompt_tps", 0.0)) for item in entries])
+        avg_accept = mean([num(item.get("avg_acceptance_ratio", 0.0)) for item in entries])
+        header = "  out  prompt  gen tok/s  prefill tok/s  accept"
+        row = (
+            f"  {avg_out:>5.1f} "
+            f"{avg_prompt:>7.1f} "
+            f"{avg_generation_tps:>9.1f} "
+            f"{avg_prompt_tps:>13.1f} "
+            f"{avg_accept:>6.2f}"
+        )
+        rows.append(c("dim", clamp_text(header, width)))
+        rows.append(clamp_text(row, width))
+    rows.append(line(width))
+
+    rows.append(c("bold", "Recent requests"))
+    recent_entries = entries[-8:]
+    if not recent_entries:
         rows.append(c("dim", "  no completed request metrics yet"))
     else:
         header = "  time      surface    out  prompt  gen tok/s  prefill tok/s  accept  finish"
         rows.append(c("dim", clamp_text(header, width)))
-        for item in reversed(entries):
+        for item in reversed(recent_entries):
             ts = item.get("finished_at") or item.get("ts") or 0
             try:
                 when = time.strftime("%H:%M:%S", time.localtime(float(ts)))
@@ -624,27 +777,27 @@ warn_if_not_ready() {
 }
 
 cmd_opencode() {
-  warn_if_not_ready
+  cmd_start
   exec "${SCRIPT_DIR}/run_opencode_local.sh" "$@"
 }
 
 cmd_opencode_auto() {
-  warn_if_not_ready
+  cmd_start
   exec "${SCRIPT_DIR}/run_opencode_local.sh" run-auto "$@"
 }
 
 cmd_codex() {
-  warn_if_not_ready
+  cmd_start
   exec "${SCRIPT_DIR}/run_codex_local.sh" "$@"
 }
 
 cmd_queue() {
-  warn_if_not_ready
+  cmd_start
   exec python3 "${SCRIPT_DIR}/agent_queue.py" run "$@"
 }
 
 cmd_queue_resume() {
-  warn_if_not_ready
+  cmd_start
   exec python3 "${SCRIPT_DIR}/agent_queue.py" resume "$@"
 }
 
@@ -741,11 +894,13 @@ usage() {
 usage: $(basename "$0") <command> [args...]
 
 server commands:
-  start     start the server in background, wait for /health (up to 120s)
+  start [--thinking=<true|false>] [--context=<32k|64k>]
+            start the server in background with the 114 tok/s profile, wait for /health (up to 120s)
   stop      graceful SIGTERM, wait up to 30s
-  restart   stop then start
-  restart-114
-            restart with the profile that produced the 114 tok/s spike
+  restart [--thinking=<true|false>] [--context=<32k|64k>]
+            stop then start with the 114 tok/s profile
+  restart-114 [--thinking=<true|false>] [--context=<32k|64k>]
+            compatibility alias for restart (defaults: thinking=true, context=32k)
   status    check running process and /health
   kill      SIGKILL the process group, clear port squatters
   logs      tail -f ${LOG_FILE}

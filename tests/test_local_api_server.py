@@ -517,6 +517,114 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(massaged[-1]["role"], "user")
         self.assertEqual(massaged[-1]["content"], local_api_server.RESPONSES_TOOL_RESULT_PROMPT)
 
+    def test_tool_calling_rules_prompt_omits_apply_patch_when_tool_absent(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        prompt = local_api_server._tool_calling_rules_prompt(tools)
+        action_prompt = local_api_server._responses_action_prompt(tools)
+
+        self.assertNotIn("apply_patch", prompt)
+        self.assertNotIn("apply_patch", action_prompt)
+        self.assertIn("available file-editing or shell tool", prompt)
+        self.assertIn("Use the <cwd> from environment_context", prompt)
+        self.assertIn("/private/tmp/codex-local-dflash", prompt)
+        self.assertIn("long-running dev servers", prompt)
+        self.assertIn("npm run dev", action_prompt)
+        self.assertIn("npm test -- --run", prompt)
+        self.assertIn("npx vitest run", action_prompt)
+
+    def test_filter_disabled_tools_removes_apply_patch_by_default(self):
+        tools = [
+            {"type": "function", "function": {"name": "apply_patch"}},
+            {"type": "function", "function": {"name": "shell_command"}},
+        ]
+
+        filtered = local_api_server._filter_disabled_tools(tools)
+
+        self.assertEqual(local_api_server._available_tool_names(filtered), {"shell_command"})
+
+    def test_build_output_items_drops_disabled_apply_patch_calls(self):
+        output_items = local_api_server._build_output_items(
+            '<function_call>{"name":"apply_patch","arguments":{"input":"bad"}}</function_call>'
+        )
+
+        self.assertEqual(len(output_items), 1)
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertEqual(output_items[0]["content"][0]["text"], "")
+
+    def test_tool_calling_rules_prompt_mentions_apply_patch_when_available(self):
+        with mock.patch.object(local_api_server, "ALLOW_APPLY_PATCH_TOOL", True):
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ]
+
+            prompt = local_api_server._tool_calling_rules_prompt(tools)
+            action_prompt = local_api_server._responses_action_prompt(tools)
+
+        self.assertIn("apply_patch tool is available", prompt)
+        self.assertIn("apply_patch tool is available", action_prompt)
+
+    def test_filter_disabled_tools_keeps_apply_patch_when_enabled(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        with mock.patch.object(local_api_server, "ALLOW_APPLY_PATCH_TOOL", True):
+            filtered = local_api_server._filter_disabled_tools(tools)
+
+        self.assertEqual(local_api_server._available_tool_names(filtered), {"apply_patch"})
+
+    def test_tool_result_prompt_handles_cancelled_existing_scaffold(self):
+        messages = [
+            {"role": "user", "content": "Create a Vite app."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "shell_command",
+                        {
+                            "command": "npm create vite@latest snake-game -- --template react-ts",
+                            "workdir": "/tmp/test",
+                        },
+                        call_id="call_1",
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "Operation cancelled",
+                "tool_call_id": "call_1",
+            },
+        ]
+
+        massaged = local_api_server._massage_responses_tool_result_messages(messages)
+
+        self.assertEqual(massaged[-1]["role"], "user")
+        self.assertIn("Operation cancelled", massaged[-1]["content"])
+        self.assertIn("inspect the existing files", massaged[-1]["content"])
+        self.assertIn("instead of running the scaffold command again", massaged[-1]["content"])
+
     def test_responses_max_tokens_raises_floor_when_tools_are_available(self):
         self.assertEqual(
             local_api_server._responses_max_tokens(512, [{"type": "function"}]),
@@ -628,7 +736,9 @@ class LocalApiServerTests(unittest.TestCase):
                     (['<function_call>{"name":"edit"}</function_call>'], tool_result),
                 ],
             ) as generate_locked_mock,
-            mock.patch.object(server, "_judge_response_needs_followup", return_value=True),
+            mock.patch.object(
+                server, "_judge_response_needs_followup", return_value=False
+            ) as judge_mock,
         ):
             result, output_items = server.generate_response(
                 messages=[{"role": "user", "content": "Fix until all tests pass."}],
@@ -641,6 +751,7 @@ class LocalApiServerTests(unittest.TestCase):
             )
 
         self.assertEqual(generate_locked_mock.call_count, 2)
+        judge_mock.assert_not_called()
         first_call = generate_locked_mock.call_args_list[0]
         second_call = generate_locked_mock.call_args_list[1]
         self.assertEqual(first_call.kwargs["previous_response_id"], "resp_1")
@@ -655,6 +766,54 @@ class LocalApiServerTests(unittest.TestCase):
         )
         self.assertEqual(second_messages[-1]["role"], "user")
         self.assertEqual(second_messages[-1]["content"], local_api_server.RESPONSES_ACTION_PROMPT)
+
+    def test_generate_auto_continues_chat_action_only_stop(self):
+        server = self._make_server()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "shell_command",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        planning_result = {
+            "text": "Now let me explore the project structure and start building the Snake game components.",
+            "finish_reason": "stop",
+            "generated_tokens": 8,
+        }
+        tool_result = {
+            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"find . -maxdepth 2 -type f"}}</tool_call>',
+            "finish_reason": "stop",
+            "generated_tokens": 4,
+        }
+
+        with (
+            mock.patch.object(
+                server,
+                "_generate_locked",
+                side_effect=[
+                    (["Now let me explore."], planning_result),
+                    (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
+                ],
+            ) as generate_locked_mock,
+            mock.patch.object(server, "_record_generation_metrics"),
+        ):
+            result = server.generate(
+                messages=[{"role": "user", "content": "Create Snake."}],
+                max_tokens=128,
+                sampling=local_api_server.SamplingParams(temperature=0.0),
+                tools=tools,
+            )
+
+        self.assertIs(result, tool_result)
+        self.assertEqual(generate_locked_mock.call_count, 2)
+        second_messages = generate_locked_mock.call_args_list[1].args[0]
+        self.assertEqual(second_messages[-2]["role"], "assistant")
+        self.assertEqual(second_messages[-2]["content"], planning_result["text"])
+        self.assertEqual(second_messages[-1]["role"], "user")
+        self.assertIn("did not execute it", second_messages[-1]["content"])
 
     def test_generate_response_auto_continues_after_empty_stop(self):
         server = self._make_server()
@@ -1242,6 +1401,59 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertFalse(
             local_api_server._response_is_followup_candidate(result, output_items, tools)
+        )
+
+    def test_assistant_text_promises_action_handles_tui_stall_phrase(self):
+        self.assertTrue(
+            local_api_server._assistant_text_promises_action(
+                "Let me create the game logic first."
+            )
+        )
+        self.assertFalse(
+            local_api_server._assistant_text_promises_action(
+                "The Snake game is complete and npm run build passed."
+            )
+        )
+
+    def test_massage_chat_tool_result_messages_adds_anti_repeat_prompt(self):
+        messages = [
+            {"role": "user", "content": "create tests"},
+            {"role": "assistant", "content": "<tool_call>...</tool_call>"},
+            {"role": "tool", "content": "Exit code: 0"},
+        ]
+
+        massaged = local_api_server._massage_chat_tool_result_messages(messages)
+
+        self.assertEqual(massaged[:-1], messages)
+        self.assertEqual(massaged[-1]["role"], "user")
+        self.assertIn("Do not immediately repeat", massaged[-1]["content"])
+        self.assertIn("finite test script", massaged[-1]["content"])
+
+    def test_task_history_requires_build_after_tests_for_generated_app(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "create snake game with react vite typescript and tests",
+            },
+            {"role": "tool", "content": "Test Files 1 passed. Tests 6 passed."},
+        ]
+
+        self.assertTrue(
+            local_api_server._task_history_requires_completion_followup(
+                messages, "All tests passed."
+            )
+        )
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": '<tool_call>{"name":"shell_command","arguments":{"command":"npx vitest run && npm run build"}}</tool_call>',
+            }
+        )
+        self.assertFalse(
+            local_api_server._task_history_requires_completion_followup(
+                messages, "Build passed and tests passed."
+            )
         )
 
     def test_stable_prefix_tokens_are_disabled_when_global_cache_limit_is_zero(self):
