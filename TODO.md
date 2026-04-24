@@ -37,6 +37,14 @@ Source inputs:
     Jinja, and remaining semantic wrapper/schema guidance was removed. Shell
     argument sanitation only normalizes Codex contract aliases such as `cmd` to
     `command`; it no longer blocks or rewrites model-chosen commands.
+  - Current patch after TUI loop report: repeated-tool guard now detects
+    structural call cycles such as `A,B,A,B`, not only immediate `A,A`
+    repeats. This is signature-based only; it does not inspect command
+    semantics or special-case React/npm/build/test behavior.
+  - Current patch after second TUI loop report: `update_plan` is treated as a
+    status-only Codex tool for loop detection, so changing plan text no longer
+    masks repetition of the same external tool call. This remains structural:
+    tool name + arguments only, no command/domain interpretation.
   - Latest smoke `artifacts/codex-smoke/20260424-142736`: project scaffold,
     app source, and test files were created, but Codex entered a repeated
     explanatory loop before adding the test script or running verification.

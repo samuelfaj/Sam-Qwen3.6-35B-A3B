@@ -166,10 +166,10 @@ PROTOCOL_TOOL_RETRY_PROMPT = (
     "Output exactly one valid tool call now using the declared format.]"
 )
 PROTOCOL_REPEATED_TOOL_RETRY_PROMPT = (
-    "[System protocol retry: the previous assistant turn repeated the same tool "
-    "call that was just executed. This retry accepts only one different valid "
-    "tool call that advances the task. Do not repeat the same command or same "
-    "arguments.]"
+    "[System protocol retry: the previous assistant turn repeated a recent "
+    "tool-call pattern. This retry accepts only one valid tool call with a "
+    "different tool name or different arguments. Do not repeat the same recent "
+    "tool-call sequence.]"
 )
 FOLLOWUP_JUDGE_SYSTEM_PROMPT = (
     "Return only compact JSON. No prose. No markdown. No reasoning. "
@@ -1247,17 +1247,29 @@ def _tool_call_signature(name: Any, arguments: Any) -> tuple[str, str]:
     return (name_text, _canonical_tool_arguments(normalized_arguments))
 
 
-def _output_tool_call_signatures(output_items: list[dict[str, Any]]) -> set[tuple[str, str]]:
+def _output_tool_call_signatures(
+    output_items: list[dict[str, Any]],
+    *,
+    include_status_tools: bool = True,
+) -> set[tuple[str, str]]:
     signatures: set[tuple[str, str]] = set()
     for item in output_items:
         if item.get("type") == "function_call":
+            if not include_status_tools and item.get("name") in STATUS_ONLY_TOOL_NAMES:
+                continue
             signatures.add(_tool_call_signature(item.get("name"), item.get("arguments")))
         elif item.get("type") == "custom_tool_call":
+            if not include_status_tools and item.get("name") in STATUS_ONLY_TOOL_NAMES:
+                continue
             signatures.add(_tool_call_signature(item.get("name"), {"input": item.get("input")}))
     return signatures
 
 
-def _last_assistant_tool_call_signatures(messages: list[dict[str, Any]]) -> set[tuple[str, str]]:
+def _last_assistant_tool_call_signatures(
+    messages: list[dict[str, Any]],
+    *,
+    include_status_tools: bool = True,
+) -> set[tuple[str, str]]:
     for message in reversed(messages):
         if message.get("role") != "assistant":
             continue
@@ -1270,27 +1282,72 @@ def _last_assistant_tool_call_signatures(messages: list[dict[str, Any]]) -> set[
                 continue
             function_payload = tool_call.get("function")
             if isinstance(function_payload, dict):
+                tool_name = function_payload.get("name") or tool_call.get("name")
+            else:
+                tool_name = tool_call.get("name")
+            if not include_status_tools and tool_name in STATUS_ONLY_TOOL_NAMES:
+                continue
+            if isinstance(function_payload, dict):
                 signatures.add(
                     _tool_call_signature(
-                        function_payload.get("name") or tool_call.get("name"),
+                        tool_name,
                         function_payload.get("arguments") or {},
                     )
                 )
             else:
-                signatures.add(_tool_call_signature(tool_call.get("name"), tool_call.get("arguments") or {}))
-        return signatures
+                signatures.add(_tool_call_signature(tool_name, tool_call.get("arguments") or {}))
+        if signatures:
+            return signatures
     return set()
+
+
+def _assistant_tool_call_signature_sequence(
+    messages: list[dict[str, Any]],
+    *,
+    limit: int = 12,
+    include_status_tools: bool = True,
+) -> list[frozenset[tuple[str, str]]]:
+    sequence: list[frozenset[tuple[str, str]]] = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        signatures = _last_assistant_tool_call_signatures(
+            [message],
+            include_status_tools=include_status_tools,
+        )
+        if signatures:
+            sequence.append(frozenset(signatures))
+    return sequence[-limit:]
+
+
+def _repeats_recent_tool_call_pattern(
+    messages: list[dict[str, Any]],
+    output_items: list[dict[str, Any]],
+    *,
+    max_period: int = 4,
+) -> bool:
+    latest = frozenset(_output_tool_call_signatures(output_items, include_status_tools=False))
+    if not latest:
+        return False
+    sequence = [
+        *_assistant_tool_call_signature_sequence(messages, include_status_tools=False),
+        latest,
+    ]
+    if len(sequence) < 2:
+        return False
+    max_period = max(1, min(max_period, len(sequence) // 2))
+    for period in range(1, max_period + 1):
+        suffix = sequence[-(period * 2) :]
+        if suffix[:period] == suffix[period:]:
+            return True
+    return False
 
 
 def _repeats_last_tool_call(
     messages: list[dict[str, Any]],
     output_items: list[dict[str, Any]],
 ) -> bool:
-    latest = _output_tool_call_signatures(output_items)
-    if not latest:
-        return False
-    previous = _last_assistant_tool_call_signatures(messages)
-    return bool(previous and latest and latest.issubset(previous))
+    return _repeats_recent_tool_call_pattern(messages, output_items)
 
 
 def _protocol_error_tool_call_text(
@@ -1921,6 +1978,7 @@ def _hash_json_payload(payload: Any) -> str:
 
 
 SHELL_TOOL_NAMES = {"shell_command", "local_shell", "exec", "exec_command"}
+STATUS_ONLY_TOOL_NAMES = {"update_plan"}
 
 
 def _augment_shell_tool_parameters(name: str, parameters: Any) -> Any:
