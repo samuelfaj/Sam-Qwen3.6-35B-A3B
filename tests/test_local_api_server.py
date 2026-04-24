@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import threading
 from types import SimpleNamespace
 import unittest
@@ -467,55 +468,71 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertTrue(observed["capture_prefill_state"])
         self.assertIs(result["prompt_cache_state"], chunk.prefill_state)
 
-    def test_massage_responses_continuation_messages_adds_explicit_continue_prompt(self):
+    def test_build_followup_judge_messages_uses_protocol_only(self):
+        server = self._make_server()
         messages = [
-            {"role": "user", "content": "Build the app."},
-            {"role": "assistant", "content": "I'll build it now."},
-            {"role": "assistant", "content": "I'll create the file next."},
+            {"role": "user", "content": "Do task."},
+            {"role": "assistant", "content": "I need another step."},
+            {"role": "tool", "content": "tool result", "tool_call_id": "call_1"},
         ]
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
 
-        massaged = local_api_server._massage_responses_continuation_messages(messages)
-
-        self.assertEqual(len(massaged), 3)
-        self.assertEqual(massaged[0], messages[0])
-        self.assertEqual(massaged[1], messages[-1])
-        self.assertEqual(massaged[2]["role"], "user")
-        self.assertEqual(massaged[2]["content"], local_api_server.RESPONSES_CONTINUE_PROMPT)
-
-    def test_massage_responses_continuation_messages_leaves_user_turn_unchanged(self):
-        messages = [
-            {"role": "user", "content": "Build the app."},
-            {"role": "assistant", "content": "Done."},
-            {"role": "user", "content": "Now add tests."},
-        ]
-
-        self.assertEqual(
-            local_api_server._massage_responses_continuation_messages(messages),
+        judge_messages = server._build_followup_judge_messages(
             messages,
+            "I need another step.",
+            tools,
+        )
+        payload = json.loads(judge_messages[1]["content"])
+
+        self.assertEqual(judge_messages[0]["role"], "system")
+        self.assertEqual(
+            judge_messages[0]["content"],
+            local_api_server.FOLLOWUP_JUDGE_SYSTEM_PROMPT,
+        )
+        self.assertEqual(payload["available_tools"], ["shell_command"])
+        self.assertEqual(payload["conversation"], messages)
+        self.assertEqual(payload["latest_assistant_response"], "I need another step.")
+        self.assertEqual(payload["last_tool_result"], messages[-1])
+
+    def test_parse_followup_judge_decision_accepts_continue_and_final(self):
+        continue_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
+            {
+                "verdict": "continue",
+                "continue_message": "Continue from judge.",
+                "reason": "not finished",
+            }
+        )
+        final_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
+            {"verdict": "final", "continue_message": "ignored", "reason": "done"}
+        )
+        invalid_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
+            {"verdict": "continue", "continue_message": "", "reason": "missing"}
+        )
+        reasoning_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
+            {
+                "verdict": "continue",
+                "continue_message": "Continue the thought process from where it stopped.",
+                "reason": "not finished",
+            }
         )
 
-    def test_massage_responses_tool_result_messages_adds_anti_repeat_prompt(self):
-        messages = [
-            {"role": "user", "content": "Inspect the repository."},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "search_files",
-                        {"path": "."},
-                        call_id="call_1",
-                    )
-                ],
-            },
-            {"role": "tool", "content": '[{"path":"README.md"}]', "tool_call_id": "call_1"},
-        ]
+        self.assertIsNotNone(continue_decision)
+        self.assertTrue(continue_decision.should_continue)
+        self.assertEqual(continue_decision.continue_message, "Continue from judge.")
+        self.assertIsNotNone(final_decision)
+        self.assertFalse(final_decision.should_continue)
+        self.assertEqual(final_decision.continue_message, "")
+        self.assertIsNone(invalid_decision)
+        self.assertIsNone(reasoning_decision)
 
-        massaged = local_api_server._massage_responses_tool_result_messages(messages)
+    def test_parse_followup_judge_output_accepts_internal_tool_call(self):
+        decision = local_api_server.LocalModelServer._parse_followup_judge_output(
+            '<tool_call>{"name":"judge_decision","arguments":{"verdict":"continue","continue_message":"Run the next observable step.","reason":"not done"}}</tool_call>'
+        )
 
-        self.assertEqual(massaged[:-1], messages)
-        self.assertEqual(massaged[-1]["role"], "user")
-        self.assertEqual(massaged[-1]["content"], local_api_server.RESPONSES_TOOL_RESULT_PROMPT)
+        self.assertIsNotNone(decision)
+        self.assertTrue(decision.should_continue)
+        self.assertEqual(decision.continue_message, "Run the next observable step.")
 
     def test_tool_calling_rules_prompt_omits_apply_patch_when_tool_absent(self):
         tools = [
@@ -529,17 +546,11 @@ class LocalApiServerTests(unittest.TestCase):
         ]
 
         prompt = local_api_server._tool_calling_rules_prompt(tools)
-        action_prompt = local_api_server._responses_action_prompt(tools)
 
         self.assertNotIn("apply_patch", prompt)
-        self.assertNotIn("apply_patch", action_prompt)
-        self.assertIn("available file-editing or shell tool", prompt)
+        self.assertIn("Function calls MUST", prompt)
         self.assertIn("Use the <cwd> from environment_context", prompt)
         self.assertIn("/private/tmp/codex-local-dflash", prompt)
-        self.assertIn("long-running dev servers", prompt)
-        self.assertIn("npm run dev", action_prompt)
-        self.assertIn("npm test -- --run", prompt)
-        self.assertIn("npx vitest run", action_prompt)
 
     def test_filter_disabled_tools_removes_apply_patch_by_default(self):
         tools = [
@@ -573,10 +584,8 @@ class LocalApiServerTests(unittest.TestCase):
             ]
 
             prompt = local_api_server._tool_calling_rules_prompt(tools)
-            action_prompt = local_api_server._responses_action_prompt(tools)
 
         self.assertIn("apply_patch tool is available", prompt)
-        self.assertIn("apply_patch tool is available", action_prompt)
 
     def test_filter_disabled_tools_keeps_apply_patch_when_enabled(self):
         tools = [
@@ -593,37 +602,6 @@ class LocalApiServerTests(unittest.TestCase):
             filtered = local_api_server._filter_disabled_tools(tools)
 
         self.assertEqual(local_api_server._available_tool_names(filtered), {"apply_patch"})
-
-    def test_tool_result_prompt_handles_cancelled_existing_scaffold(self):
-        messages = [
-            {"role": "user", "content": "Create a Vite app."},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {
-                            "command": "npm create vite@latest snake-game -- --template react-ts",
-                            "workdir": "/tmp/test",
-                        },
-                        call_id="call_1",
-                    )
-                ],
-            },
-            {
-                "role": "tool",
-                "content": "Operation cancelled",
-                "tool_call_id": "call_1",
-            },
-        ]
-
-        massaged = local_api_server._massage_responses_tool_result_messages(messages)
-
-        self.assertEqual(massaged[-1]["role"], "user")
-        self.assertIn("Operation cancelled", massaged[-1]["content"])
-        self.assertIn("inspect the existing files", massaged[-1]["content"])
-        self.assertIn("instead of running the scaffold command again", massaged[-1]["content"])
 
     def test_responses_max_tokens_raises_floor_when_tools_are_available(self):
         self.assertEqual(
@@ -737,7 +715,13 @@ class LocalApiServerTests(unittest.TestCase):
                 ],
             ) as generate_locked_mock,
             mock.patch.object(
-                server, "_judge_response_needs_followup", return_value=False
+                server,
+                "_judge_turn_completion",
+                return_value=local_api_server.FollowupJudgeDecision(
+                    True,
+                    "Continue from judge.",
+                    "not finished",
+                ),
             ) as judge_mock,
         ):
             result, output_items = server.generate_response(
@@ -751,7 +735,7 @@ class LocalApiServerTests(unittest.TestCase):
             )
 
         self.assertEqual(generate_locked_mock.call_count, 2)
-        judge_mock.assert_not_called()
+        judge_mock.assert_called_once()
         first_call = generate_locked_mock.call_args_list[0]
         second_call = generate_locked_mock.call_args_list[1]
         self.assertEqual(first_call.kwargs["previous_response_id"], "resp_1")
@@ -765,7 +749,7 @@ class LocalApiServerTests(unittest.TestCase):
             "The test file has a module resolution issue. Let me fix the import path and run the tests again.",
         )
         self.assertEqual(second_messages[-1]["role"], "user")
-        self.assertEqual(second_messages[-1]["content"], local_api_server.RESPONSES_ACTION_PROMPT)
+        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
 
     def test_generate_auto_continues_chat_action_only_stop(self):
         server = self._make_server()
@@ -799,6 +783,15 @@ class LocalApiServerTests(unittest.TestCase):
                 ],
             ) as generate_locked_mock,
             mock.patch.object(server, "_record_generation_metrics"),
+            mock.patch.object(
+                server,
+                "_judge_turn_completion",
+                return_value=local_api_server.FollowupJudgeDecision(
+                    True,
+                    "Continue from judge.",
+                    "not finished",
+                ),
+            ) as judge_mock,
         ):
             result = server.generate(
                 messages=[{"role": "user", "content": "Create Snake."}],
@@ -809,11 +802,12 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertIs(result, tool_result)
         self.assertEqual(generate_locked_mock.call_count, 2)
+        judge_mock.assert_called_once()
         second_messages = generate_locked_mock.call_args_list[1].args[0]
         self.assertEqual(second_messages[-2]["role"], "assistant")
         self.assertEqual(second_messages[-2]["content"], planning_result["text"])
         self.assertEqual(second_messages[-1]["role"], "user")
-        self.assertIn("did not execute it", second_messages[-1]["content"])
+        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
 
     def test_generate_response_auto_continues_after_empty_stop(self):
         server = self._make_server()
@@ -874,11 +868,22 @@ class LocalApiServerTests(unittest.TestCase):
             "elapsed": 1.2,
             "prompt_cache_state": None,
         }
-        with mock.patch.object(
-            server,
-            "_generate_locked",
-            side_effect=[(None, empty_result), (None, tool_result)],
-        ) as generate_locked:
+        with (
+            mock.patch.object(
+                server,
+                "_generate_locked",
+                side_effect=[(None, empty_result), (None, tool_result)],
+            ) as generate_locked,
+            mock.patch.object(
+                server,
+                "_judge_turn_completion",
+                return_value=local_api_server.FollowupJudgeDecision(
+                    True,
+                    "Continue from judge.",
+                    "empty response",
+                ),
+            ) as judge_mock,
+        ):
             result, output_items = server.generate_response(
                 [{"role": "user", "content": "create app"}],
                 128,
@@ -888,8 +893,9 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIs(result, tool_result)
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(generate_locked.call_count, 2)
+        judge_mock.assert_called_once()
         second_messages = generate_locked.call_args_list[1].args[0]
-        self.assertEqual(second_messages[-1]["content"], local_api_server.RESPONSES_EMPTY_OUTPUT_PROMPT)
+        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
         self.assertEqual(result["text"], tool_result["text"])
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(output_items[0]["name"], "edit")
@@ -1027,6 +1033,120 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn('"content": "Hello"', events)
         self.assertIn('"finish_reason": "stop"', events)
         self.assertTrue(events.rstrip().endswith("data: [DONE]"))
+
+    def test_streaming_generation_continues_after_action_only_text(self):
+        server = self._make_server()
+
+        def chunk(text: str, tokens: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                text=text,
+                finish_reason="stop",
+                prefill_seconds=0.01,
+                prompt_tps=10.0,
+                reused_prefix_tokens=0,
+                decode_seconds=0.02,
+                generation_tps=20.0,
+                generation_tokens=tokens,
+                speculative_steps=1,
+                proposed_tokens=tokens,
+                accepted_tokens=tokens,
+                avg_acceptance_length=float(tokens),
+                avg_acceptance_ratio=1.0,
+                acceptance_lengths=[tokens],
+                acceptance_ratios=[1.0],
+                block_size_history=[tokens],
+                adaptive_block_size=False,
+                prefill_hidden_bytes=0,
+                prefill_target_cache_bytes=0,
+                prefill_logits_bytes=0,
+                prefill_working_set_bytes=0,
+                prompt_cache_state_bytes=0,
+                peak_memory=1.0,
+                prefill_state=None,
+            )
+
+        queue = Queue()
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+        with (
+            mock.patch.object(server, "_acquire_generation_turn", return_value=1),
+            mock.patch.object(server, "_release_generation_turn"),
+            mock.patch.object(server, "finish_request"),
+            mock.patch.object(server, "_record_generation_metrics"),
+            mock.patch.object(
+                server,
+                "_stream_generate_locked",
+                side_effect=[
+                    (
+                        iter(
+                            [
+                                chunk(
+                                    "Let me rewrite the Snake game and add tests.",
+                                    9,
+                                )
+                            ]
+                        ),
+                        10,
+                        1.0,
+                        None,
+                        (),
+                        "none",
+                    ),
+                    (
+                        iter(
+                            [
+                                chunk(
+                                    '<tool_call>{"name":"shell_command","arguments":{"cmd":"echo ok"}}</tool_call>',
+                                    7,
+                                )
+                            ]
+                        ),
+                        12,
+                        2.0,
+                        None,
+                        (),
+                        "none",
+                    ),
+                ],
+            ) as stream_mock,
+            mock.patch.object(
+                server,
+                "_judge_turn_completion",
+                return_value=local_api_server.FollowupJudgeDecision(
+                    True,
+                    "Continue from judge.",
+                    "not finished",
+                ),
+            ) as judge_mock,
+        ):
+            server._generation_worker(
+                queue,
+                messages=[{"role": "user", "content": "create react vite game"}],
+                requested_max_tokens=64,
+                sampling=local_api_server.SamplingParams(temperature=0.0),
+                tools=tools,
+            )
+
+        events = []
+        while not queue.empty():
+            events.append(queue.get())
+
+        self.assertEqual(stream_mock.call_count, 2)
+        judge_mock.assert_called_once()
+        second_messages = stream_mock.call_args_list[1].args[0]
+        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
+        self.assertNotIn(
+            ("text", "Let me rewrite the Snake game and add tests."),
+            events,
+        )
+        self.assertTrue(
+            any(
+                kind == "text" and "tool_call" in payload
+                for kind, payload in events
+            )
+        )
+        result = next(payload for kind, payload in events if kind == "result")
+        self.assertNotIn("Let me rewrite", result["text"])
+        self.assertIn("tool_call", result["text"])
 
     def test_incremental_visible_text_stream_matches_full_visible_output(self):
         stream = local_api_server._IncrementalVisibleTextStream(strip_edges=False)
@@ -1386,74 +1506,85 @@ class LocalApiServerTests(unittest.TestCase):
         )
         self.assertEqual(merged_tools, tools)
 
-    def test_response_followup_candidate_treats_custom_tool_call_as_action(self):
-        result = {
-            "text": "",
+    def test_generate_response_with_tool_call_does_not_call_judge(self):
+        server = self._make_server()
+        tools = [{"type": "function", "function": {"name": "edit"}}]
+        tool_result = {
+            "text": '<function_call>{"name":"edit","arguments":{"filePath":"src/App.tsx","oldString":"a","newString":"b"}}</function_call>',
             "finish_reason": "stop",
+            "generated_tokens": 8,
         }
-        tools = [{"type": "custom", "name": "apply_patch"}]
-        output_items = [
-            local_api_server._make_custom_tool_call_item(
-                "apply_patch",
-                "*** Begin Patch\n*** End Patch\n",
+
+        with (
+            mock.patch.object(server, "_generate_locked", return_value=(None, tool_result)) as generate_locked,
+            mock.patch.object(server, "_judge_turn_completion") as judge_mock,
+            mock.patch.object(server, "_record_generation_metrics"),
+        ):
+            result, output_items = server.generate_response(
+                [{"role": "user", "content": "edit file"}],
+                64,
+                tools=tools,
             )
-        ]
 
-        self.assertFalse(
-            local_api_server._response_is_followup_candidate(result, output_items, tools)
-        )
+        self.assertIs(result, tool_result)
+        self.assertEqual(generate_locked.call_count, 1)
+        judge_mock.assert_not_called()
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(output_items[0]["name"], "edit")
 
-    def test_assistant_text_promises_action_handles_tui_stall_phrase(self):
-        self.assertTrue(
-            local_api_server._assistant_text_promises_action(
-                "Let me create the game logic first."
+    def test_generate_returns_when_judge_says_final(self):
+        server = self._make_server()
+        final_result = {
+            "text": "Done.",
+            "finish_reason": "stop",
+            "generated_tokens": 4,
+        }
+
+        with (
+            mock.patch.object(server, "_generate_locked", return_value=(None, final_result)) as generate_locked,
+            mock.patch.object(
+                server,
+                "_judge_turn_completion",
+                return_value=local_api_server.FollowupJudgeDecision(False, "", "done"),
+            ) as judge_mock,
+            mock.patch.object(server, "_record_generation_metrics"),
+        ):
+            result = server.generate(
+                [{"role": "user", "content": "answer"}],
+                64,
+                tools=[{"type": "function", "function": {"name": "shell_command"}}],
             )
-        )
-        self.assertFalse(
-            local_api_server._assistant_text_promises_action(
-                "The Snake game is complete and npm run build passed."
+
+        self.assertIs(result, final_result)
+        self.assertEqual(generate_locked.call_count, 1)
+        judge_mock.assert_called_once()
+
+    def test_judge_turn_completion_invalid_json_returns_final_without_continuation_fallback(self):
+        server = self._make_server()
+        invalid_result = {
+            "text": "not json",
+            "finish_reason": "stop",
+            "generated_tokens": 4,
+        }
+
+        with mock.patch.object(
+            server,
+            "_generate_locked",
+            side_effect=[(None, invalid_result), (None, invalid_result)],
+        ) as generate_locked:
+            decision = server._judge_turn_completion(
+                [{"role": "user", "content": "answer"}],
+                "No tool call.",
+                [{"type": "function", "function": {"name": "shell_command"}}],
             )
-        )
 
-    def test_massage_chat_tool_result_messages_adds_anti_repeat_prompt(self):
-        messages = [
-            {"role": "user", "content": "create tests"},
-            {"role": "assistant", "content": "<tool_call>...</tool_call>"},
-            {"role": "tool", "content": "Exit code: 0"},
-        ]
-
-        massaged = local_api_server._massage_chat_tool_result_messages(messages)
-
-        self.assertEqual(massaged[:-1], messages)
-        self.assertEqual(massaged[-1]["role"], "user")
-        self.assertIn("Do not immediately repeat", massaged[-1]["content"])
-        self.assertIn("finite test script", massaged[-1]["content"])
-
-    def test_task_history_requires_build_after_tests_for_generated_app(self):
-        messages = [
-            {
-                "role": "user",
-                "content": "create snake game with react vite typescript and tests",
-            },
-            {"role": "tool", "content": "Test Files 1 passed. Tests 6 passed."},
-        ]
-
-        self.assertTrue(
-            local_api_server._task_history_requires_completion_followup(
-                messages, "All tests passed."
-            )
-        )
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": '<tool_call>{"name":"shell_command","arguments":{"command":"npx vitest run && npm run build"}}</tool_call>',
-            }
-        )
-        self.assertFalse(
-            local_api_server._task_history_requires_completion_followup(
-                messages, "Build passed and tests passed."
-            )
+        self.assertEqual(generate_locked.call_count, 2)
+        self.assertFalse(decision.should_continue)
+        self.assertEqual(decision.reason, "follow-up judge returned invalid JSON")
+        retry_messages = generate_locked.call_args_list[1].args[0]
+        self.assertEqual(
+            retry_messages[-1]["content"],
+            local_api_server.FOLLOWUP_JUDGE_RETRY_PROMPT,
         )
 
     def test_stable_prefix_tokens_are_disabled_when_global_cache_limit_is_zero(self):
@@ -1567,6 +1698,11 @@ class LocalApiServerTests(unittest.TestCase):
             mock.patch.object(local_api_server, "load_draft", return_value="draft-1"),
             mock.patch.object(local_api_server, "tokenize_prompt", return_value=local_api_server.mx.array([10, 20, 30])),
             mock.patch.object(local_api_server, "stream_generate", side_effect=fake_stream_generate),
+            mock.patch.object(
+                server,
+                "_judge_turn_completion",
+                return_value=local_api_server.FollowupJudgeDecision(False, "", "done"),
+            ),
         ):
             result = server.generate(
                 messages=[{"role": "user", "content": "Continue"}],

@@ -151,107 +151,55 @@ GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CA
 MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 2)
 ALLOW_APPLY_PATCH_TOOL = _env_bool("LOCAL_DFLASH_ALLOW_APPLY_PATCH_TOOL", False)
-RESPONSES_CONTINUE_PROMPT = (
-    "[System: Continue the previous incomplete response now. "
-    "Do not repeat prior acknowledgements, summaries, or bullet lists. "
-    "Execute the required tool call immediately. "
-    "If a tool call was cut off, re-emit it in full.]"
-)
-RESPONSES_TOOL_RESULT_PROMPT = (
-    "[System: The previous tool call already completed and its result is available above. "
-    "Use that result to continue. "
-    "Do not immediately repeat the exact same tool call with identical arguments. "
-    "If the tool output shows a failure, read the error and choose a different corrective action. "
-    "If a scaffold command reports Operation cancelled because the target already exists, inspect the "
-    "existing files and continue from them instead of running the scaffold command again. "
-    "If a dev-server command such as npm run dev, vite, or next dev times out after printing a ready/local URL, "
-    "treat the server startup as verified; do not retry it, and continue with build/check or final. "
-    "After tests pass for a generated app, still run npm run build before final.]"
-)
-CHAT_TOOL_RESULT_PROMPT = (
-    "[System: The previous tool call already completed and its result is available above. "
-    "Use that result to continue. Do not immediately repeat the exact same tool call or shell command with identical arguments. "
-    "If a file write command succeeded, move to the next different required file, package script, test, build, or verification step. "
-    "If the user asked for tests, create test files, add a finite test script such as vitest run, and run it. "
-    "After tests pass for a generated app, still run npm run build before final. "
-    "If a command fails, read the error and choose a different corrective action.]"
-)
-RESPONSES_ACTION_PROMPT = (
-    "[System: You just stated the next action but did not execute it. "
-    "Do not repeat or re-emit the plan; do not call update_plan again on this turn. "
-    "If files need to change, use an available editing-capable tool or shell command now. "
-    "If a command must run, call the available shell tool now. "
-    "Only produce a final text answer if no tool call is possible. "
-    "Do not stop after announcing what you will do next. "
-    "For generated apps, do not finish until you have run the relevant build/check command or identified a real blocker. "
-    "Prefer finite commands such as npm run build or npm test -- --run over long-running dev servers such as npm run dev. "
-    "For Vitest projects, use npm test -- --run or npx vitest run; do not run bare npm test because it can enter watch mode. "
-    "If tests passed but npm run build has not run yet, run npm run build next.]"
-)
-RESPONSES_EMPTY_OUTPUT_PROMPT = (
-    "[System: Your previous response was empty or too short to be actionable. "
-    "The task is not complete. Continue the agentic workflow now. "
-    "If work remains, call the appropriate tool immediately. "
-    "If you need context, inspect files or run commands. "
-    "Do not emit an empty response, a single token, or a final answer unless the task is actually complete.]"
-)
-PLANNING_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "update_plan",
-        "plan",
-        "todo_write",
-        "todo",
-        "apply_plan",
-        "planner",
-    }
-)
-RESPONSES_FOLLOWUP_JUDGE_ENABLED = _env_bool("LOCAL_DFLASH_FOLLOWUP_JUDGE", True)
 RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS = _env_positive_int(
-    "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 128
+    "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 256
 )
-RESPONSES_FOLLOWUP_JUDGE_LOGPROB_MARGIN = _env_positive_float(
-    "LOCAL_DFLASH_FOLLOWUP_JUDGE_LOGPROB_MARGIN", 1.0
+FOLLOWUP_JUDGE_SYSTEM_PROMPT = (
+    "Return only compact JSON. No prose. No markdown. No reasoning. "
+    "Schema: {\"verdict\":\"continue|final\",\"continue_message\":\"string\",\"reason\":\"string\"}. "
+    "Decide whether the latest assistant response should be returned to the client or whether one more assistant turn should run. "
+    "Use only the JSON payload: conversation, latest_assistant_response, available_tools, last_tool_result. "
+    "Infer completion criteria from the user request and evidence in conversation/tool results. "
+    "Use verdict=continue only when another assistant turn is needed; continue_message must be the exact next user message. "
+    "continue_message must request an observable action or answer, not hidden reasoning or thought process. "
+    "Use verdict=final when the latest response can be returned, asks a needed question, or reports a blocker."
 )
-RESPONSES_FOLLOWUP_JUDGE_LOGPROB_SYSTEM_PROMPT = (
-    "You are a strict turn-completion checker for an AI coding agent. "
-    "The agent has function-calling tools to read files, edit code, run commands, and inspect results. "
-    "Decide whether the agent's latest turn is finished or whether it still needs to act.\n\n"
-    "Reply with EXACTLY one uppercase letter and nothing else.\n"
-    "- Y: the agent delivered the final answer, reported a genuine blocker, or asked a real clarifying question.\n"
-    "- N: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n"
-    "- N: the agent already called `update_plan` with the same plan as a prior turn but did not actually invoke an action tool (`apply_patch`, `shell`, `container.exec`, etc.).\n"
-    "- N: the agent emitted `update_plan` alone when the user asked for concrete work and there are action tools available.\n"
-    "When unsure, answer N."
+FOLLOWUP_JUDGE_RETRY_PROMPT = (
+    "Invalid. Return only JSON matching the schema. No prose."
 )
-RESPONSES_FOLLOWUP_JUDGE_JSON_SYSTEM_PROMPT = (
-    "You are a strict turn-completion checker for an AI coding agent. "
-    "The agent has function-calling tools to read files, edit code, run commands, and inspect results. "
-    "Decide whether the agent's latest turn is finished or whether it still needs to act.\n\n"
-    "Respond with ONLY a single JSON object and nothing else, matching this schema:\n"
-    '{"reason":"<one short sentence>","verdict":"COMPLETE"|"INCOMPLETE"}\n\n'
-    "- COMPLETE: the agent delivered the final answer, reported a genuine blocker, or asked a real clarifying question.\n"
-    "- INCOMPLETE: the agent described a next step, a fix, or an action it should perform (in any language) but did not actually call any tool.\n"
-    "- INCOMPLETE: the agent re-emitted the same `update_plan` plan as a prior turn without actually invoking any action tool.\n"
-    "- INCOMPLETE: the agent emitted `update_plan` alone when concrete action tools were available and the user's request required executing something.\n\n"
-    "When unsure, answer INCOMPLETE."
-)
+FOLLOWUP_JUDGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "judge_decision",
+        "description": "Return the turn-completion decision for the agent orchestrator.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["continue", "final"],
+                },
+                "continue_message": {
+                    "type": "string",
+                    "description": "Exact next user message when verdict is continue; empty when final.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason for the decision.",
+                },
+            },
+            "required": ["verdict", "continue_message", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
 TOOL_CALLING_RULES_PROMPT = (
     "Tool-calling rules (strict):\n"
     "- Function calls MUST be wrapped in <tool_call>...</tool_call>. The JSON body must parse as a single object with keys \"name\" and \"arguments\".\n"
     "- Do NOT omit the opening <tool_call> tag, even after prose.\n"
-    "- You MAY write one short reasoning line BEFORE a tool call, but NEVER after announcing an action without executing it.\n"
-    "- NEVER say \"I will now <do X>\" or \"Next, I'll call <tool>\" without emitting the <tool_call> in the same turn.\n"
-    "- If you have already emitted a plan via update_plan this turn, do NOT re-emit it; proceed directly to an available file-editing or shell tool.\n"
     "- Use the <cwd> from environment_context as the project root for shell workdir and file paths. Never create or edit user projects under CODEX_HOME, /tmp/codex-local-dflash, /private/tmp/codex-local-dflash, plugin directories, or skill directories unless the user explicitly asks.\n"
     "- Required parameters MUST be present. Do not emit tool calls with \"arguments\": {} unless the schema has zero required fields.\n"
-    "- When a prior tool_response is available, USE IT. Do not re-issue the identical call with the same arguments.\n"
-    "- When a command fails, read the error and change strategy; do not retry the same failing command unchanged.\n"
-    "- If a project scaffold command reports Operation cancelled because the target exists, inspect and modify the existing project instead of scaffolding again.\n"
-    "- For buildable apps, run the relevant build/check command before the final answer unless a real blocker prevents it.\n"
-    "- Do not use long-running dev servers such as npm run dev, vite, or next dev as the final verification step; prefer finite build/check/test commands.\n"
-    "- For Vitest projects, run npm test -- --run or npx vitest run. Do not run bare npm test because it can enter watch mode.\n"
-    "- Produce a final natural-language answer ONLY when no tool is applicable or the user's task is fully complete.\n"
-    "- Decide and act in the same turn."
+    "- Keep each tool call small enough to be reliable. Prefer focused edits or commands over very large inline shell heredocs."
 )
 TOOL_CALLING_RULES_APPLY_PATCH_PROMPT = (
     "\n- The apply_patch tool is available. Use it for precise repository file edits when appropriate."
@@ -1145,149 +1093,6 @@ def _classify_error_code(message: str, exc: Exception | None = None) -> str:
     return "server_error"
 
 
-def _is_planning_only_function_call(item: dict[str, Any]) -> bool:
-    if item.get("type") not in {"function_call", "custom_tool_call"}:
-        return False
-    name = str(item.get("name") or "").strip().lower()
-    return name in PLANNING_ONLY_TOOL_NAMES
-
-
-def _response_is_followup_candidate(
-    result: dict[str, Any],
-    output_items: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-) -> bool:
-    """Cheap gate: returns True only if it is worth asking the model-based judge."""
-    if not tools:
-        return False
-
-    response_status, _ = _response_completion_state(result)
-    if response_status != "completed":
-        return False
-
-    has_action_call = any(
-        item.get("type") in {"function_call", "custom_tool_call"}
-        and not _is_planning_only_function_call(item)
-        for item in output_items
-    )
-    if has_action_call:
-        return False
-
-    has_planning_call = any(
-        _is_planning_only_function_call(item) for item in output_items
-    )
-    assistant_text = _output_text_from_items(output_items).strip()
-    if not assistant_text and not has_planning_call:
-        return False
-
-    return True
-
-
-def _response_needs_empty_output_followup(
-    result: dict[str, Any],
-    output_items: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-) -> bool:
-    if not tools:
-        return False
-    response_status, _ = _response_completion_state(result)
-    if response_status != "completed":
-        return False
-    if any(item.get("type") in {"function_call", "custom_tool_call"} for item in output_items):
-        return False
-    assistant_text = _output_text_from_items(output_items).strip()
-    generated_tokens = int(result.get("generated_tokens", 0) or 0)
-    return generated_tokens <= 2 or len(assistant_text) <= 2
-
-
-def _assistant_text_promises_action(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", text.strip().lower())
-    if not normalized:
-        return False
-
-    promise_patterns = (
-        r"\blet me\b",
-        r"\bi(?:'ll| will)\b",
-        r"\bi(?:'m| am) going to\b",
-        r"\bi need to\b",
-        r"\bnow i(?:'ll| will)\b",
-        r"\bnext i(?:'ll| will)\b",
-        r"\bvou\b",
-        r"\bvou agora\b",
-        r"\bdeixe-me\b",
-        r"\bagora vou\b",
-    )
-    if not any(re.search(pattern, normalized) for pattern in promise_patterns):
-        return False
-
-    action_patterns = (
-        r"\b(add|build|building|check|create|edit|explore|fix|implement|inspect|install|modify|read|run|start|test|update|verify|write)\b",
-        r"\b(criar|editar|executar|implementar|instalar|ler|modificar|rodar|verificar)\b",
-    )
-    return any(re.search(pattern, normalized) for pattern in action_patterns)
-
-
-def _chat_result_needs_action_followup(
-    result: dict[str, Any],
-    tools: list[dict[str, Any]] | None,
-    messages: list[dict[str, Any]] | None = None,
-) -> bool:
-    if not tools:
-        return False
-    if str(result.get("finish_reason") or "").strip() != "stop":
-        return False
-    visible_text, tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
-    if tool_calls:
-        return False
-    return _assistant_text_promises_action(
-        visible_text
-    ) or _task_history_requires_completion_followup(messages or [], visible_text)
-
-
-def _task_history_requires_completion_followup(
-    messages: list[dict[str, Any]],
-    assistant_text: str,
-) -> bool:
-    last_user_text = _last_user_message_text(messages).lower()
-    if not last_user_text:
-        return False
-    blob = (
-        json.dumps(messages, ensure_ascii=False, default=str)
-        + "\n"
-        + assistant_text
-    ).lower()
-    wants_buildable_app = any(
-        marker in last_user_text
-        for marker in ("react", "vite", "typescript", "app", "game")
-    )
-    if wants_buildable_app and not any(
-        marker in blob for marker in ("npm run build", "vite build")
-    ):
-        return True
-    wants_tests = "test" in last_user_text
-    if wants_tests and not any(
-        marker in blob
-        for marker in ("vitest run", "npm test -- --run", "npm run test -- --run")
-    ):
-        return True
-    return False
-
-
-def _massage_chat_tool_result_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not messages:
-        return messages
-    last = messages[-1]
-    if str(last.get("role") or "").lower() != "tool":
-        return messages
-    return [
-        *messages,
-        {
-            "role": "user",
-            "content": CHAT_TOOL_RESULT_PROMPT,
-        },
-    ]
-
-
 def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -1296,6 +1101,20 @@ def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
         if text.strip():
             return text
     return ""
+
+
+def _last_tool_result_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") == "tool":
+            return message
+    return None
+
+
+@dataclass
+class FollowupJudgeDecision:
+    should_continue: bool
+    continue_message: str
+    reason: str
 
 
 def _summarize_tool_names(tools: list[dict[str, Any]] | None) -> str:
@@ -1359,23 +1178,6 @@ def _tool_calling_rules_prompt(tools: list[dict[str, Any]] | None) -> str:
     if "apply_patch" in _available_tool_names(tools):
         prompt += TOOL_CALLING_RULES_APPLY_PATCH_PROMPT
     return prompt
-
-
-def _responses_action_prompt(tools: list[dict[str, Any]] | None) -> str:
-    prompt = RESPONSES_ACTION_PROMPT
-    if "apply_patch" in _available_tool_names(tools):
-        prompt += " [System: The apply_patch tool is available for precise file edits.]"
-    return prompt
-
-
-def _first_encoded_token_id(tokenizer: Any, text: str) -> int | None:
-    try:
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-    except TypeError:
-        tokens = tokenizer.encode(text)
-    if not tokens:
-        return None
-    return int(tokens[0])
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -1572,68 +1374,14 @@ def _merge_message_context(
     return merged
 
 
-def _massage_responses_continuation_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not messages or messages[-1].get("role") != "assistant":
-        return messages
-
-    trailing_start = len(messages) - 1
-    while trailing_start > 0:
-        candidate = messages[trailing_start - 1]
-        if candidate.get("role") != "assistant":
-            break
-        if candidate.get("tool_calls"):
-            break
-        trailing_start -= 1
-
-    trailing_assistants = messages[trailing_start:]
-    if not trailing_assistants:
-        return messages
-
-    if any(message.get("tool_calls") for message in trailing_assistants):
-        return messages
-
-    last_assistant = copy.deepcopy(trailing_assistants[-1])
-    continue_message = {
-        "role": "user",
-        "content": RESPONSES_CONTINUE_PROMPT,
-    }
-    return [*messages[:trailing_start], last_assistant, continue_message]
-
-
-def _massage_responses_tool_result_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not messages or messages[-1].get("role") != "tool":
-        return messages
-
-    tool_result_start = len(messages) - 1
-    while tool_result_start > 0 and messages[tool_result_start - 1].get("role") == "tool":
-        tool_result_start -= 1
-
-    if tool_result_start == 0:
-        return messages
-
-    preceding_message = messages[tool_result_start - 1]
-    if preceding_message.get("role") != "assistant" or not preceding_message.get("tool_calls"):
-        return messages
-
-    return [
-        *messages,
-        {
-            "role": "user",
-            "content": RESPONSES_TOOL_RESULT_PROMPT,
-        },
-    ]
-
-
 def _synthesize_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Qwen3 chat templates REQUIRE every assistant `tool_calls` block to be
     followed by a matching `tool` / `<tool_response>` message. If the last
     assistant message emits tool_calls with no tool_result, Qwen drops into a
-    prefill-only mode (no `<|im_start|>assistant` generation prompt), which
-    surfaces as the "empty-args loop" from turn 3+.
+    prefill-only mode (no `<|im_start|>assistant` generation prompt).
 
     This function injects synthetic `{error: "tool_result_missing"}` responses
-    for any dangling tool_calls, keeping the conversation template valid so
-    the model resumes generation correctly.
+    for any dangling tool_calls, keeping the conversation template valid.
     """
     if not messages:
         return messages
@@ -1658,16 +1406,6 @@ def _synthesize_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict
                 "content": json.dumps({"error": "tool_result_missing"}, ensure_ascii=False),
             }
         )
-    patched.append(
-        {
-            "role": "user",
-            "content": (
-                "[System: The previous assistant turn emitted tool calls that were not "
-                "delivered to the environment. Treat the tool results above as authoritative. "
-                "Do not repeat the identical tool calls; decide the next action based on the error.]"
-            ),
-        }
-    )
     return patched
 
 
@@ -3240,75 +2978,117 @@ class LocalModelServer:
     ) -> None:
         generation_ticket: int | None = None
         text_parts: list[str] = []
-        final = None
-        prompt_tokens = 0
-        started = time.time()
-        stable_prefix_key: str | None = None
-        stable_prefix_tokens: tuple[int, ...] = ()
-        prefix_cache_source = "none"
+        result: dict[str, Any] | None = None
+        total_prompt_tokens = 0
+        total_generated_tokens = 0
         try:
             generation_ticket = self._acquire_generation_turn()
-            with self._lock:
-                iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source = self._stream_generate_locked(
-                    messages,
-                    requested_max_tokens,
-                    sampling,
-                    tools=tools,
-                    previous_response_id=previous_response_id,
-                    capture_prompt_cache_state=capture_prompt_cache_state,
-                    should_stop=(stop_event.is_set if stop_event is not None else None),
-                )
-                for chunk in iterator:
-                    if chunk.text:
-                        text_parts.append(chunk.text)
-                        if not _queue_put(queue, ("text", chunk.text), stop_event):
-                            return
-                    final = chunk
-
-            if final is None:
-                raise RuntimeError("Model returned no output")
-
-            with self._lock:
-                if stable_prefix_tokens:
-                    self._remember_global_prefix_state_locked(
-                        stable_prefix_key,
-                        stable_prefix_tokens,
-                        final.prefill_state if capture_prompt_cache_state else None,
+            current_messages = list(messages)
+            remaining_max_tokens = requested_max_tokens
+            for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
+                iteration_parts: list[str] = []
+                final = None
+                prompt_tokens = 0
+                started = time.time()
+                stable_prefix_key: str | None = None
+                stable_prefix_tokens: tuple[int, ...] = ()
+                prefix_cache_source = "none"
+                with self._lock:
+                    iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source = self._stream_generate_locked(
+                        current_messages,
+                        remaining_max_tokens,
+                        sampling,
+                        tools=tools,
+                        previous_response_id=previous_response_id,
+                        capture_prompt_cache_state=capture_prompt_cache_state,
+                        should_stop=(stop_event.is_set if stop_event is not None else None),
                     )
-            result = {
-                "text": "".join(text_parts),
-                "finish_reason": final.finish_reason or "stop",
-                "prompt_tokens": prompt_tokens,
-                "prefill_seconds": final.prefill_seconds,
-                "prompt_tps": final.prompt_tps,
-                "reused_prefix_tokens": final.reused_prefix_tokens,
-                "decode_seconds": final.decode_seconds,
-                "generation_tps": final.generation_tps,
-                "generated_tokens": final.generation_tokens,
-                "speculative_steps": final.speculative_steps,
-                "proposed_tokens": final.proposed_tokens,
-                "accepted_tokens": final.accepted_tokens,
-                "avg_acceptance_length": final.avg_acceptance_length,
-                "avg_acceptance_ratio": final.avg_acceptance_ratio,
-                "acceptance_lengths": list(final.acceptance_lengths),
-                "acceptance_ratios": list(final.acceptance_ratios),
-                "block_size_history": list(final.block_size_history),
-                "adaptive_block_size": final.adaptive_block_size,
-                "prefix_cache_source": prefix_cache_source,
-                "prefill_hidden_bytes": final.prefill_hidden_bytes,
-                "prefill_target_cache_bytes": final.prefill_target_cache_bytes,
-                "prefill_logits_bytes": final.prefill_logits_bytes,
-                "prefill_working_set_bytes": final.prefill_working_set_bytes,
-                "prompt_cache_state_bytes": final.prompt_cache_state_bytes,
-                "peak_memory_gb": final.peak_memory,
-                "elapsed": time.time() - started,
-                "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
-                "engine": "dflash",
-            }
-            extra_result_fields = getattr(final, "extra_result_fields", None)
-            if isinstance(extra_result_fields, dict):
-                result.update(extra_result_fields)
+                    for chunk in iterator:
+                        if chunk.text:
+                            iteration_parts.append(chunk.text)
+                        final = chunk
+
+                if final is None:
+                    raise RuntimeError("Model returned no output")
+
+                with self._lock:
+                    if stable_prefix_tokens:
+                        self._remember_global_prefix_state_locked(
+                            stable_prefix_key,
+                            stable_prefix_tokens,
+                            final.prefill_state if capture_prompt_cache_state else None,
+                        )
+
+                total_prompt_tokens += prompt_tokens
+                total_generated_tokens += int(final.generation_tokens)
+                iteration_text = "".join(iteration_parts)
+                result = {
+                    "text": "".join(text_parts),
+                    "finish_reason": final.finish_reason or "stop",
+                    "prompt_tokens": total_prompt_tokens,
+                    "prefill_seconds": final.prefill_seconds,
+                    "prompt_tps": final.prompt_tps,
+                    "reused_prefix_tokens": final.reused_prefix_tokens,
+                    "decode_seconds": final.decode_seconds,
+                    "generation_tps": final.generation_tps,
+                    "generated_tokens": total_generated_tokens,
+                    "speculative_steps": final.speculative_steps,
+                    "proposed_tokens": final.proposed_tokens,
+                    "accepted_tokens": final.accepted_tokens,
+                    "avg_acceptance_length": final.avg_acceptance_length,
+                    "avg_acceptance_ratio": final.avg_acceptance_ratio,
+                    "acceptance_lengths": list(final.acceptance_lengths),
+                    "acceptance_ratios": list(final.acceptance_ratios),
+                    "block_size_history": list(final.block_size_history),
+                    "adaptive_block_size": final.adaptive_block_size,
+                    "prefix_cache_source": prefix_cache_source,
+                    "prefill_hidden_bytes": final.prefill_hidden_bytes,
+                    "prefill_target_cache_bytes": final.prefill_target_cache_bytes,
+                    "prefill_logits_bytes": final.prefill_logits_bytes,
+                    "prefill_working_set_bytes": final.prefill_working_set_bytes,
+                    "prompt_cache_state_bytes": final.prompt_cache_state_bytes,
+                    "peak_memory_gb": final.peak_memory,
+                    "elapsed": time.time() - started,
+                    "prompt_cache_state": final.prefill_state if capture_prompt_cache_state else None,
+                    "engine": "dflash",
+                }
+                extra_result_fields = getattr(final, "extra_result_fields", None)
+                if isinstance(extra_result_fields, dict):
+                    result.update(extra_result_fields)
+
+                remaining_max_tokens = max(
+                    0,
+                    remaining_max_tokens - max(0, int(final.generation_tokens)),
+                )
+                previous_response_id = None
+                if remaining_max_tokens <= 0:
+                    text_parts.extend(iteration_parts)
+                    result["text"] = "".join(text_parts)
+                    break
+                visible_text, tool_calls = _parse_tool_calls(iteration_text)
+                if tool_calls:
+                    text_parts.extend(iteration_parts)
+                    result["text"] = "".join(text_parts)
+                    break
+                judge_decision = self._judge_turn_completion(
+                    current_messages, visible_text, tools
+                )
+                if not judge_decision.should_continue:
+                    text_parts.extend(iteration_parts)
+                    result["text"] = "".join(text_parts)
+                    break
+                current_messages = [
+                    *current_messages,
+                    {"role": "assistant", "content": visible_text},
+                    {"role": "user", "content": judge_decision.continue_message},
+                ]
+
+            if result is None:
+                raise RuntimeError("Model returned no output")
             self._record_generation_metrics(result, surface="stream")
+            final_text = result.get("text", "")
+            if final_text and not _queue_put(queue, ("text", final_text), stop_event):
+                return
             if not _queue_put(queue, ("result", result), stop_event):
                 return
         except Exception as exc:
@@ -3353,18 +3133,20 @@ class LocalModelServer:
                         remaining_max_tokens - max(0, int(result.get("generated_tokens", 0))),
                     )
                     previous_response_id = None
-                    if (
-                        remaining_max_tokens <= 0
-                        or not _chat_result_needs_action_followup(
-                            result, tools, current_messages
-                        )
-                    ):
+                    if remaining_max_tokens <= 0:
                         break
-                    visible_text, _ = _parse_tool_calls(_coerce_text(result.get("text", "")))
+                    visible_text, tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
+                    if tool_calls:
+                        break
+                    judge_decision = self._judge_turn_completion(
+                        current_messages, visible_text, tools
+                    )
+                    if not judge_decision.should_continue:
+                        break
                     current_messages = [
                         *current_messages,
                         {"role": "assistant", "content": visible_text},
-                        {"role": "user", "content": _responses_action_prompt(tools)},
+                        {"role": "user", "content": judge_decision.continue_message},
                     ]
             if result is None:
                 raise RuntimeError("Model returned no output")
@@ -3415,214 +3197,164 @@ class LocalModelServer:
             )
             output_items = _build_output_items(result["text"])
             output_items = _convert_items_for_custom_tools(output_items, tools)
-            if _response_needs_empty_output_followup(result, output_items, tools):
-                current_messages = [
-                    *current_messages,
-                    {
-                        "role": "user",
-                        "content": RESPONSES_EMPTY_OUTPUT_PROMPT,
-                    },
-                ]
-                current_previous_response_id = None
-                continue
-            if not _response_is_followup_candidate(result, output_items, tools):
+            if any(
+                item.get("type") in {"function_call", "custom_tool_call"}
+                for item in output_items
+            ):
                 return result, output_items
             if remaining_max_tokens <= 0:
                 return result, output_items
 
             assistant_text = _output_text_from_items(output_items).strip()
-            if _assistant_text_promises_action(assistant_text):
-                need_followup = True
-            elif _task_history_requires_completion_followup(
-                current_messages, assistant_text
-            ):
-                need_followup = True
-            else:
-                need_followup = self._judge_response_needs_followup(
-                    current_messages, assistant_text, tools
-                )
-            if not need_followup:
+            judge_decision = self._judge_turn_completion(
+                current_messages, assistant_text, tools
+            )
+            if not judge_decision.should_continue:
                 return result, output_items
 
-            carry_items = [
-                item
-                for item in output_items
-                if not _is_planning_only_function_call(item)
-            ]
             current_messages = [
                 *current_messages,
-                *_messages_from_output_items(carry_items),
+                *_messages_from_output_items(output_items),
                 {
                     "role": "user",
-                    "content": _responses_action_prompt(tools),
+                    "content": judge_decision.continue_message,
                 },
             ]
             current_previous_response_id = None
 
         return result, output_items
 
-    def _judge_response_needs_followup(
+    def _judge_turn_completion(
         self,
         messages: list[dict[str, Any]],
         assistant_text: str,
         tools: list[dict[str, Any]] | None,
-    ) -> bool:
-        if not RESPONSES_FOLLOWUP_JUDGE_ENABLED:
-            return False
-
-        last_user_text = _last_user_message_text(messages)
-        tool_names = _summarize_tool_names(tools)
-
-        logprob_verdict: bool | None = None
-        logprob_margin = 0.0
-        try:
-            logprob_verdict, logprob_margin = self._judge_verdict_via_logprobs(
-                last_user_text, tool_names, assistant_text
-            )
-        except Exception as exc:
-            _logger.warning("judge logprob path failed: %s", exc)
-            logprob_verdict, logprob_margin = None, 0.0
-
-        if (
-            logprob_verdict is not None
-            and logprob_margin >= RESPONSES_FOLLOWUP_JUDGE_LOGPROB_MARGIN
-        ):
-            return logprob_verdict
-
-        # Low-margin or no logprob signal — consult the reasoning judge.
-        # `LOCAL_DFLASH_FOLLOWUP_JUDGE_TIEBREAK_VOTES` toggles best-of-N voting
-        # (default 1 = legacy single-call behavior). Set to 3 for stronger
-        # tie-breaking at the cost of extra tokens per judge invocation.
-        votes_target = max(1, int(os.environ.get("LOCAL_DFLASH_FOLLOWUP_JUDGE_TIEBREAK_VOTES", "1")))
-        reasoning_votes: list[bool] = []
-        for _ in range(votes_target):
-            verdict = self._judge_verdict_via_reasoning(
-                last_user_text, tool_names, assistant_text
-            )
-            if verdict is None:
-                break
-            reasoning_votes.append(verdict)
-            # Short-circuit: once the first 2 votes agree we already have a
-            # majority for best-of-3.
-            if (
-                votes_target >= 3
-                and len(reasoning_votes) == 2
-                and reasoning_votes[0] == reasoning_votes[1]
-            ):
-                return reasoning_votes[0]
-        if reasoning_votes:
-            incomplete_count = sum(1 for v in reasoning_votes if v)
-            complete_count = len(reasoning_votes) - incomplete_count
-            if incomplete_count != complete_count:
-                return incomplete_count > complete_count
-            return reasoning_votes[0]
-
-        if logprob_verdict is not None:
-            return logprob_verdict
-        return True
-
-    def _judge_verdict_via_logprobs(
-        self,
-        last_user_text: str,
-        tool_names: str,
-        assistant_text: str,
-    ) -> tuple[bool | None, float]:
-        self.ensure_loaded()
-        tokenizer = self._tokenizer
-        tok_y = _first_encoded_token_id(tokenizer, "Y")
-        tok_n = _first_encoded_token_id(tokenizer, "N")
-        if tok_y is None or tok_n is None or tok_y == tok_n:
-            return None, 0.0
-
-        judge_messages = [
-            {"role": "system", "content": RESPONSES_FOLLOWUP_JUDGE_LOGPROB_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Tools available: {tool_names}\n\n"
-                    f"User's latest message:\n{last_user_text or '(not shown)'}\n\n"
-                    f"Agent's latest response:\n{assistant_text}\n\n"
-                    "Answer with exactly one letter: Y if the turn is complete, N if the agent still needs to act."
-                ),
-            },
-        ]
-        try:
-            prompt_tokens = tokenizer.apply_chat_template(
-                judge_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            prompt_tokens = tokenizer.apply_chat_template(
-                judge_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-        if hasattr(prompt_tokens, "tolist"):
-            prompt_tokens = prompt_tokens.tolist()
-        run = prefill_prompt(
-            self._model,
-            tokenizer,
-            prompt_tokens,
-            target_turboquant_bits=self.target_turboquant_bits,
-            prefix_state=None,
-            capture_prefill_state=False,
+    ) -> FollowupJudgeDecision:
+        judge_messages = self._build_followup_judge_messages(
+            messages, assistant_text, tools
         )
-        row = run.logits[0, -1, :].astype(mx.float32)
-        mx.eval(row)
-        logit_y = float(row[tok_y].item())
-        logit_n = float(row[tok_n].item())
-        margin = abs(logit_n - logit_y)
-        is_incomplete = logit_n > logit_y
-        return is_incomplete, margin
+        for attempt in range(2):
+            original_engine = self.generation_engine
+            original_disable_thinking = self.disable_thinking
+            self.generation_engine = "dflash"
+            self.disable_thinking = True
+            try:
+                _, judge_result = self._generate_locked(
+                    judge_messages,
+                    RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS,
+                    SamplingParams(
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        min_p=0.0,
+                        presence_penalty=0.0,
+                        repetition_penalty=0.0,
+                        frequency_penalty=0.0,
+                    ),
+                    tools=[FOLLOWUP_JUDGE_TOOL],
+                )
+            finally:
+                self.generation_engine = original_engine
+                self.disable_thinking = original_disable_thinking
+            raw = _coerce_text(judge_result.get("text", ""))
+            decision = self._parse_followup_judge_output(raw)
+            if decision is not None:
+                return decision
+            _, visible = _strip_reasoning_blocks(raw)
+            _logger.warning(
+                "follow-up judge returned invalid output on attempt %s: %r",
+                attempt + 1,
+                visible[:1000],
+            )
+            if attempt == 0:
+                judge_messages = [
+                    *self._build_followup_judge_messages(messages, assistant_text, tools),
+                    {
+                        "role": "user",
+                        "content": FOLLOWUP_JUDGE_RETRY_PROMPT,
+                    },
+                ]
+        _logger.error("follow-up judge returned invalid JSON; returning latest assistant response")
+        return FollowupJudgeDecision(False, "", "follow-up judge returned invalid JSON")
 
-    def _judge_verdict_via_reasoning(
+    @classmethod
+    def _parse_followup_judge_output(cls, raw: str) -> FollowupJudgeDecision | None:
+        _, visible = _strip_reasoning_blocks(raw)
+        _, tool_calls = _parse_tool_calls(visible)
+        for tool_call in tool_calls:
+            if str(tool_call.get("name") or "") != "judge_decision":
+                continue
+            arguments = tool_call.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    parsed_arguments = json.loads(arguments) if arguments.strip() else {}
+                except json.JSONDecodeError:
+                    continue
+            elif isinstance(arguments, dict):
+                parsed_arguments = arguments
+            else:
+                continue
+            decision = cls._parse_followup_judge_decision(parsed_arguments)
+            if decision is not None:
+                return decision
+
+        return cls._parse_followup_judge_decision(_extract_json_object(visible))
+
+    def _build_followup_judge_messages(
         self,
-        last_user_text: str,
-        tool_names: str,
+        messages: list[dict[str, Any]],
         assistant_text: str,
-    ) -> bool | None:
-        judge_messages = [
-            {"role": "system", "content": RESPONSES_FOLLOWUP_JUDGE_JSON_SYSTEM_PROMPT},
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        recent_messages = messages[-12:]
+        return [
+            {"role": "system", "content": FOLLOWUP_JUDGE_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    f"Tools available: {tool_names}\n\n"
-                    f"User's latest message:\n{last_user_text or '(not shown)'}\n\n"
-                    f"Agent's latest response:\n{assistant_text}\n\n"
-                    'Respond with ONLY: {"reason":"<one short sentence>","verdict":"COMPLETE"|"INCOMPLETE"}.'
+                "content": json.dumps(
+                    {
+                        "available_tools": sorted(_available_tool_names(tools)),
+                        "conversation": recent_messages,
+                        "latest_assistant_response": assistant_text,
+                        "last_tool_result": _last_tool_result_message(recent_messages),
+                    },
+                    ensure_ascii=False,
+                    default=str,
                 ),
             },
         ]
-        try:
-            _, judge_result = self._generate_locked(
-                judge_messages,
-                RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS,
-                SamplingParams(
-                    temperature=0.0,
-                    top_p=1.0,
-                    top_k=0,
-                    min_p=0.0,
-                    presence_penalty=0.0,
-                    repetition_penalty=0.0,
-                    frequency_penalty=0.0,
-                ),
-            )
-        except Exception as exc:
-            _logger.warning("judge reasoning generation failed: %s", exc)
+
+    @staticmethod
+    def _parse_followup_judge_decision(
+        parsed: dict[str, Any] | None,
+    ) -> FollowupJudgeDecision | None:
+        if not isinstance(parsed, dict):
             return None
-        raw = _coerce_text(judge_result.get("text", ""))
-        _, visible = _strip_reasoning_blocks(raw)
-        parsed = _extract_json_object(visible)
-        if not parsed:
-            return None
-        verdict = str(parsed.get("verdict") or "").strip().upper()
-        if verdict.startswith("INCOMPLETE"):
-            return True
-        if verdict.startswith("COMPLETE"):
-            return False
+        verdict = str(parsed.get("verdict") or "").strip().lower()
+        continue_message = _coerce_text(parsed.get("continue_message")).strip()
+        reason = _coerce_text(parsed.get("reason")).strip()
+        if verdict == "final":
+            return FollowupJudgeDecision(False, "", reason)
+        if (
+            verdict == "continue"
+            and continue_message
+            and LocalModelServer._is_valid_followup_continue_message(continue_message)
+        ):
+            return FollowupJudgeDecision(True, continue_message, reason)
         return None
+
+    @staticmethod
+    def _is_valid_followup_continue_message(message: str) -> bool:
+        normalized = " ".join(message.lower().split())
+        blocked_fragments = (
+            "thought process",
+            "chain of thought",
+            "internal reasoning",
+            "hidden reasoning",
+            "continue reasoning",
+            "continue the reasoning",
+        )
+        return not any(fragment in normalized for fragment in blocked_fragments)
 
     def _responses_generation_worker(
         self,
@@ -4830,12 +4562,9 @@ def create_app(server: LocalModelServer) -> FastAPI:
             if req.model != server.model_name:
                 raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
             max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
-            chat_messages = _massage_chat_tool_result_messages(
-                [m.model_dump() for m in req.messages]
-            )
             return StreamingResponse(
                 server.stream_chat_completions(
-                    chat_messages,
+                    [m.model_dump() for m in req.messages],
                     max_tokens,
                     sampling,
                     tools=tools,
@@ -4852,12 +4581,9 @@ def create_app(server: LocalModelServer) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
         max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
-        chat_messages = _massage_chat_tool_result_messages(
-            [m.model_dump() for m in req.messages]
-        )
         try:
             result = server.generate(
-                chat_messages,
+                [m.model_dump() for m in req.messages],
                 max_tokens,
                 sampling,
                 tools=tools,
@@ -4962,8 +4688,6 @@ def create_app(server: LocalModelServer) -> FastAPI:
             )
         except UnknownPreviousResponseError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        messages = _massage_responses_continuation_messages(messages)
-        messages = _massage_responses_tool_result_messages(messages)
         messages = _synthesize_orphan_tool_results(messages)
         max_tokens = _responses_max_tokens(req.max_output_tokens, tools)
         has_tools = bool(tools)

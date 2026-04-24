@@ -10,6 +10,8 @@ PORT="${LOCAL_DFLASH_PORT:-8010}"
 HOST="${LOCAL_DFLASH_HOST:-127.0.0.1}"
 HEALTH_URL="http://${HOST}:${PORT}/health"
 METRICS_URL="http://${HOST}:${PORT}/metrics"
+DFLASH_PROFILE_114_PASSTHROUGH=()
+DFLASH_PROFILE_114_PASSTHROUGH_READY=0
 
 get_running_pid() {
   if [[ -f "${PID_FILE}" ]]; then
@@ -73,7 +75,7 @@ cmd_status() {
 
 cmd_start() {
   prepare_profile_114_args "$@"
-  if ((${#DFLASH_PROFILE_114_PASSTHROUGH[@]})); then
+  if [[ "${DFLASH_START_FORWARD_PASSTHROUGH:-1}" == "1" ]] && ((${#DFLASH_PROFILE_114_PASSTHROUGH[@]})); then
     set -- "${DFLASH_PROFILE_114_PASSTHROUGH[@]}"
   else
     set --
@@ -283,6 +285,7 @@ prepare_profile_114_args() {
   if ((${#passthrough[@]})); then
     DFLASH_PROFILE_114_PASSTHROUGH=("${passthrough[@]}")
   fi
+  DFLASH_PROFILE_114_PASSTHROUGH_READY=1
 }
 
 cmd_restart_114() {
@@ -787,7 +790,6 @@ cmd_opencode_auto() {
 }
 
 cmd_codex() {
-  cmd_start
   exec "${SCRIPT_DIR}/run_codex_local.sh" "$@"
 }
 
@@ -911,7 +913,7 @@ server commands:
 client commands:
   opencode       launch OpenCode against the local server (forwards extra args)
   opencode-auto  launch supervised OpenCode one-shot mode with watchdog/restarts
-  codex          launch Codex against the local server (forwards extra args)
+  codex          launch Codex against the local server (does not start the server; forwards extra args)
 
 autonomous queue:
   queue --dir <workdir> "<goal>"

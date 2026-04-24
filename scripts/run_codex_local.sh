@@ -89,7 +89,7 @@ model_catalog_json = "${CATALOG_PATH}"
 # ----- model knobs (non-reasoning local) -----
 model_context_window = ${LOCAL_CONTEXT_WINDOW}
 model_auto_compact_token_limit = ${LOCAL_AUTO_COMPACT_LIMIT}
-model_reasoning_effort = "high"
+model_reasoning_effort = "medium"
 plan_mode_reasoning_effort = "low"
 model_reasoning_summary = "none"
 model_supports_reasoning_summaries = false
