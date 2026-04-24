@@ -10,7 +10,7 @@ import json
 import logging
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
 import re
 import time
@@ -22,6 +22,7 @@ import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from jinja2 import Environment
 from pydantic import BaseModel, ConfigDict
 
 from dflash.ddtree_engine import generate_ddtree
@@ -138,6 +139,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 STREAM_HEARTBEAT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_HEARTBEAT_SECONDS", 1.0)
+STREAM_RESULT_TIMEOUT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_RESULT_TIMEOUT_SECONDS", 600.0)
 STREAM_QUEUE_MAX_CHUNKS = _env_positive_int("LOCAL_DFLASH_STREAM_QUEUE_MAX_CHUNKS", 32)
 STREAM_QUEUE_PUT_TIMEOUT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_QUEUE_PUT_TIMEOUT_SECONDS", 0.5)
 RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 8)
@@ -149,10 +151,25 @@ PREFIX_CACHE_STATE_BYTE_LIMIT = _env_non_negative_int(
 )
 GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CACHE_LIMIT", 1)
 MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
-RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 2)
+MAX_TOOL_TURN_TOKENS = _env_positive_int("LOCAL_DFLASH_MAX_TOOL_TURN_TOKENS", 4096)
+RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 15)
 ALLOW_APPLY_PATCH_TOOL = _env_bool("LOCAL_DFLASH_ALLOW_APPLY_PATCH_TOOL", False)
+FOLLOWUP_JUDGE_ENABLED = _env_bool("LOCAL_DFLASH_FOLLOWUP_JUDGE", False)
 RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS = _env_positive_int(
     "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 256
+)
+PROTOCOL_TOOL_RETRY_PROMPT = (
+    "[System protocol retry: the previous assistant turn was discarded because "
+    "it did not contain a valid tool call. This retry accepts only one valid "
+    "tool call. Do not continue, summarize, refer to discarded text, plan in "
+    "prose, output markdown code blocks, or return a final answer on this retry. "
+    "Output exactly one valid tool call now using the declared format.]"
+)
+PROTOCOL_REPEATED_TOOL_RETRY_PROMPT = (
+    "[System protocol retry: the previous assistant turn repeated the same tool "
+    "call that was just executed. This retry accepts only one different valid "
+    "tool call that advances the task. Do not repeat the same command or same "
+    "arguments.]"
 )
 FOLLOWUP_JUDGE_SYSTEM_PROMPT = (
     "Return only compact JSON. No prose. No markdown. No reasoning. "
@@ -193,22 +210,22 @@ FOLLOWUP_JUDGE_TOOL = {
         },
     },
 }
-TOOL_CALLING_RULES_PROMPT = (
-    "Tool-calling rules (strict):\n"
-    "- Function calls MUST be wrapped in <tool_call>...</tool_call>. The JSON body must parse as a single object with keys \"name\" and \"arguments\".\n"
-    "- Do NOT omit the opening <tool_call> tag, even after prose.\n"
-    "- Use the <cwd> from environment_context as the project root for shell workdir and file paths. Never create or edit user projects under CODEX_HOME, /tmp/codex-local-dflash, /private/tmp/codex-local-dflash, plugin directories, or skill directories unless the user explicitly asks.\n"
-    "- Required parameters MUST be present. Do not emit tool calls with \"arguments\": {} unless the schema has zero required fields.\n"
-    "- Keep each tool call small enough to be reliable. Prefer focused edits or commands over very large inline shell heredocs."
-)
-TOOL_CALLING_RULES_APPLY_PATCH_PROMPT = (
-    "\n- The apply_patch tool is available. Use it for precise repository file edits when appropriate."
-)
+TOOL_CALLING_RULES_TEMPLATE = """Tool-calling rules (strict):
+- Function calls MUST use the Qwen XML format exactly:
+  <tool_call><function=tool_name><parameter=param_name>value</parameter></function></tool_call>
+- The assistant message MUST contain only one tool call when calling a tool.
+- Do NOT add prose before or after a tool call.
+- Required parameters MUST be present. Do not emit empty arguments unless the schema has zero required fields.
+- Use only these available tools:
+{% for tool in tools %}
+  - {{ tool.name }}{% if tool.kind %} ({{ tool.kind }}){% endif %}{% if tool.required %}; required: {{ tool.required | join(", ") }}{% endif %}{% if tool.properties %}; parameters: {{ tool.properties | join(", ") }}{% endif %}{% if tool.description %}; description: {{ tool.description }}{% endif %}
+{% endfor %}"""
+TOOL_CALLING_RULES_ENV = Environment(autoescape=False, trim_blocks=True, lstrip_blocks=True)
 TOOL_CALLING_RULES_ENABLED = _env_bool("LOCAL_DFLASH_TOOL_CALLING_RULES", True)
 
 
 DEFAULT_TEMPERATURE_NO_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE", 0.6)
-DEFAULT_TEMPERATURE_WITH_TOOLS = _env_positive_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS", 0.3)
+DEFAULT_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS", 0.0)
 DEFAULT_TOP_P = _env_positive_float("LOCAL_DFLASH_DEFAULT_TOP_P", 0.8)
 DEFAULT_TOP_K = _env_non_negative_int("LOCAL_DFLASH_DEFAULT_TOP_K", 20)
 DEFAULT_MIN_P = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_MIN_P", 0.0)
@@ -220,6 +237,7 @@ DEFAULT_REPETITION_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_REPET
 DEFAULT_FREQUENCY_PENALTY = _env_non_negative_float("LOCAL_DFLASH_DEFAULT_FREQUENCY_PENALTY", 0.0)
 DEFAULT_MAX_TOKENS_FALLBACK = _env_positive_int("LOCAL_DFLASH_DEFAULT_MAX_TOKENS", 8192)
 MIN_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS", 0.0)
+MAX_TEMPERATURE_WITH_TOOLS = _env_non_negative_float("LOCAL_DFLASH_MAX_TEMPERATURE_WITH_TOOLS", 0.2)
 
 
 def _coerce_sampling_arg(sampling: Any, temperature: float | None) -> "SamplingParams":
@@ -273,6 +291,8 @@ class SamplingParams:
             temp = DEFAULT_TEMPERATURE_WITH_TOOLS if temperature is None else float(temperature)
             if temp < MIN_TEMPERATURE_WITH_TOOLS:
                 temp = DEFAULT_TEMPERATURE_WITH_TOOLS
+            if temp > MAX_TEMPERATURE_WITH_TOOLS:
+                temp = MAX_TEMPERATURE_WITH_TOOLS
             pp = DEFAULT_PRESENCE_PENALTY if presence_penalty is None else float(presence_penalty)
             rp = DEFAULT_REPETITION_PENALTY if repetition_penalty is None else float(repetition_penalty)
         else:
@@ -291,8 +311,13 @@ class SamplingParams:
 
 
 class OpenAIMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"] | str
-    content: str
+    role: Literal["system", "developer", "user", "assistant", "tool"] | str
+    content: Any = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+    function_call: Any = None
+    model_config = ConfigDict(extra="allow")
 
 
 class OpenAIChatRequest(BaseModel):
@@ -523,7 +548,7 @@ def _extract_text_from_content(content: Any) -> str:
 
 def _coerce_tool_arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
-        return value
+        return _normalize_tool_argument_literals(value)
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
@@ -532,8 +557,49 @@ def _coerce_tool_arguments(value: Any) -> dict[str, Any]:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
             return {"input": stripped}
+        parsed = _normalize_tool_argument_literals(parsed)
         return parsed if isinstance(parsed, dict) else {"input": parsed}
-    return {"input": value}
+    return {"input": _normalize_tool_argument_literals(value)}
+
+
+def _normalize_tool_argument_literals(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _normalize_tool_argument_literals(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_normalize_tool_argument_literals(inner) for inner in value]
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        if lowered == "null":
+            return None
+    return value
+
+
+def _sanitize_function_call_arguments(name: str, arguments: Any) -> dict[str, Any]:
+    coerced = _coerce_tool_arguments(arguments)
+    if isinstance(coerced, dict) and "command" not in coerced:
+        for alias in ("cmd", "script", "shell_command", "bash_command"):
+            if alias in coerced:
+                coerced = dict(coerced)
+                coerced["command"] = coerced[alias]
+                break
+    if name in SHELL_TOOL_NAMES:
+        coerced = dict(coerced)
+        if "command" not in coerced:
+            for alias in ("cmd", "script"):
+                if alias in coerced:
+                    coerced["command"] = coerced[alias]
+                    break
+        if name == "exec":
+            coerced.pop("cmd", None)
+            coerced.pop("script", None)
+        if coerced.get("sandbox_permissions") == "require_escalated":
+            coerced.pop("sandbox_permissions", None)
+            coerced.pop("justification", None)
+    return coerced
 
 
 def _canonical_tool_arguments(value: Any) -> str:
@@ -556,6 +622,13 @@ def _parse_param_value(value: str) -> Any:
     stripped = value.strip()
     if not stripped:
         return ""
+    lowered = stripped.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
@@ -732,7 +805,7 @@ def _make_function_call_item(
         "id": item_id or f"fc_{uuid.uuid4().hex}",
         "call_id": call_id or f"call_{uuid.uuid4().hex}",
         "name": name,
-        "arguments": json.dumps(_coerce_tool_arguments(arguments), ensure_ascii=False),
+        "arguments": json.dumps(_sanitize_function_call_arguments(name, arguments), ensure_ascii=False),
         "status": "completed",
     }
 
@@ -902,13 +975,21 @@ def _tool_call_items_from_payload(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+@dataclass
+class ToolCallParseResult:
+    visible_text: str
+    tool_calls: list[dict[str, Any]]
+    incomplete: bool = False
+    formats: list[str] = field(default_factory=list)
+
+
+def _parse_tool_calls_detailed(text: str) -> ToolCallParseResult:
     cleaned = _clean_output_text(text)
     # Track consumed (start, end) spans so we don't double-parse a single
     # `<tool_call>` that contains both nested `<function=...>` XML (Qwen3-Coder)
     # and a bare JSON body the outer TAGGED pattern also matches.
     consumed_spans: list[tuple[int, int]] = []
-    parsed_blocks: list[tuple[int, int, list[dict[str, Any]]]] = []
+    parsed_blocks: list[tuple[int, int, list[dict[str, Any]], str]] = []
 
     def _span_overlaps(start: int, end: int) -> bool:
         for s, e in consumed_spans:
@@ -931,6 +1012,7 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
                         params,
                     )
                 ],
+                "qwen_xml",
             )
         )
 
@@ -940,7 +1022,7 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
         parsed = _tool_call_items_from_payload(match.group("body"))
         if parsed:
             consumed_spans.append((match.start(), match.end()))
-            parsed_blocks.append((match.start(), match.end(), parsed))
+            parsed_blocks.append((match.start(), match.end(), parsed, "tagged_json"))
 
     for match in FENCED_TOOL_CALL_RE.finditer(cleaned):
         if _span_overlaps(match.start(), match.end()):
@@ -948,14 +1030,68 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
         parsed = _tool_call_items_from_payload(match.group("body"))
         if parsed:
             consumed_spans.append((match.start(), match.end()))
-            parsed_blocks.append((match.start(), match.end(), parsed))
+            parsed_blocks.append((match.start(), match.end(), parsed, "fenced_json"))
 
     tool_calls: list[dict[str, Any]] = []
-    for _, _, items in sorted(parsed_blocks, key=lambda entry: entry[0]):
+    formats: list[str] = []
+    for _, _, items, parse_format in sorted(parsed_blocks, key=lambda entry: entry[0]):
         tool_calls.extend(items)
+        formats.extend([parse_format] * len(items))
 
     visible_text = _extract_visible_text(cleaned)
-    return _clean_output_text(visible_text), tool_calls
+    return ToolCallParseResult(
+        _clean_output_text(visible_text),
+        tool_calls,
+        incomplete=_has_unterminated_tool_call_markup(cleaned),
+        formats=formats,
+    )
+
+
+def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    result = _parse_tool_calls_detailed(text)
+    return result.visible_text, result.tool_calls
+
+
+def _tool_call_parse_format_label(formats: list[str]) -> str:
+    ordered: list[str] = []
+    for parse_format in formats:
+        if parse_format not in ordered:
+            ordered.append(parse_format)
+    if not ordered:
+        return "none"
+    if len(ordered) == 1:
+        return ordered[0]
+    return "mixed"
+
+
+def _tool_call_parse_format_code(label: str) -> int:
+    return {
+        "none": 0,
+        "qwen_xml": 1,
+        "tagged_json": 2,
+        "fenced_json": 3,
+        "mixed": 4,
+    }.get(label, 0)
+
+
+def _annotate_agentic_metrics(
+    result: dict[str, Any],
+    *,
+    tools: list[dict[str, Any]] | None,
+    protocol_no_tool_retries: int,
+    protocol_malformed_tool_retries: int,
+) -> dict[str, Any]:
+    _, visible_text = _strip_reasoning_blocks(_coerce_text(result.get("text", "")))
+    parsed = _parse_tool_calls_detailed(visible_text)
+    parse_format = _tool_call_parse_format_label(parsed.formats)
+    result["tool_call_count"] = len(parsed.tool_calls)
+    result["tool_call_parse_incomplete"] = 1 if parsed.incomplete else 0
+    result["tool_call_parse_format"] = parse_format
+    result["tool_call_parse_format_code"] = _tool_call_parse_format_code(parse_format)
+    result["protocol_no_tool_retries"] = int(protocol_no_tool_retries)
+    result["protocol_malformed_tool_retries"] = int(protocol_malformed_tool_retries)
+    result["protocol_final_with_tools"] = 1 if tools and not parsed.tool_calls else 0
+    return result
 
 
 def _make_internal_tool_call(name: str, arguments: Any, *, call_id: str | None = None) -> dict[str, Any]:
@@ -968,6 +1104,24 @@ def _make_internal_tool_call(name: str, arguments: Any, *, call_id: str | None =
             "arguments": _coerce_tool_arguments(arguments),
         }
     }
+
+
+def _openai_tool_call_from_item(item: dict[str, Any], index: int | None = None) -> dict[str, Any]:
+    if item.get("type") == "custom_tool_call":
+        arguments = json.dumps({"input": _coerce_text(item.get("input"))}, ensure_ascii=False)
+    else:
+        arguments = _coerce_text(item.get("arguments"))
+    payload = {
+        "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}",
+        "type": "function",
+        "function": {
+            "name": item.get("name") or "tool",
+            "arguments": arguments,
+        },
+    }
+    if index is not None:
+        payload["index"] = index
+    return payload
 
 
 def _approx_tokens_bytes(tokens: Any) -> int:
@@ -1017,6 +1171,13 @@ def _response_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "acceptance_ratios": result.get("acceptance_ratios", []),
         "block_size_history": result.get("block_size_history", []),
         "adaptive_block_size": result.get("adaptive_block_size", False),
+        "tool_call_count": result.get("tool_call_count", 0),
+        "tool_call_parse_incomplete": result.get("tool_call_parse_incomplete", 0),
+        "tool_call_parse_format": result.get("tool_call_parse_format", "none"),
+        "tool_call_parse_format_code": result.get("tool_call_parse_format_code", 0),
+        "protocol_no_tool_retries": result.get("protocol_no_tool_retries", 0),
+        "protocol_malformed_tool_retries": result.get("protocol_malformed_tool_retries", 0),
+        "protocol_final_with_tools": result.get("protocol_final_with_tools", 0),
         "peak_memory_gb": result["peak_memory_gb"],
         "elapsed": result["elapsed"],
     }
@@ -1065,6 +1226,182 @@ def _response_completion_state(result: dict[str, Any]) -> tuple[str, dict[str, A
         return "incomplete", {"reason": "max_output_tokens"}
 
     return "completed", None
+
+
+def _has_tool_call_item(output_items: list[dict[str, Any]]) -> bool:
+    return any(
+        item.get("type") in {"function_call", "custom_tool_call"}
+        for item in output_items
+    )
+
+
+def _tool_call_signature(name: Any, arguments: Any) -> tuple[str, str]:
+    name_text = _coerce_text(name or "tool")
+    normalized_arguments = _coerce_tool_arguments(arguments)
+    if name_text in SHELL_TOOL_NAMES:
+        for command_key in ("cmd", "command", "script"):
+            command = normalized_arguments.get(command_key)
+            if isinstance(command, str):
+                normalized_arguments = {command_key: command}
+                break
+    return (name_text, _canonical_tool_arguments(normalized_arguments))
+
+
+def _output_tool_call_signatures(output_items: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    signatures: set[tuple[str, str]] = set()
+    for item in output_items:
+        if item.get("type") == "function_call":
+            signatures.add(_tool_call_signature(item.get("name"), item.get("arguments")))
+        elif item.get("type") == "custom_tool_call":
+            signatures.add(_tool_call_signature(item.get("name"), {"input": item.get("input")}))
+    return signatures
+
+
+def _last_assistant_tool_call_signatures(messages: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            continue
+        signatures: set[tuple[str, str]] = set()
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function_payload = tool_call.get("function")
+            if isinstance(function_payload, dict):
+                signatures.add(
+                    _tool_call_signature(
+                        function_payload.get("name") or tool_call.get("name"),
+                        function_payload.get("arguments") or {},
+                    )
+                )
+            else:
+                signatures.add(_tool_call_signature(tool_call.get("name"), tool_call.get("arguments") or {}))
+        return signatures
+    return set()
+
+
+def _repeats_last_tool_call(
+    messages: list[dict[str, Any]],
+    output_items: list[dict[str, Any]],
+) -> bool:
+    latest = _output_tool_call_signatures(output_items)
+    if not latest:
+        return False
+    previous = _last_assistant_tool_call_signatures(messages)
+    return bool(previous and latest and latest.issubset(previous))
+
+
+def _protocol_error_tool_call_text(
+    tools: list[dict[str, Any]] | None,
+    reason: str,
+) -> str:
+    tool_names = list(_available_tool_names(tools))
+    tool_name = next((name for name in tool_names if name in SHELL_TOOL_NAMES), None)
+    if tool_name is None:
+        tool_name = tool_names[0] if tool_names else "shell_command"
+    if tool_name in SHELL_TOOL_NAMES:
+        arguments: dict[str, Any] = {
+            "command": (
+                "printf '%s\\n' "
+                + json.dumps(f"LOCAL_DFLASH_PROTOCOL_ERROR: {reason}")
+                + " >&2; exit 2"
+            ),
+            "workdir": os.getcwd(),
+            "timeout_ms": 10000,
+        }
+    else:
+        arguments = {"input": f"LOCAL_DFLASH_PROTOCOL_ERROR: {reason}"}
+    payload = {"name": tool_name, "arguments": arguments}
+    return "<tool_call>" + json.dumps(payload, ensure_ascii=False) + "</tool_call>"
+
+
+def _protocol_error_tool_call_result(
+    tools: list[dict[str, Any]] | None,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "text": _protocol_error_tool_call_text(tools, reason),
+        "finish_reason": "stop",
+        "prompt_tokens": 0,
+        "prefill_seconds": 0.0,
+        "prompt_tps": 0.0,
+        "reused_prefix_tokens": 0,
+        "decode_seconds": 0.0,
+        "generation_tps": 0.0,
+        "generated_tokens": 0,
+        "speculative_steps": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "avg_acceptance_length": 0.0,
+        "avg_acceptance_ratio": 0.0,
+        "acceptance_lengths": [],
+        "acceptance_ratios": [],
+        "block_size_history": [],
+        "adaptive_block_size": False,
+        "prefix_cache_source": "none",
+        "peak_memory_gb": 0.0,
+        "elapsed": 0.0,
+        "prompt_cache_state": None,
+        "engine": "protocol",
+        "protocol_timeout_tool_call": 1,
+    }
+
+
+def _force_protocol_error_tool_call_if_needed(
+    result: dict[str, Any],
+    output_items: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not tools or _has_tool_call_item(output_items):
+        return result, output_items
+    forced = _protocol_error_tool_call_result(
+        tools,
+        "assistant returned prose or markdown instead of the required tool call; write files or run commands through tools",
+    )
+    forced.update({key: value for key, value in result.items() if key != "text"})
+    return forced, _build_output_items(forced["text"])
+
+
+def _should_protocol_retry_without_tool(
+    result: dict[str, Any],
+    output_items: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> bool:
+    if not tools or _has_tool_call_item(output_items):
+        return False
+    if not FOLLOWUP_JUDGE_ENABLED:
+        return True
+    raw_text = _coerce_text(result.get("text", ""))
+    visible_text = _output_text_from_items(output_items).strip()
+    finish_reason = _coerce_text(result.get("finish_reason")).strip().lower()
+    if not visible_text:
+        return True
+    if _has_unterminated_tool_call_markup(raw_text):
+        return True
+    return finish_reason in {"length", "max_tokens", "max_output_tokens"}
+
+
+def _tool_iteration_max_tokens(remaining_max_tokens: int, tools: list[dict[str, Any]] | None) -> int:
+    remaining = max(1, int(remaining_max_tokens))
+    if not tools:
+        return remaining
+    return max(1, min(remaining, MAX_TOOL_TURN_TOKENS))
+
+
+def _stream_result_timed_out(started_monotonic: float) -> bool:
+    return (
+        STREAM_RESULT_TIMEOUT_SECONDS > 0
+        and (time.monotonic() - started_monotonic) >= STREAM_RESULT_TIMEOUT_SECONDS
+    )
+
+
+def _stream_result_timeout_message() -> str:
+    return (
+        "Generation timed out before producing a protocol result "
+        f"after {STREAM_RESULT_TIMEOUT_SECONDS:g}s"
+    )
 
 
 def _classify_error_code(message: str, exc: Exception | None = None) -> str:
@@ -1173,11 +1510,132 @@ def _filter_disabled_tool_calls(items: list[dict[str, Any]]) -> list[dict[str, A
     return filtered
 
 
+def _tool_contract_rows(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for tool in _normalize_tool_schemas(_filter_disabled_tools(tools or [])):
+        if tool.get("type") == "custom":
+            rows.append(
+                {
+                    "name": _coerce_text(tool.get("name")),
+                    "kind": "custom/freeform",
+                    "required": [],
+                    "properties": ["input"],
+                    "description": _coerce_text(tool.get("description")).strip(),
+                }
+            )
+            continue
+        function_payload = tool.get("function")
+        if not isinstance(function_payload, dict):
+            continue
+        parameters = function_payload.get("parameters")
+        properties: list[str] = []
+        required: list[str] = []
+        if isinstance(parameters, dict):
+            raw_properties = parameters.get("properties")
+            if isinstance(raw_properties, dict):
+                properties = [str(key) for key in raw_properties.keys()]
+            raw_required = parameters.get("required")
+            if isinstance(raw_required, list):
+                required = [str(key) for key in raw_required]
+        rows.append(
+            {
+                "name": _coerce_text(function_payload.get("name")),
+                "kind": "function",
+                "required": required,
+                "properties": properties,
+                "description": _coerce_text(function_payload.get("description")).strip(),
+            }
+        )
+    return rows
+
+
 def _tool_calling_rules_prompt(tools: list[dict[str, Any]] | None) -> str:
-    prompt = TOOL_CALLING_RULES_PROMPT
-    if "apply_patch" in _available_tool_names(tools):
-        prompt += TOOL_CALLING_RULES_APPLY_PATCH_PROMPT
-    return prompt
+    template = TOOL_CALLING_RULES_ENV.from_string(TOOL_CALLING_RULES_TEMPLATE)
+    return template.render(tools=_tool_contract_rows(tools)).strip()
+
+
+def _ensure_tool_calling_rules_message(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if not tools or not TOOL_CALLING_RULES_ENABLED:
+        return messages
+    rules = _tool_calling_rules_prompt(tools)
+    for message in messages:
+        if message.get("role") == "system" and "Tool-calling rules (strict):" in _coerce_text(message.get("content")):
+            return messages
+
+    normalized = list(messages)
+    if normalized and normalized[0].get("role") == "system":
+        first = dict(normalized[0])
+        existing = _coerce_text(first.get("content")).strip()
+        first["content"] = f"{existing}\n\n{rules}" if existing else rules
+        normalized[0] = first
+        return normalized
+
+    return [{"role": "system", "content": rules}, *normalized]
+
+
+def _ensure_system_directive(
+    messages: list[dict[str, Any]],
+    directive: str | None,
+) -> list[dict[str, Any]]:
+    if not directive:
+        return messages
+    normalized = list(messages)
+    if normalized and normalized[0].get("role") == "system":
+        first = dict(normalized[0])
+        existing = _coerce_text(first.get("content")).strip()
+        if directive in existing:
+            return normalized
+        first["content"] = f"{existing}\n\n{directive}" if existing else directive
+        normalized[0] = first
+        return normalized
+    return [{"role": "system", "content": directive}, *normalized]
+
+
+def _tool_choice_mode_and_name(tool_choice: Any) -> tuple[str, str | None]:
+    if tool_choice is None:
+        return "auto", None
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.strip().lower()
+        if normalized in {"none", "auto", "required", "any"}:
+            return ("required" if normalized == "any" else normalized), None
+        return "specific", tool_choice.strip() or None
+    if isinstance(tool_choice, dict):
+        choice_type = _coerce_text(tool_choice.get("type")).strip().lower()
+        if choice_type in {"none", "auto", "required", "any"}:
+            return ("required" if choice_type == "any" else choice_type), None
+        if choice_type in {"function", "tool"}:
+            function_payload = tool_choice.get("function")
+            name = None
+            if isinstance(function_payload, dict):
+                name = function_payload.get("name")
+            if name is None:
+                name = tool_choice.get("name")
+            return "specific", _coerce_text(name).strip() or None
+    return "auto", None
+
+
+def _apply_tool_choice_to_tools(
+    tools: list[dict[str, Any]],
+    tool_choice: Any,
+) -> tuple[list[dict[str, Any]], str | None]:
+    mode, name = _tool_choice_mode_and_name(tool_choice)
+    if mode == "none":
+        return [], None
+    if mode == "specific" and name:
+        selected = [tool for tool in tools if _tool_name(tool) == name]
+        return selected, (
+            f"Tool choice requires calling `{name}`. Emit exactly one `{name}` tool call "
+            "using the declared tool-call format unless the request is impossible."
+        )
+    if mode == "required":
+        return tools, (
+            "Tool choice requires a tool call. Emit exactly one available tool call "
+            "using the declared tool-call format unless the request is impossible."
+        )
+    return tools, None
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -1258,9 +1716,9 @@ def _build_output_items(full_text: str) -> list[dict[str, Any]]:
         deduped_tool_calls.append(tool_call)
         previous_signature = signature
     items: list[dict[str, Any]] = []
-    if reasoning_text:
+    if reasoning_text and not deduped_tool_calls:
         items.append(_make_reasoning_item(reasoning_text))
-    if assistant_text:
+    if assistant_text and not deduped_tool_calls:
         items.append(_make_message_item(assistant_text))
     items.extend(deduped_tool_calls)
     if not items:
@@ -1417,10 +1875,17 @@ def _leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _responses_max_tokens(requested_max_tokens: int | None, tools: list[dict[str, Any]] | None) -> int:
+    if requested_max_tokens is not None and int(requested_max_tokens) <= 0:
+        raise HTTPException(status_code=400, detail="max_output_tokens must be positive")
     max_tokens = requested_max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
     if tools:
         max_tokens = max(max_tokens, MIN_TOOL_RESPONSE_MAX_TOKENS)
     return max_tokens
+
+
+def _validate_requested_max_tokens(value: int | None, field_name: str) -> None:
+    if value is not None and int(value) <= 0:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be positive")
 
 
 def _longest_common_prefix_tokens(left: list[int], right: list[int]) -> tuple[int, ...]:
@@ -1455,7 +1920,54 @@ def _hash_json_payload(payload: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+SHELL_TOOL_NAMES = {"shell_command", "local_shell", "exec", "exec_command"}
+
+
+def _augment_shell_tool_parameters(name: str, parameters: Any) -> Any:
+    if name not in SHELL_TOOL_NAMES:
+        return parameters
+    schema = copy.deepcopy(parameters) if isinstance(parameters, dict) else {"type": "object", "properties": {}}
+    if schema.get("type") != "object":
+        schema["type"] = "object"
+    properties = schema.setdefault("properties", {})
+    command_property_name = "command"
+    if isinstance(properties, dict):
+        properties.setdefault(
+            command_property_name,
+            {
+                "type": "string",
+                "description": "Required shell command to execute.",
+            },
+        )
+        properties.setdefault(
+            "workdir",
+            {
+                "type": "string",
+                "description": "Required working directory for the command.",
+            },
+        )
+        properties.setdefault(
+            "timeout_ms",
+            {
+                "type": "integer",
+                "description": "Required command timeout in milliseconds.",
+                "minimum": 1000,
+            },
+        )
+    required = schema.get("required")
+    if not isinstance(required, list):
+        required = []
+    if command_property_name not in required:
+        required = [*required, command_property_name]
+    if "workdir" not in required:
+        required = [*required, "workdir"]
+    if "timeout_ms" not in required:
+        required = [*required, "timeout_ms"]
+    schema["required"] = required
+    return schema
+
+
+def _normalize_tool_schemas(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if not tools:
         return []
     cache_key = _hash_json_payload(tools)
@@ -1466,16 +1978,55 @@ def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[
     for tool in tools:
         if not isinstance(tool, dict):
             continue
-        name = tool.get("name") or tool.get("tool_name")
+        tool_type = _coerce_text(tool.get("type")).strip()
+        if tool_type == "custom":
+            name = tool.get("name") or tool.get("tool_name")
+            if not name:
+                function_payload = tool.get("function")
+                if isinstance(function_payload, dict):
+                    name = function_payload.get("name")
+            if not name:
+                continue
+            custom_tool = dict(tool)
+            custom_tool["type"] = "custom"
+            custom_tool["name"] = str(name)
+            normalized.append(custom_tool)
+            continue
+
+        function_payload = tool.get("function")
+        if isinstance(function_payload, dict):
+            name = function_payload.get("name") or tool.get("name") or tool.get("tool_name")
+            parameters = (
+                function_payload.get("parameters")
+                or function_payload.get("input_schema")
+                or tool.get("parameters")
+                or tool.get("input_schema")
+                or {"type": "object", "properties": {}}
+            )
+            description = (
+                function_payload.get("description")
+                or tool.get("description")
+            )
+        else:
+            name = tool.get("name") or tool.get("tool_name")
+            parameters = (
+                tool.get("parameters")
+                or tool.get("input_schema")
+                or {"type": "object", "properties": {}}
+            )
+            description = tool.get("description")
+
         if not name:
             continue
+        name_text = str(name)
+        parameters = _augment_shell_tool_parameters(name_text, parameters)
         function_def: dict[str, Any] = {
-            "name": name,
-            "parameters": tool.get("input_schema") or tool.get("parameters") or {"type": "object", "properties": {}},
+            "name": name_text,
+            "parameters": parameters,
         }
-        description = _coerce_text(tool.get("description")).strip()
-        if description:
-            function_def["description"] = description
+        description_text = _coerce_text(description).strip()
+        if description_text:
+            function_def["description"] = description_text
         normalized.append(
             {
                 "type": "function",
@@ -1488,13 +2039,26 @@ def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[
     return normalized
 
 
+def _normalize_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return _normalize_tool_schemas(tools)
+
+
 def _normalize_anthropic_messages(req: AnthropicRequest | AnthropicCountTokensRequest) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     messages: list[dict[str, Any]] = []
     tools = _normalize_anthropic_tools(getattr(req, "tools", None))
+    tools, tool_choice_directive = _apply_tool_choice_to_tools(
+        tools,
+        getattr(req, "tool_choice", None),
+    )
 
+    system_parts: list[str] = []
     system_text = _extract_text_from_content(req.system)
     if system_text:
-        messages.append({"role": "system", "content": system_text})
+        system_parts.append(system_text)
+    if tool_choice_directive:
+        system_parts.append(tool_choice_directive)
+    if system_parts:
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
     for msg in req.messages:
         if isinstance(msg.content, str):
@@ -1555,6 +2119,54 @@ def _normalize_anthropic_messages(req: AnthropicRequest | AnthropicCountTokensRe
             messages.append({"role": msg.role, "content": "".join(text_parts)})
 
     return messages, tools
+
+
+def _normalize_openai_messages(messages: list[OpenAIMessage | dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, OpenAIMessage):
+            data = message.model_dump(mode="json", exclude_none=True)
+        elif isinstance(message, dict):
+            data = dict(message)
+        else:
+            continue
+
+        role = _coerce_text(data.get("role") or "user")
+        if role == "developer":
+            role = "system"
+
+        if role == "tool":
+            normalized.append(
+                _make_tool_message(
+                    data.get("content"),
+                    tool_call_id=data.get("tool_call_id") or data.get("id"),
+                    name=data.get("name"),
+                )
+            )
+            continue
+
+        content = _extract_text_from_content(data.get("content"))
+        normalized_message: dict[str, Any] = {
+            "role": role,
+            "content": content,
+        }
+
+        tool_calls = data.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            normalized_message["tool_calls"] = tool_calls
+        elif data.get("function_call") is not None:
+            function_call = data.get("function_call")
+            if isinstance(function_call, dict):
+                normalized_message["tool_calls"] = [
+                    _make_internal_tool_call(
+                        function_call.get("name") or data.get("name") or "tool",
+                        function_call.get("arguments") or {},
+                        call_id=function_call.get("id") or data.get("tool_call_id"),
+                    )
+                ]
+
+        normalized.append(normalized_message)
+    return normalized
 
 
 def _anthropic_stop_reason(result: dict[str, Any], content_blocks: list[dict[str, Any]]) -> str:
@@ -1814,7 +2426,11 @@ def _anthropic_heartbeat_line() -> str:
 
 def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     messages: list[dict[str, Any]] = []
-    tools = _filter_disabled_tools(req.tools or [])
+    tools = _filter_disabled_tools(_normalize_tool_schemas(req.tools or []))
+    tools, tool_choice_directive = _apply_tool_choice_to_tools(
+        tools,
+        getattr(req, "tool_choice", None),
+    )
     system_parts: list[str] = []
 
     if req.instructions:
@@ -1826,8 +2442,12 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
     # LOCAL_DFLASH_TOOL_CALLING_RULES=0 for diagnostics.
     if tools and TOOL_CALLING_RULES_ENABLED:
         system_parts.append(_tool_calling_rules_prompt(tools))
+    if tool_choice_directive:
+        system_parts.append(tool_choice_directive)
 
     if isinstance(req.input, str):
+        if system_parts:
+            messages.append({"role": "system", "content": "\n\n".join(part for part in system_parts if part)})
         messages.append({"role": "user", "content": req.input})
         return messages, tools
 
@@ -1889,6 +2509,8 @@ def _normalize_responses_input(req: ResponsesRequest) -> tuple[list[dict[str, An
             continue
 
         if item_type == "reasoning":
+            if tools:
+                continue
             # Preserve any encrypted_content / summary text so it can be
             # replayed if we ever gain access to the target model's cached
             # thinking. For now we keep the item as a hint in the assistant
@@ -2071,7 +2693,15 @@ class LocalModelServer:
             "ddtree_fast_path_ratio": float(result.get("ddtree_fast_path_ratio", 0.0) or 0.0),
             "avg_tree_node_count": float(result.get("avg_tree_node_count", 0.0) or 0.0),
             "max_tree_node_count": int(result.get("max_tree_node_count", 0) or 0),
+            "tool_call_count": int(result.get("tool_call_count", 0) or 0),
+            "tool_call_parse_incomplete": int(result.get("tool_call_parse_incomplete", 0) or 0),
+            "tool_call_parse_format_code": int(result.get("tool_call_parse_format_code", 0) or 0),
+            "protocol_no_tool_retries": int(result.get("protocol_no_tool_retries", 0) or 0),
+            "protocol_malformed_tool_retries": int(result.get("protocol_malformed_tool_retries", 0) or 0),
+            "protocol_final_with_tools": int(result.get("protocol_final_with_tools", 0) or 0),
         }
+        if "tool_call_parse_format" in result:
+            metrics["tool_call_parse_format"] = str(result.get("tool_call_parse_format") or "none")
         phase_timings = result.get("ddtree_phase_timings_us") or {}
         if isinstance(phase_timings, dict):
             phase_total = 0.0
@@ -2440,22 +3070,24 @@ class LocalModelServer:
         *,
         add_generation_prompt: bool = True,
     ) -> str:
+        messages = _ensure_tool_calling_rules_message(messages, tools)
         kwargs: dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": add_generation_prompt,
         }
         if tools:
             kwargs["tools"] = tools
-        enable_thinking = not self.disable_thinking
+        enable_thinking = (not self.disable_thinking) and not bool(tools)
+        preserve_thinking = not bool(tools)
         # `preserve_thinking=True` keeps the last assistant `<think>` block on
-        # Qwen3 thinking-mode templates; stripping it from turn 3+ causes the
-        # known empty-args tool-call loop. Older templates don't accept the
-        # kwarg, so we fall back in stages.
+        # non-tool Qwen3 thinking-mode templates. Tool turns intentionally drop
+        # preserved thinking so Codex reasoning summaries cannot trigger
+        # "continue thought process" loops.
         try:
             return self._tokenizer.apply_chat_template(
                 messages,
                 enable_thinking=enable_thinking,
-                preserve_thinking=True,
+                preserve_thinking=preserve_thinking,
                 **kwargs,
             )
         except TypeError:
@@ -2670,6 +3302,7 @@ class LocalModelServer:
         tools: list[dict[str, Any]] | None = None,
         previous_response_id: str | None = None,
         capture_prompt_cache_state: bool = False,
+        should_stop: Any = None,
     ) -> tuple[dict[str, Any], int, float]:
         self.ensure_loaded()
         prompt = self.build_prompt(messages, tools=tools)
@@ -2708,6 +3341,7 @@ class LocalModelServer:
                     prefix_state=prefix_state,
                     capture_prefill_state=capture_prefill_state,
                     target_turboquant_bits=target_turboquant_bits,
+                    should_stop=should_stop,
                 )
                 result.update(
                     {
@@ -2803,6 +3437,7 @@ class LocalModelServer:
                     tools=tools,
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
+                    should_stop=should_stop,
                 )
                 return [str(result.get("text", ""))], result
             except Exception:
@@ -2912,6 +3547,7 @@ class LocalModelServer:
                     tools=tools,
                     previous_response_id=previous_response_id,
                     capture_prompt_cache_state=capture_prompt_cache_state,
+                    should_stop=should_stop,
                 )
                 return (
                     iter((self._ddtree_result_to_response(result),)),
@@ -2981,6 +3617,8 @@ class LocalModelServer:
         result: dict[str, Any] | None = None
         total_prompt_tokens = 0
         total_generated_tokens = 0
+        protocol_no_tool_retries = 0
+        protocol_malformed_tool_retries = 0
         try:
             generation_ticket = self._acquire_generation_turn()
             current_messages = list(messages)
@@ -2993,10 +3631,11 @@ class LocalModelServer:
                 stable_prefix_key: str | None = None
                 stable_prefix_tokens: tuple[int, ...] = ()
                 prefix_cache_source = "none"
+                iteration_max_tokens = _tool_iteration_max_tokens(remaining_max_tokens, tools)
                 with self._lock:
                     iterator, prompt_tokens, started, stable_prefix_key, stable_prefix_tokens, prefix_cache_source = self._stream_generate_locked(
                         current_messages,
-                        remaining_max_tokens,
+                        iteration_max_tokens,
                         sampling,
                         tools=tools,
                         previous_response_id=previous_response_id,
@@ -3067,24 +3706,54 @@ class LocalModelServer:
                     break
                 visible_text, tool_calls = _parse_tool_calls(iteration_text)
                 if tool_calls:
+                    output_items = _build_output_items(iteration_text)
+                    output_items = _convert_items_for_custom_tools(output_items, tools)
+                    if _repeats_last_tool_call(current_messages, output_items):
+                        protocol_no_tool_retries += 1
+                        current_messages = [
+                            *current_messages,
+                            {"role": "user", "content": PROTOCOL_REPEATED_TOOL_RETRY_PROMPT},
+                        ]
+                        continue
                     text_parts.extend(iteration_parts)
                     result["text"] = "".join(text_parts)
                     break
-                judge_decision = self._judge_turn_completion(
-                    current_messages, visible_text, tools
-                )
-                if not judge_decision.should_continue:
-                    text_parts.extend(iteration_parts)
-                    result["text"] = "".join(text_parts)
-                    break
-                current_messages = [
-                    *current_messages,
-                    {"role": "assistant", "content": visible_text},
-                    {"role": "user", "content": judge_decision.continue_message},
-                ]
+                output_items = _build_output_items(iteration_text)
+                output_items = _convert_items_for_custom_tools(output_items, tools)
+                if _should_protocol_retry_without_tool(result, output_items, tools):
+                    protocol_no_tool_retries += 1
+                    if _has_unterminated_tool_call_markup(iteration_text):
+                        protocol_malformed_tool_retries += 1
+                    current_messages = [
+                        *current_messages,
+                        {"role": "user", "content": PROTOCOL_TOOL_RETRY_PROMPT},
+                    ]
+                    continue
+                if FOLLOWUP_JUDGE_ENABLED:
+                    judge_decision = self._judge_turn_completion(
+                        current_messages, visible_text, tools
+                    )
+                    if judge_decision.should_continue:
+                        current_messages = [
+                            *current_messages,
+                            {"role": "assistant", "content": visible_text},
+                            {"role": "user", "content": judge_decision.continue_message},
+                        ]
+                        continue
+                text_parts.extend(iteration_parts)
+                result["text"] = "".join(text_parts)
+                break
 
             if result is None:
                 raise RuntimeError("Model returned no output")
+            final_items = _build_output_items(_coerce_text(result.get("text", "")))
+            result, _ = _force_protocol_error_tool_call_if_needed(result, final_items, tools)
+            _annotate_agentic_metrics(
+                result,
+                tools=tools,
+                protocol_no_tool_retries=protocol_no_tool_retries,
+                protocol_malformed_tool_retries=protocol_malformed_tool_retries,
+            )
             self._record_generation_metrics(result, surface="stream")
             final_text = result.get("text", "")
             if final_text and not _queue_put(queue, ("text", final_text), stop_event):
@@ -3120,9 +3789,10 @@ class LocalModelServer:
             result: dict[str, Any] | None = None
             with self._lock:
                 for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
+                    iteration_max_tokens = _tool_iteration_max_tokens(remaining_max_tokens, tools)
                     _, result = self._generate_locked(
                         current_messages,
-                        remaining_max_tokens,
+                        iteration_max_tokens,
                         sampling,
                         tools=tools,
                         previous_response_id=previous_response_id,
@@ -3137,17 +3807,35 @@ class LocalModelServer:
                         break
                     visible_text, tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
                     if tool_calls:
+                        output_items = _build_output_items(_coerce_text(result.get("text", "")))
+                        output_items = _convert_items_for_custom_tools(output_items, tools)
+                        if _repeats_last_tool_call(current_messages, output_items):
+                            current_messages = [
+                                *current_messages,
+                                {"role": "user", "content": PROTOCOL_REPEATED_TOOL_RETRY_PROMPT},
+                            ]
+                            continue
                         break
-                    judge_decision = self._judge_turn_completion(
-                        current_messages, visible_text, tools
-                    )
-                    if not judge_decision.should_continue:
-                        break
-                    current_messages = [
-                        *current_messages,
-                        {"role": "assistant", "content": visible_text},
-                        {"role": "user", "content": judge_decision.continue_message},
-                    ]
+                    output_items = _build_output_items(_coerce_text(result.get("text", "")))
+                    output_items = _convert_items_for_custom_tools(output_items, tools)
+                    if _should_protocol_retry_without_tool(result, output_items, tools):
+                        current_messages = [
+                            *current_messages,
+                            {"role": "user", "content": PROTOCOL_TOOL_RETRY_PROMPT},
+                        ]
+                        continue
+                    if FOLLOWUP_JUDGE_ENABLED:
+                        judge_decision = self._judge_turn_completion(
+                            current_messages, visible_text, tools
+                        )
+                        if judge_decision.should_continue:
+                            current_messages = [
+                                *current_messages,
+                                {"role": "assistant", "content": visible_text},
+                                {"role": "user", "content": judge_decision.continue_message},
+                            ]
+                            continue
+                    break
             if result is None:
                 raise RuntimeError("Model returned no output")
             self._record_generation_metrics(result, surface="generate")
@@ -3174,6 +3862,25 @@ class LocalModelServer:
         current_messages = list(messages)
         current_previous_response_id = previous_response_id
         remaining_max_tokens = max(1, int(requested_max_tokens))
+        protocol_no_tool_retries = 0
+        protocol_malformed_tool_retries = 0
+
+        def finalize(
+            final_result: dict[str, Any],
+            final_output_items: list[dict[str, Any]],
+        ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            final_result, final_output_items = _force_protocol_error_tool_call_if_needed(
+                final_result,
+                final_output_items,
+                tools,
+            )
+            _annotate_agentic_metrics(
+                final_result,
+                tools=tools,
+                protocol_no_tool_retries=protocol_no_tool_retries,
+                protocol_malformed_tool_retries=protocol_malformed_tool_retries,
+            )
+            return final_result, final_output_items
 
         for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
             if should_stop is not None:
@@ -3182,9 +3889,10 @@ class LocalModelServer:
                         break
                 except Exception:
                     pass
+            iteration_max_tokens = _tool_iteration_max_tokens(remaining_max_tokens, tools)
             _, result = self._generate_locked(
                 current_messages,
-                remaining_max_tokens,
+                iteration_max_tokens,
                 sampling,
                 tools=tools,
                 previous_response_id=current_previous_response_id,
@@ -3197,32 +3905,56 @@ class LocalModelServer:
             )
             output_items = _build_output_items(result["text"])
             output_items = _convert_items_for_custom_tools(output_items, tools)
-            if any(
-                item.get("type") in {"function_call", "custom_tool_call"}
-                for item in output_items
-            ):
-                return result, output_items
+            if _has_tool_call_item(output_items):
+                if _repeats_last_tool_call(current_messages, output_items):
+                    protocol_no_tool_retries += 1
+                    current_messages = [
+                        *current_messages,
+                        {
+                            "role": "user",
+                            "content": PROTOCOL_REPEATED_TOOL_RETRY_PROMPT,
+                        },
+                    ]
+                    current_previous_response_id = None
+                    continue
+                return finalize(result, output_items)
             if remaining_max_tokens <= 0:
-                return result, output_items
+                return finalize(result, output_items)
 
             assistant_text = _output_text_from_items(output_items).strip()
-            judge_decision = self._judge_turn_completion(
-                current_messages, assistant_text, tools
-            )
-            if not judge_decision.should_continue:
-                return result, output_items
+            if _should_protocol_retry_without_tool(result, output_items, tools):
+                protocol_no_tool_retries += 1
+                if _has_unterminated_tool_call_markup(result["text"]):
+                    protocol_malformed_tool_retries += 1
+                current_messages = [
+                    *current_messages,
+                    {
+                        "role": "user",
+                        "content": PROTOCOL_TOOL_RETRY_PROMPT,
+                    },
+                ]
+                current_previous_response_id = None
+                continue
 
-            current_messages = [
-                *current_messages,
-                *_messages_from_output_items(output_items),
-                {
-                    "role": "user",
-                    "content": judge_decision.continue_message,
-                },
-            ]
-            current_previous_response_id = None
+            if FOLLOWUP_JUDGE_ENABLED:
+                judge_decision = self._judge_turn_completion(
+                    current_messages, assistant_text, tools
+                )
+                if judge_decision.should_continue:
+                    current_messages = [
+                        *current_messages,
+                        *_messages_from_output_items(output_items),
+                        {
+                            "role": "user",
+                            "content": judge_decision.continue_message,
+                        },
+                    ]
+                    current_previous_response_id = None
+                    continue
 
-        return result, output_items
+            return finalize(result, output_items)
+
+        return finalize(result, output_items)
 
     def _judge_turn_completion(
         self,
@@ -3443,6 +4175,7 @@ class LocalModelServer:
         worker.start()
 
         try:
+            stream_started = time.monotonic()
             visible_stream = _IncrementalVisibleTextStream(strip_edges=True)
             emitted_role = False
             result: dict[str, Any] | None = None
@@ -3452,6 +4185,17 @@ class LocalModelServer:
                 try:
                     kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
                 except Empty:
+                    if _stream_result_timed_out(stream_started):
+                        stop_event.set()
+                        yield _data_line(
+                            {
+                                "error": {
+                                    "message": _stream_result_timeout_message(),
+                                }
+                            }
+                        )
+                        yield _done_line()
+                        return
                     yield _chat_heartbeat_line(completion_id, created, self.model_name)
                     continue
 
@@ -3516,6 +4260,65 @@ class LocalModelServer:
                     "error": {
                         "message": "Generation completed without a final result",
                     }
+                }
+            )
+            yield _done_line()
+            return
+
+        _, chat_tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
+        chat_tool_calls = _filter_disabled_tool_calls(chat_tool_calls)
+        chat_tool_calls = _convert_items_for_custom_tools(chat_tool_calls, tools)
+        if chat_tool_calls:
+            if not emitted_role:
+                yield _data_line(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": self.model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                emitted_role = True
+            yield _data_line(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    _openai_tool_call_from_item(item, index)
+                                    for index, item in enumerate(chat_tool_calls)
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            yield _data_line(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
                 }
             )
             yield _done_line()
@@ -3630,6 +4433,7 @@ class LocalModelServer:
                 response_id=response_id,
                 previous_response_id=previous_response_id,
                 event_queue=event_queue,
+                stop_event=stop_event,
                 messages=messages,
                 max_tokens=max_tokens,
                 sampling=sampling,
@@ -3653,6 +4457,7 @@ class LocalModelServer:
         response_id: str,
         previous_response_id: str | None,
         event_queue: Queue,
+        stop_event: Any,
         messages: list[dict[str, Any]],
         max_tokens: int,
         sampling: SamplingParams,
@@ -3663,11 +4468,54 @@ class LocalModelServer:
         result: dict[str, Any] | None = None
         output_items: list[dict[str, Any]] | None = None
         done = False
+        stream_started = time.monotonic()
 
         while not done:
             try:
                 kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
             except Empty:
+                if _stream_result_timed_out(stream_started):
+                    stop_event.set()
+                    if tools:
+                        result = _protocol_error_tool_call_result(
+                            tools,
+                            "model generation timed out before producing a protocol result; continue with a different tool call",
+                        )
+                        output_items = _build_output_items(result["text"])
+                        output_items = _convert_items_for_custom_tools(output_items, tools)
+                        _annotate_agentic_metrics(
+                            result,
+                            tools=tools,
+                            protocol_no_tool_retries=0,
+                            protocol_malformed_tool_retries=0,
+                        )
+                        self._record_generation_metrics(result, surface="responses_stream_timeout")
+                        done = True
+                        continue
+                    err_message = _stream_result_timeout_message()
+                    err_code = "generation_timeout"
+                    yield _json_line(
+                        "response.failed",
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "id": response_id,
+                                "object": "response",
+                                "status": "failed",
+                                "model": self.model_name,
+                                "error": {
+                                    "code": err_code,
+                                    "message": err_message,
+                                },
+                            },
+                            "error": {
+                                "code": err_code,
+                                "message": err_message,
+                            },
+                        },
+                    )
+                    yield _done_line()
+                    return
                 yield _responses_heartbeat_line(response_id, self.model_name)
                 continue
 
@@ -4094,7 +4942,7 @@ class LocalModelServer:
         worker.start()
 
         try:
-            yield from self._stream_anthropic_events_body(event_queue)
+            yield from self._stream_anthropic_events_body(event_queue, stop_event)
         except GeneratorExit:
             stop_event.set()
             raise
@@ -4106,16 +4954,30 @@ class LocalModelServer:
                 pass
         return
 
-    def _stream_anthropic_events_body(self, event_queue: Queue) -> Iterator[str]:
+    def _stream_anthropic_events_body(self, event_queue: Queue, stop_event: Any) -> Iterator[str]:
         visible_stream = _IncrementalVisibleTextStream(strip_edges=False)
         text_block_open = False
         result: dict[str, Any] | None = None
         done = False
+        stream_started = time.monotonic()
 
         while not done:
             try:
                 kind, payload = event_queue.get(timeout=STREAM_HEARTBEAT_SECONDS)
             except Empty:
+                if _stream_result_timed_out(stream_started):
+                    stop_event.set()
+                    yield _json_line(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": _stream_result_timeout_message(),
+                            },
+                        },
+                    )
+                    return
                 yield _anthropic_heartbeat_line()
                 continue
 
@@ -4342,7 +5204,10 @@ def create_app(server: LocalModelServer) -> FastAPI:
         last_request_metrics = dict(server._last_request_metrics or {})
         return {
             "status": "ok",
+            "profile": os.environ.get("LOCAL_DFLASH_PROFILE", "custom"),
             "model": server.model_name,
+            "model_path": server.model_path,
+            "draft_path": server.draft_path,
             "loaded": server._model is not None,
             "context_window": server.context_window,
             "context_reserve": server.context_reserve,
@@ -4355,8 +5220,14 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "disable_thinking": server.disable_thinking,
             "sliding_window_size": server.sliding_window_size,
             "max_tokens_limit": server.max_tokens_limit,
+            "max_tool_turn_tokens": MAX_TOOL_TURN_TOKENS,
             "keep_alive_seconds": server.keep_alive_seconds,
             "stream_heartbeat_seconds": STREAM_HEARTBEAT_SECONDS,
+            "stream_result_timeout_seconds": STREAM_RESULT_TIMEOUT_SECONDS,
+            "default_temperature": DEFAULT_TEMPERATURE_NO_TOOLS,
+            "default_temperature_with_tools": DEFAULT_TEMPERATURE_WITH_TOOLS,
+            "min_temperature_with_tools": MIN_TEMPERATURE_WITH_TOOLS,
+            "max_temperature_with_tools": MAX_TEMPERATURE_WITH_TOOLS,
             "target_turboquant_bits": server.target_turboquant_bits,
             "draft_turboquant_bits": server.draft_turboquant_bits,
             "response_history_limit": server.response_history_limit,
@@ -4434,6 +5305,11 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "mlx_peak_memory_bytes": peak_memory,
             "dflash_context_window": server.context_window or 0,
             "dflash_max_tokens_limit": server.max_tokens_limit or 0,
+            "dflash_max_tool_turn_tokens": MAX_TOOL_TURN_TOKENS,
+            "dflash_default_temperature": DEFAULT_TEMPERATURE_NO_TOOLS,
+            "dflash_default_temperature_with_tools": DEFAULT_TEMPERATURE_WITH_TOOLS,
+            "dflash_min_temperature_with_tools": MIN_TEMPERATURE_WITH_TOOLS,
+            "dflash_max_temperature_with_tools": MAX_TEMPERATURE_WITH_TOOLS,
             "dflash_block_size": server.block_size,
             "dflash_generation_engine_ddtree": 1 if server.generation_engine == "ddtree" else 0,
             "dflash_ddtree_tree_budget": server.ddtree_tree_budget,
@@ -4546,8 +5422,15 @@ def create_app(server: LocalModelServer) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: OpenAIChatRequest) -> dict[str, Any]:
-        tools = _filter_disabled_tools(req.tools or [])
+        tools = _filter_disabled_tools(_normalize_tool_schemas(req.tools or []))
+        tools, tool_choice_directive = _apply_tool_choice_to_tools(tools, req.tool_choice)
         has_tools = bool(tools)
+        _validate_requested_max_tokens(req.max_completion_tokens, "max_completion_tokens")
+        _validate_requested_max_tokens(req.max_tokens, "max_tokens")
+        request_messages = _ensure_system_directive(
+            _normalize_openai_messages(req.messages),
+            tool_choice_directive,
+        )
         sampling = SamplingParams.for_request(
             temperature=req.temperature,
             top_p=req.top_p,
@@ -4564,7 +5447,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
             return StreamingResponse(
                 server.stream_chat_completions(
-                    [m.model_dump() for m in req.messages],
+                    request_messages,
                     max_tokens,
                     sampling,
                     tools=tools,
@@ -4583,7 +5466,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
         max_tokens = req.max_completion_tokens or req.max_tokens or DEFAULT_MAX_TOKENS_FALLBACK
         try:
             result = server.generate(
-                [m.model_dump() for m in req.messages],
+                request_messages,
                 max_tokens,
                 sampling,
                 tools=tools,
@@ -4592,6 +5475,21 @@ def create_app(server: LocalModelServer) -> FastAPI:
         except PromptTooLargeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _, assistant_text = _strip_reasoning_blocks(result["text"])
+        assistant_text, tool_calls = _parse_tool_calls(assistant_text)
+        tool_calls = _filter_disabled_tool_calls(tool_calls)
+        tool_calls = _convert_items_for_custom_tools(tool_calls, tools)
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_text,
+        }
+        finish_reason = result["finish_reason"]
+        if tool_calls:
+            message["content"] = assistant_text or None
+            message["tool_calls"] = [
+                _openai_tool_call_from_item(item, index)
+                for index, item in enumerate(tool_calls)
+            ]
+            finish_reason = "tool_calls"
         payload = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -4600,11 +5498,8 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": assistant_text,
-                    },
-                    "finish_reason": result["finish_reason"],
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {
@@ -4626,6 +5521,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown model: {req.model}")
 
         messages, tools = _normalize_anthropic_messages(req)
+        _validate_requested_max_tokens(req.max_tokens, "max_tokens")
         max_tokens = req.max_tokens
         has_tools = bool(tools)
         sampling = SamplingParams.for_request(

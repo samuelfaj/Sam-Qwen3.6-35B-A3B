@@ -5,12 +5,13 @@ CODEX_HOME_DIR="${CODEX_HOME:-${CODEX_HOME_DIR:-/tmp/codex-local-dflash}}"
 LOCAL_MODEL_NAME="${LOCAL_DFLASH_MODEL_NAME:-qwen3.6-35b-a3b-dflash-local}"
 LOCAL_HOST="${LOCAL_DFLASH_HOST:-127.0.0.1}"
 LOCAL_PORT="${LOCAL_DFLASH_PORT:-8010}"
-LOCAL_CONTEXT_WINDOW="${LOCAL_DFLASH_CODEX_CONTEXT_WINDOW:-65536}"
-LOCAL_AUTO_COMPACT_LIMIT="${LOCAL_DFLASH_CODEX_AUTO_COMPACT_LIMIT:-49152}"
+LOCAL_CONTEXT_WINDOW="${LOCAL_DFLASH_CODEX_CONTEXT_WINDOW:-${LOCAL_DFLASH_CONTEXT_WINDOW:-32768}}"
+LOCAL_AUTO_COMPACT_LIMIT="${LOCAL_DFLASH_CODEX_AUTO_COMPACT_LIMIT:-24576}"
+LOCAL_TRUNCATION_LIMIT="${LOCAL_DFLASH_CODEX_TRUNCATION_LIMIT:-30000}"
 LOCAL_MAX_OUTPUT_TOKENS="${LOCAL_DFLASH_CODEX_MAX_OUTPUT_TOKENS:-16384}"
 LOCAL_STREAM_IDLE_MS="${LOCAL_DFLASH_CODEX_STREAM_IDLE_MS:-1800000}"
 LOCAL_BG_TERM_MAX_MS="${LOCAL_DFLASH_CODEX_BG_TERM_MAX_MS:-21600000}"
-LOCAL_TOOL_OUTPUT_LIMIT="${LOCAL_DFLASH_CODEX_TOOL_OUTPUT_LIMIT:-32000}"
+LOCAL_TOOL_OUTPUT_LIMIT="${LOCAL_DFLASH_CODEX_TOOL_OUTPUT_LIMIT:-12000}"
 LOCAL_REQUEST_RETRIES="${LOCAL_DFLASH_CODEX_REQUEST_RETRIES:-2}"
 LOCAL_STREAM_RETRIES="${LOCAL_DFLASH_CODEX_STREAM_RETRIES:-3}"
 LOCAL_STARTUP_TIMEOUT_SEC="${LOCAL_DFLASH_CODEX_STARTUP_TIMEOUT_SEC:-60}"
@@ -30,7 +31,7 @@ cat > "${CATALOG_PATH}" <<'EOF'
       "slug": "__LOCAL_MODEL_NAME__",
       "display_name": "Qwen3.6 35B A3B (dflash local)",
       "description": "Local Qwen3.6 35B A3B served by dflash.",
-      "default_reasoning_level": "low",
+      "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         { "effort": "low",    "description": "Fast, minimal deliberation" },
         { "effort": "medium", "description": "Balanced for everyday tasks" }
@@ -42,9 +43,9 @@ cat > "${CATALOG_PATH}" <<'EOF'
       "additional_speed_tiers": [],
       "availability_nux": null,
       "upgrade": null,
-      "base_instructions": "",
+      "base_instructions": "You are an autonomous coding agent running inside Codex CLI. Use the provided Codex tools to satisfy the user's request. For Codex exec shell calls, the shell command argument is command; include workdir and timeout_ms when the tool schema provides them. Return a final answer when the request is complete or blocked by observed tool output.",
       "model_messages": {
-        "instructions_template": "",
+        "instructions_template": "Complete the task end-to-end through tool calls. If work remains and a tool can help, call a tool instead of explaining the next step.",
         "instructions_variables": {
           "personality_default": "",
           "personality_friendly": "",
@@ -59,7 +60,7 @@ cat > "${CATALOG_PATH}" <<'EOF'
       "web_search_tool_type": "text",
       "truncation_policy": {
         "mode": "tokens",
-        "limit": 10000
+        "limit": __LOCAL_TRUNCATION_LIMIT__
       },
       "supports_parallel_tool_calls": false,
       "supports_image_detail_original": false,
@@ -78,6 +79,7 @@ EOF
 sed -i '' \
   -e "s/__LOCAL_MODEL_NAME__/${LOCAL_MODEL_NAME}/g" \
   -e "s/__LOCAL_CONTEXT_WINDOW__/${LOCAL_CONTEXT_WINDOW}/g" \
+  -e "s/__LOCAL_TRUNCATION_LIMIT__/${LOCAL_TRUNCATION_LIMIT}/g" \
   "${CATALOG_PATH}"
 
 cat > "${CODEX_HOME_DIR}/config.toml" <<EOF
@@ -117,8 +119,8 @@ approvals_reviewer = "user"
 check_for_update_on_startup = false
 suppress_unstable_features_warning = true
 disable_paste_burst = true
-show_raw_agent_reasoning = true
-hide_agent_reasoning = false
+show_raw_agent_reasoning = false
+hide_agent_reasoning = true
 file_opener = "none"
 
 [history]
@@ -173,7 +175,7 @@ model = "${LOCAL_MODEL_NAME}"
 model_provider = "localdflash"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
-model_reasoning_effort = "low"
+model_reasoning_effort = "medium"
 model_verbosity = "low"
 EOF
 

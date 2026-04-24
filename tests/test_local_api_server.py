@@ -24,6 +24,26 @@ _sys.modules["local_api_server"] = local_api_server
 SPEC.loader.exec_module(local_api_server)
 
 
+def _sse_event_names(events: str) -> list[str]:
+    names: list[str] = []
+    for line in events.splitlines():
+        if line.startswith("event: "):
+            names.append(line.removeprefix("event: ").strip())
+    return names
+
+
+def _sse_payloads(events: str, event_name: str) -> list[dict]:
+    payloads: list[dict] = []
+    current_event: str | None = None
+    for line in events.splitlines():
+        if line.startswith("event: "):
+            current_event = line.removeprefix("event: ").strip()
+            continue
+        if current_event == event_name and line.startswith("data: "):
+            payloads.append(json.loads(line.removeprefix("data: ")))
+    return payloads
+
+
 class FakeStreamingServer(local_api_server.LocalModelServer):
     @staticmethod
     def _result():
@@ -57,6 +77,53 @@ class FakeStreamingServer(local_api_server.LocalModelServer):
 
     def generate_response(self, messages, max_tokens, *args, **kwargs):
         return self._result(), local_api_server._build_output_items(self._result()["text"])
+
+
+class FakeHangingResponsesServer(local_api_server.LocalModelServer):
+    def _responses_generation_worker(self, queue: Queue, *args, **kwargs) -> None:
+        stop_event = kwargs.get("stop_event")
+        if stop_event is None and args:
+            stop_event = args[-1]
+        if stop_event is not None:
+            stop_event.wait(1.0)
+
+
+class FakeCustomToolStreamingServer(local_api_server.LocalModelServer):
+    @staticmethod
+    def _result():
+        return {
+            "text": (
+                '<function_call>{"name":"apply_patch","arguments":'
+                '{"input":"*** Begin Patch\\n*** Add File: hello.txt\\n+hello\\n*** End Patch\\n"}}'
+                "</function_call>"
+            ),
+            "finish_reason": "stop",
+            "prompt_tokens": 12,
+            "prefill_seconds": 0.1,
+            "prompt_tps": 10.0,
+            "reused_prefix_tokens": 4,
+            "decode_seconds": 0.2,
+            "generation_tps": 9.0,
+            "generated_tokens": 8,
+            "speculative_steps": 3,
+            "proposed_tokens": 9,
+            "accepted_tokens": 7,
+            "avg_acceptance_length": 2.33,
+            "avg_acceptance_ratio": 0.77,
+            "acceptance_lengths": [2, 2, 3],
+            "acceptance_ratios": [0.66, 0.66, 1.0],
+            "block_size_history": [3, 3, 3],
+            "adaptive_block_size": True,
+            "prefix_cache_source": "global",
+            "peak_memory_gb": 1.0,
+            "elapsed": 0.5,
+        }
+
+    def generate_response(self, messages, max_tokens, *args, tools=None, **kwargs):
+        result = self._result()
+        output_items = local_api_server._build_output_items(result["text"])
+        output_items = local_api_server._convert_items_for_custom_tools(output_items, tools)
+        return result, output_items
 
 
 class FakeTruncatedToolCallServer(local_api_server.LocalModelServer):
@@ -137,6 +204,24 @@ class FakeChatStreamingServer(local_api_server.LocalModelServer):
             "elapsed": 0.2,
         }
         queue.put(("result", result))
+        queue.put(("done", None))
+
+
+class FakeStreamErrorServer(local_api_server.LocalModelServer):
+    def _generation_worker(self, queue: Queue, *args, **kwargs) -> None:
+        queue.put(("error", "boom"))
+        queue.put(("done", None))
+
+    def _responses_generation_worker(self, queue: Queue, *args, **kwargs) -> None:
+        queue.put(("error", "boom"))
+        queue.put(("done", None))
+
+
+class FakeStreamNoResultServer(local_api_server.LocalModelServer):
+    def _generation_worker(self, queue: Queue, *args, **kwargs) -> None:
+        queue.put(("done", None))
+
+    def _responses_generation_worker(self, queue: Queue, *args, **kwargs) -> None:
         queue.put(("done", None))
 
 
@@ -373,6 +458,25 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(messages[1]["tool_call_id"], "call_123")
         self.assertEqual(messages[1]["content"], '[{"path":"README.md"}]')
 
+    def test_normalize_responses_input_drops_reasoning_when_tools_are_present(self):
+        req = SimpleNamespace(
+            tools=[{"type": "function", "function": {"name": "shell_command"}}],
+            tool_choice=None,
+            instructions=None,
+            input=[
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "continue thought process"}],
+                },
+            ],
+        )
+
+        messages, tools = local_api_server._normalize_responses_input(req)
+
+        self.assertTrue(tools)
+        self.assertFalse(any("<think>" in message.get("content", "") for message in messages))
+
     def test_build_output_items_deduplicates_identical_consecutive_tool_calls(self):
         output_items = local_api_server._build_output_items(
             (
@@ -385,6 +489,17 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(len(function_calls), 1)
         self.assertEqual(function_calls[0]["name"], "search_files")
         self.assertEqual(function_calls[0]["call_id"][:5], "call_")
+
+    def test_build_output_items_drops_text_when_tool_call_exists(self):
+        output_items = local_api_server._build_output_items(
+            (
+                "I will inspect the repo now.\n"
+                '<function_call>{"name":"search_files","arguments":{"path":"."}}</function_call>'
+            )
+        )
+
+        self.assertEqual([item["type"] for item in output_items], ["function_call"])
+        self.assertEqual(output_items[0]["name"], "search_files")
 
     def test_generate_locked_skips_prefill_capture_when_caches_are_disabled(self):
         server = self._make_server()
@@ -548,9 +663,280 @@ class LocalApiServerTests(unittest.TestCase):
         prompt = local_api_server._tool_calling_rules_prompt(tools)
 
         self.assertNotIn("apply_patch", prompt)
+        self.assertIn("Tool-calling rules (strict):", prompt)
         self.assertIn("Function calls MUST", prompt)
-        self.assertIn("Use the <cwd> from environment_context", prompt)
-        self.assertIn("/private/tmp/codex-local-dflash", prompt)
+        self.assertIn("<function=tool_name>", prompt)
+        self.assertIn("shell_command", prompt)
+        self.assertIn("required: command, workdir, timeout_ms", prompt)
+        self.assertIn("parameters: command, workdir, timeout_ms", prompt)
+        self.assertNotIn("pathlib", prompt)
+        self.assertNotIn("dev server", prompt)
+        self.assertNotIn("test/build", prompt)
+
+    def test_build_prompt_injects_tool_calling_rules_for_any_tool_surface(self):
+        server = self._make_server()
+
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                return "\n".join(
+                    _message.get("content", "")
+                    for _message in messages
+                    if _message.get("role") == "system"
+                )
+
+        server._tokenizer = FakeTokenizer()
+        prompt = server.build_prompt(
+            [{"role": "user", "content": "inspect repo"}],
+            tools=[{"type": "function", "function": {"name": "shell_command"}}],
+        )
+
+        self.assertIn("Tool-calling rules (strict):", prompt)
+        self.assertIn("<function=tool_name>", prompt)
+        self.assertIn("Do NOT add prose before or after a tool call.", prompt)
+        self.assertIn("shell_command", prompt)
+        self.assertNotIn("Do not use long-running dev servers", prompt)
+        self.assertNotIn("Do not print raw patches", prompt)
+
+    def test_build_prompt_disables_thinking_for_tool_turns(self):
+        server = self._make_server()
+        server.disable_thinking = False
+        observed: dict[str, Any] = {}
+
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                observed.update(kwargs)
+                return "prompt"
+
+        server._tokenizer = FakeTokenizer()
+        server.build_prompt(
+            [{"role": "user", "content": "inspect repo"}],
+            tools=[{"type": "function", "function": {"name": "shell_command"}}],
+        )
+
+        self.assertFalse(observed["enable_thinking"])
+        self.assertFalse(observed["preserve_thinking"])
+
+    def test_tool_calling_rules_injection_deduplicates_existing_system_rules(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "abc\n\nTool-calling rules (strict):\nexisting",
+            },
+            {"role": "user", "content": "inspect repo"},
+        ]
+
+        result = local_api_server._ensure_tool_calling_rules_message(
+            messages,
+            [{"type": "function", "function": {"name": "shell_command"}}],
+        )
+
+        self.assertIs(result, messages)
+
+    def test_tool_choice_none_disables_tools(self):
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+
+        selected, directive = local_api_server._apply_tool_choice_to_tools(tools, "none")
+
+        self.assertEqual(selected, [])
+        self.assertIsNone(directive)
+
+    def test_tool_choice_required_adds_protocol_directive(self):
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+
+        selected, directive = local_api_server._apply_tool_choice_to_tools(tools, "required")
+
+        self.assertEqual(selected, tools)
+        self.assertIn("requires a tool call", directive)
+
+    def test_tool_choice_specific_filters_to_named_tool(self):
+        tools = [
+            {"type": "function", "function": {"name": "shell_command"}},
+            {"type": "function", "function": {"name": "read_file"}},
+        ]
+
+        selected, directive = local_api_server._apply_tool_choice_to_tools(
+            tools,
+            {"type": "function", "function": {"name": "read_file"}},
+        )
+
+        self.assertEqual([local_api_server._tool_name(tool) for tool in selected], ["read_file"])
+        self.assertIn("`read_file`", directive)
+
+    def test_normalize_tool_schemas_accepts_openai_anthropic_responses_and_custom(self):
+        normalized = local_api_server._normalize_tool_schemas(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "openai_tool",
+                        "description": "OpenAI nested",
+                        "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+                    },
+                },
+                {
+                    "name": "anthropic_tool",
+                    "description": "Anthropic flat",
+                    "input_schema": {"type": "object", "properties": {"y": {"type": "string"}}},
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "freeform",
+                },
+            ]
+        )
+
+        self.assertEqual(normalized[0]["function"]["name"], "openai_tool")
+        self.assertEqual(normalized[1]["function"]["name"], "anthropic_tool")
+        self.assertEqual(normalized[1]["function"]["parameters"]["properties"]["y"]["type"], "string")
+        self.assertEqual(normalized[2]["type"], "custom")
+        self.assertEqual(normalized[2]["name"], "apply_patch")
+
+    def test_normalize_tool_schemas_requires_timeout_for_shell_tools(self):
+        normalized = local_api_server._normalize_tool_schemas(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "shell_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        )
+
+        parameters = normalized[0]["function"]["parameters"]
+        self.assertIn("workdir", parameters["properties"])
+        self.assertIn("workdir", parameters["required"])
+        self.assertIn("timeout_ms", parameters["properties"])
+        self.assertIn("timeout_ms", parameters["required"])
+
+    def test_tool_argument_sanitizer_coerces_literals_and_removes_impossible_escalation(self):
+        item = local_api_server._make_function_call_item(
+            "shell_command",
+            {
+                "command": "npm install",
+                "timeout_ms": "120000",
+                "disableTimeout": "True",
+                "sandbox_permissions": "require_escalated",
+                "justification": "Need approval",
+            },
+        )
+        args = json.loads(item["arguments"])
+
+        self.assertTrue(args["disableTimeout"])
+        self.assertNotIn("sandbox_permissions", args)
+        self.assertNotIn("justification", args)
+
+    def test_normalize_openai_messages_preserves_agentic_tool_turns(self):
+        messages = [
+            local_api_server.OpenAIMessage(role="developer", content="dev rules"),
+            local_api_server.OpenAIMessage(role="user", content=[{"type": "text", "text": "inspect"}]),
+            local_api_server.OpenAIMessage(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "shell_command",
+                            "arguments": {"cmd": "pwd"},
+                        },
+                    }
+                ],
+            ),
+            local_api_server.OpenAIMessage(
+                role="tool",
+                tool_call_id="call_1",
+                name="shell_command",
+                content={"output": "/tmp/project"},
+            ),
+        ]
+
+        normalized = local_api_server._normalize_openai_messages(messages)
+
+        self.assertEqual(normalized[0], {"role": "system", "content": "dev rules"})
+        self.assertEqual(normalized[1], {"role": "user", "content": "inspect"})
+        self.assertEqual(normalized[2]["role"], "assistant")
+        self.assertEqual(normalized[2]["content"], "")
+        self.assertEqual(normalized[2]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(normalized[3]["role"], "tool")
+        self.assertEqual(normalized[3]["tool_call_id"], "call_1")
+        self.assertIn("/tmp/project", normalized[3]["content"])
+
+    def test_parse_tool_calls_detailed_accepts_xml_json_fenced_and_marks_incomplete(self):
+        xml = local_api_server._parse_tool_calls_detailed(
+            "<tool_call>\n<function=shell_command>\n<parameter=cmd>\npwd\n</parameter>\n</function>\n</tool_call>"
+        )
+        tagged_json = local_api_server._parse_tool_calls_detailed(
+            '<tool_call>{"name":"shell_command","arguments":{"cmd":"pwd"}}</tool_call>'
+        )
+        fenced = local_api_server._parse_tool_calls_detailed(
+            '```tool_call\n{"name":"shell_command","arguments":{"cmd":"pwd"}}\n```'
+        )
+        incomplete = local_api_server._parse_tool_calls_detailed(
+            "<tool_call>\n<function=shell_command>\n<parameter=cmd>\npwd"
+        )
+
+        self.assertEqual(xml.tool_calls[0]["name"], "shell_command")
+        self.assertEqual(json.loads(tagged_json.tool_calls[0]["arguments"])["cmd"], "pwd")
+        self.assertEqual(fenced.tool_calls[0]["name"], "shell_command")
+        self.assertEqual(xml.formats, ["qwen_xml"])
+        self.assertEqual(tagged_json.formats, ["tagged_json"])
+        self.assertEqual(fenced.formats, ["fenced_json"])
+        self.assertFalse(xml.incomplete)
+        self.assertTrue(incomplete.incomplete)
+        self.assertEqual(incomplete.tool_calls, [])
+
+    def test_sampling_clamps_tool_turn_temperature_to_agentic_range(self):
+        sampling = local_api_server.SamplingParams.for_request(
+            temperature=0.8,
+            top_p=None,
+            top_k=None,
+            min_p=None,
+            presence_penalty=None,
+            repetition_penalty=None,
+            frequency_penalty=None,
+            has_tools=True,
+        )
+
+        self.assertLessEqual(sampling.temperature, local_api_server.MAX_TEMPERATURE_WITH_TOOLS)
+
+    def test_agentic_metrics_record_tool_retry_and_parse_format(self):
+        result = dict(FakeStreamingServer._result())
+        local_api_server._annotate_agentic_metrics(
+            result,
+            tools=[{"type": "function", "function": {"name": "write_file"}}],
+            protocol_no_tool_retries=2,
+            protocol_malformed_tool_retries=1,
+        )
+
+        self.assertEqual(result["tool_call_count"], 1)
+        self.assertEqual(result["tool_call_parse_format"], "tagged_json")
+        self.assertEqual(result["tool_call_parse_format_code"], 2)
+        self.assertEqual(result["protocol_no_tool_retries"], 2)
+        self.assertEqual(result["protocol_malformed_tool_retries"], 1)
+        self.assertEqual(result["protocol_final_with_tools"], 0)
+
+    def test_responses_tool_choice_required_is_added_to_system_message(self):
+        req = SimpleNamespace(
+            model="local-test-model",
+            instructions=None,
+            input="inspect repo",
+            tools=[{"type": "function", "function": {"name": "shell_command"}}],
+            tool_choice="required",
+        )
+
+        messages, tools = local_api_server._normalize_responses_input(req)
+
+        self.assertEqual(local_api_server._available_tool_names(tools), {"shell_command"})
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("Tool choice requires a tool call", messages[0]["content"])
 
     def test_filter_disabled_tools_removes_apply_patch_by_default(self):
         tools = [
@@ -585,7 +971,9 @@ class LocalApiServerTests(unittest.TestCase):
 
             prompt = local_api_server._tool_calling_rules_prompt(tools)
 
-        self.assertIn("apply_patch tool is available", prompt)
+        self.assertIn("apply_patch", prompt)
+        self.assertIn("Tool-calling rules (strict):", prompt)
+        self.assertNotIn("pathlib", prompt)
 
     def test_filter_disabled_tools_keeps_apply_patch_when_enabled(self):
         tools = [
@@ -618,6 +1006,110 @@ class LocalApiServerTests(unittest.TestCase):
             512,
         )
 
+    def test_invalid_requested_max_tokens_raise_http_400(self):
+        with self.assertRaises(local_api_server.HTTPException) as responses_exc:
+            local_api_server._responses_max_tokens(0, None)
+        self.assertEqual(responses_exc.exception.status_code, 400)
+
+        with self.assertRaises(local_api_server.HTTPException) as chat_exc:
+            local_api_server._validate_requested_max_tokens(-1, "max_tokens")
+        self.assertEqual(chat_exc.exception.status_code, 400)
+
+    def test_exec_tool_arguments_use_codex_command_field(self):
+        sanitized = local_api_server._sanitize_function_call_arguments(
+            "exec",
+            {"cmd": "npm run build", "workdir": "/tmp/app", "timeout_ms": 120000},
+        )
+
+        self.assertEqual(sanitized["command"], "npm run build")
+        self.assertNotIn("cmd", sanitized)
+        self.assertEqual(sanitized["workdir"], "/tmp/app")
+        self.assertEqual(sanitized["timeout_ms"], 120000)
+
+    def test_exec_tool_schema_requires_command_workdir_and_timeout(self):
+        normalized = local_api_server._normalize_tool_schemas(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        )
+        parameters = normalized[0]["function"]["parameters"]
+
+        self.assertIn("command", parameters["properties"])
+        self.assertIn("workdir", parameters["properties"])
+        self.assertIn("timeout_ms", parameters["properties"])
+        self.assertIn("command", parameters["required"])
+        self.assertIn("workdir", parameters["required"])
+        self.assertIn("timeout_ms", parameters["required"])
+
+    def test_protocol_error_tool_call_uses_exec_command_field(self):
+        text = local_api_server._protocol_error_tool_call_text(
+            [{"type": "function", "function": {"name": "exec", "parameters": {"type": "object"}}}],
+            "timeout",
+        )
+        _, tool_calls = local_api_server._parse_tool_calls(text)
+        args = json.loads(tool_calls[0]["arguments"])
+
+        self.assertEqual(tool_calls[0]["name"], "exec")
+        self.assertIn("command", args)
+        self.assertNotIn("cmd", args)
+        self.assertIn("LOCAL_DFLASH_PROTOCOL_ERROR", args["command"])
+
+    def test_shell_command_sanitizer_preserves_model_command_semantics(self):
+        background = local_api_server._sanitize_function_call_arguments(
+            "shell_command",
+            {"command": "npm run test 2>&1 &", "workdir": "/tmp/app", "timeout_ms": 120000},
+        )
+        alias = local_api_server._sanitize_function_call_arguments(
+            "shell_command",
+            {"cmd": "npm run dev", "workdir": "/tmp/app", "timeout_ms": 120000},
+        )
+
+        self.assertEqual(background["command"], "npm run test 2>&1 &")
+        self.assertEqual(background["timeout_ms"], 120000)
+        self.assertEqual(alias["command"], "npm run dev")
+        self.assertNotIn("LOCAL_DFLASH_PROTOCOL_ERROR", background["command"])
+        self.assertNotIn("LOCAL_DFLASH_PROTOCOL_ERROR", alias["command"])
+
+    def test_ddtree_generation_receives_cooperative_stop_callback(self):
+        server = self._make_server()
+        server.generation_engine = "ddtree"
+        should_stop = lambda: True
+
+        def fake_generate_ddtree(**kwargs):
+            self.assertIs(kwargs["should_stop"], should_stop)
+            return {
+                "text": "",
+                "finish_reason": "cancelled",
+                "prompt_tokens": 2,
+                "generated_tokens": 0,
+                "prompt_cache_state": None,
+            }
+
+        with (
+            mock.patch.object(server, "ensure_loaded"),
+            mock.patch.object(server, "build_prompt", return_value="prompt"),
+            mock.patch.object(server, "tokenize_prompt", return_value=[1, 2]),
+            mock.patch.object(server, "_stable_prefix_key", return_value="key"),
+            mock.patch.object(server, "_stable_prefix_tokens_locked", return_value=(1, 2)),
+            mock.patch.object(server, "_select_prefix_state_locked", return_value=(None, "none")),
+            mock.patch.object(local_api_server, "generate_ddtree", side_effect=fake_generate_ddtree) as generate_mock,
+        ):
+            _, result = server._generate_locked(
+                [{"role": "user", "content": "hi"}],
+                8,
+                tools=[{"type": "function", "function": {"name": "run"}}],
+                should_stop=should_stop,
+            )
+
+        self.assertEqual(result["finish_reason"], "cancelled")
+        generate_mock.assert_called_once()
+
     def test_stream_response_events_emit_standard_function_call_events(self):
         server = self._make_server(FakeStreamingServer)
         events = "".join(
@@ -644,6 +1136,121 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("event: response.function_call_arguments.delta", events)
         self.assertIn("event: response.function_call_arguments.done", events)
         self.assertIn("event: response.completed", events)
+
+    def test_stream_response_events_function_call_event_order_is_codex_compatible(self):
+        server = self._make_server(FakeStreamingServer)
+        events = "".join(
+            server.stream_response_events(
+                messages=[{"role": "user", "content": "Create index.html"}],
+                max_tokens=128,
+                temperature=0.0,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                request_messages=[{"role": "user", "content": "Create index.html"}],
+            )
+        )
+        names = _sse_event_names(events)
+
+        expected_order = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        positions = [names.index(name) for name in expected_order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_stream_response_events_timeout_returns_protocol_error_tool_call(self):
+        server = self._make_server(FakeHangingResponsesServer)
+
+        with (
+            mock.patch.object(local_api_server, "STREAM_HEARTBEAT_SECONDS", 0.01),
+            mock.patch.object(local_api_server, "STREAM_RESULT_TIMEOUT_SECONDS", 0.02),
+        ):
+            events = "".join(
+                server.stream_response_events(
+                    messages=[{"role": "user", "content": "Create index.html"}],
+                    max_tokens=128,
+                    temperature=0.0,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    request_messages=[{"role": "user", "content": "Create index.html"}],
+                )
+            )
+
+        self.assertNotIn("event: response.failed", events)
+        self.assertIn("event: response.function_call_arguments.delta", events)
+        self.assertIn("event: response.completed", events)
+        self.assertIn("LOCAL_DFLASH_PROTOCOL_ERROR", events)
+        self.assertIn("timed out before producing a protocol result", events)
+
+    def test_responses_custom_apply_patch_outputs_non_empty_custom_tool_call(self):
+        tools = [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+            }
+        ]
+        result = FakeCustomToolStreamingServer._result()
+        with mock.patch.object(local_api_server, "ALLOW_APPLY_PATCH_TOOL", True):
+            output_items = local_api_server._build_output_items(result["text"])
+            output_items = local_api_server._convert_items_for_custom_tools(output_items, tools)
+
+        self.assertEqual(output_items[0]["type"], "custom_tool_call")
+        self.assertEqual(output_items[0]["name"], "apply_patch")
+        self.assertIn("*** Begin Patch", output_items[0]["input"])
+        self.assertNotEqual(output_items[0]["input"].strip(), "")
+
+    def test_stream_response_events_custom_tool_call_emits_input_delta_done(self):
+        server = self._make_server(FakeCustomToolStreamingServer)
+        with mock.patch.object(local_api_server, "ALLOW_APPLY_PATCH_TOOL", True):
+            events = "".join(
+                server.stream_response_events(
+                    messages=[{"role": "user", "content": "Patch file"}],
+                    max_tokens=128,
+                    temperature=0.0,
+                    tools=[
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                        }
+                    ],
+                    request_messages=[{"role": "user", "content": "Patch file"}],
+                )
+            )
+        names = _sse_event_names(events)
+        expected_order = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.custom_tool_call_input.delta",
+            "response.custom_tool_call_input.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        positions = [names.index(name) for name in expected_order]
+        self.assertEqual(positions, sorted(positions))
+        delta = _sse_payloads(events, "response.custom_tool_call_input.delta")[0]
+        done = _sse_payloads(events, "response.custom_tool_call_input.done")[0]
+        self.assertIn("*** Begin Patch", delta["delta"])
+        self.assertEqual(done["input"], delta["delta"])
 
     def test_generate_response_auto_continues_after_action_only_stop(self):
         server = self._make_server()
@@ -723,6 +1330,7 @@ class LocalApiServerTests(unittest.TestCase):
                     "not finished",
                 ),
             ) as judge_mock,
+            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
         ):
             result, output_items = server.generate_response(
                 messages=[{"role": "user", "content": "Fix until all tests pass."}],
@@ -750,6 +1358,156 @@ class LocalApiServerTests(unittest.TestCase):
         )
         self.assertEqual(second_messages[-1]["role"], "user")
         self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
+
+    def test_generate_response_protocol_retries_no_tool_text_when_judge_disabled(self):
+        server = self._make_server()
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+        text_result = {
+            "text": "The command timed out. Let me inspect the project and continue.",
+            "finish_reason": "stop",
+            "generated_tokens": 9,
+        }
+        tool_result = {
+            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"ls -la"}}</tool_call>',
+            "finish_reason": "stop",
+            "generated_tokens": 4,
+        }
+
+        with (
+            mock.patch.object(
+                server,
+                "_generate_locked",
+                side_effect=[
+                    (["The command timed out."], text_result),
+                    (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
+                ],
+            ) as generate_locked_mock,
+            mock.patch.object(server, "_judge_turn_completion") as judge_mock,
+            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", False),
+        ):
+            result, output_items = server._generate_response_locked(
+                [{"role": "user", "content": "Create Snake."}],
+                64,
+                tools=tools,
+            )
+
+        self.assertIs(result, tool_result)
+        self.assertEqual(generate_locked_mock.call_count, 2)
+        judge_mock.assert_not_called()
+        second_messages = generate_locked_mock.call_args_list[1].args[0]
+        self.assertEqual(len(second_messages), 2)
+        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_TOOL_RETRY_PROMPT)
+        self.assertEqual(second_messages[-1]["role"], "user")
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(result["protocol_no_tool_retries"], 1)
+
+    def test_tool_turn_generation_is_capped_but_total_budget_remains(self):
+        server = self._make_server()
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+        text_result = {
+            "text": "I will keep working.",
+            "finish_reason": "length",
+            "generated_tokens": 256,
+        }
+        tool_result = {
+            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"pwd"}}</tool_call>',
+            "finish_reason": "stop",
+            "generated_tokens": 8,
+        }
+
+        with (
+            mock.patch.object(local_api_server, "MAX_TOOL_TURN_TOKENS", 256),
+            mock.patch.object(
+                server,
+                "_generate_locked",
+                side_effect=[
+                    (["I will keep working."], text_result),
+                    (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
+                ],
+            ) as generate_locked_mock,
+            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", False),
+        ):
+            result, output_items = server._generate_response_locked(
+                [{"role": "user", "content": "Create app."}],
+                1000,
+                tools=tools,
+            )
+
+        self.assertIs(result, tool_result)
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(generate_locked_mock.call_args_list[0].args[1], 256)
+        self.assertEqual(generate_locked_mock.call_args_list[1].args[1], 256)
+
+    def test_generate_response_retries_repeated_identical_tool_call(self):
+        server = self._make_server()
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+        messages = [
+            {"role": "user", "content": "Create app."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "shell_command",
+                        {"cmd": "cat vitest.config.ts", "workdir": "/repo"},
+                    )
+                ],
+            },
+            {"role": "tool", "content": "NOT FOUND", "tool_call_id": "call_1"},
+        ]
+        repeated = {
+            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"cat vitest.config.ts","workdir":"/different"}}</tool_call>',
+            "finish_reason": "stop",
+            "generated_tokens": 12,
+        }
+        advanced = {
+            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"python3 -c \\"print(1)\\"","workdir":"/repo"}}</tool_call>',
+            "finish_reason": "stop",
+            "generated_tokens": 12,
+        }
+
+        with mock.patch.object(
+            server,
+            "_generate_locked",
+            side_effect=[
+                (["repeat"], repeated),
+                (["advance"], advanced),
+            ],
+        ) as generate_locked_mock:
+            result, output_items = server._generate_response_locked(
+                messages,
+                256,
+                tools=tools,
+            )
+
+        self.assertIs(result, advanced)
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(generate_locked_mock.call_count, 2)
+        second_messages = generate_locked_mock.call_args_list[1].args[0]
+        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_REPEATED_TOOL_RETRY_PROMPT)
+
+    def test_generate_response_forces_protocol_error_tool_after_no_tool_exhaustion(self):
+        server = self._make_server()
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+        no_tool = {
+            "text": "```ts\nconst x = 1\n```",
+            "finish_reason": "stop",
+            "generated_tokens": 1,
+        }
+
+        with (
+            mock.patch.object(local_api_server, "RESPONSES_ACTION_FOLLOWUP_LIMIT", 0),
+            mock.patch.object(server, "_generate_locked", return_value=(["code"], no_tool)),
+        ):
+            result, output_items = server._generate_response_locked(
+                [{"role": "user", "content": "Create app."}],
+                64,
+                tools=tools,
+            )
+
+        self.assertIn("LOCAL_DFLASH_PROTOCOL_ERROR", result["text"])
+        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertEqual(output_items[0]["name"], "shell_command")
 
     def test_generate_auto_continues_chat_action_only_stop(self):
         server = self._make_server()
@@ -792,6 +1550,7 @@ class LocalApiServerTests(unittest.TestCase):
                     "not finished",
                 ),
             ) as judge_mock,
+            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
         ):
             result = server.generate(
                 messages=[{"role": "user", "content": "Create Snake."}],
@@ -893,9 +1652,11 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIs(result, tool_result)
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(generate_locked.call_count, 2)
-        judge_mock.assert_called_once()
+        judge_mock.assert_not_called()
         second_messages = generate_locked.call_args_list[1].args[0]
-        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
+        self.assertEqual(len(second_messages), 2)
+        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_TOOL_RETRY_PROMPT)
+        self.assertEqual(second_messages[-1]["role"], "user")
         self.assertEqual(result["text"], tool_result["text"])
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(output_items[0]["name"], "edit")
@@ -1034,6 +1795,158 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn('"finish_reason": "stop"', events)
         self.assertTrue(events.rstrip().endswith("data: [DONE]"))
 
+    def test_chat_completions_non_stream_emits_tool_calls(self):
+        server = self._make_server()
+        endpoint = self._get_endpoint(server, "/v1/chat/completions")
+        result = FakeStreamingServer._result()
+        with mock.patch.object(server, "generate", return_value=result):
+            payload = endpoint(
+                local_api_server.OpenAIChatRequest(
+                    model=server.model_name,
+                    messages=[local_api_server.OpenAIMessage(role="user", content="write file")],
+                    tools=[{"type": "function", "function": {"name": "write_file"}}],
+                )
+            )
+
+        choice = payload["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertIsNone(choice["message"]["content"])
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "write_file")
+        self.assertIn("index.html", choice["message"]["tool_calls"][0]["function"]["arguments"])
+
+    def test_stream_chat_completions_emits_tool_call_deltas(self):
+        server = self._make_server(FakeStreamingServer)
+        events = "".join(
+            server.stream_chat_completions(
+                messages=[{"role": "user", "content": "write file"}],
+                max_tokens=64,
+                temperature=0.0,
+                tools=[{"type": "function", "function": {"name": "write_file"}}],
+            )
+        )
+
+        self.assertIn('"tool_calls"', events)
+        self.assertIn('"name": "write_file"', events)
+        self.assertIn('"finish_reason": "tool_calls"', events)
+        self.assertTrue(events.rstrip().endswith("data: [DONE]"))
+
+    def test_anthropic_messages_non_stream_emits_tool_use(self):
+        server = self._make_server()
+        endpoint = self._get_endpoint(server, "/v1/messages")
+        result = FakeStreamingServer._result()
+        with mock.patch.object(server, "generate", return_value=result):
+            payload = endpoint(
+                local_api_server.AnthropicRequest(
+                    model=server.model_name,
+                    max_tokens=64,
+                    messages=[
+                        local_api_server.AnthropicMessage(role="user", content="write file")
+                    ],
+                    tools=[{"name": "write_file", "input_schema": {"type": "object"}}],
+                )
+            )
+
+        self.assertEqual(payload["stop_reason"], "tool_use")
+        self.assertEqual(payload["content"][0]["type"], "tool_use")
+        self.assertEqual(payload["content"][0]["name"], "write_file")
+        self.assertEqual(payload["content"][0]["input"]["path"], "index.html")
+
+    def test_stream_anthropic_events_emits_tool_use_blocks(self):
+        server = self._make_server(FakeStreamingServer)
+        events = "".join(
+            server.stream_anthropic_events(
+                messages=[{"role": "user", "content": "write file"}],
+                max_tokens=64,
+                temperature=0.0,
+                tools=[{"name": "write_file", "input_schema": {"type": "object"}}],
+            )
+        )
+
+        self.assertIn('"type": "tool_use"', events)
+        self.assertIn('"name": "write_file"', events)
+        self.assertIn('"type": "input_json_delta"', events)
+        self.assertIn('"stop_reason": "tool_use"', events)
+
+    def test_stream_chat_error_closes_with_done(self):
+        server = self._make_server(FakeStreamErrorServer)
+        events = "".join(
+            server.stream_chat_completions(
+                messages=[{"role": "user", "content": "fail"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+        )
+
+        self.assertIn('"message": "boom"', events)
+        self.assertTrue(events.rstrip().endswith("data: [DONE]"))
+
+    def test_stream_chat_no_result_closes_with_done(self):
+        server = self._make_server(FakeStreamNoResultServer)
+        events = "".join(
+            server.stream_chat_completions(
+                messages=[{"role": "user", "content": "empty"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+        )
+
+        self.assertIn("Generation completed without a final result", events)
+        self.assertTrue(events.rstrip().endswith("data: [DONE]"))
+
+    def test_stream_responses_error_closes_with_failed_and_done(self):
+        server = self._make_server(FakeStreamErrorServer)
+        events = "".join(
+            server.stream_response_events(
+                messages=[{"role": "user", "content": "fail"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+        )
+
+        self.assertIn("event: response.failed", events)
+        self.assertIn('"message": "boom"', events)
+        self.assertTrue(events.rstrip().endswith("data: [DONE]"))
+
+    def test_stream_responses_no_result_closes_with_failed_and_done(self):
+        server = self._make_server(FakeStreamNoResultServer)
+        events = "".join(
+            server.stream_response_events(
+                messages=[{"role": "user", "content": "empty"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+        )
+
+        self.assertIn("event: response.failed", events)
+        self.assertIn("Generation completed without a final result", events)
+        self.assertTrue(events.rstrip().endswith("data: [DONE]"))
+
+    def test_stream_anthropic_error_emits_error_event(self):
+        server = self._make_server(FakeStreamErrorServer)
+        events = "".join(
+            server.stream_anthropic_events(
+                messages=[{"role": "user", "content": "fail"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+        )
+
+        self.assertIn("event: error", events)
+        self.assertIn('"message": "boom"', events)
+
+    def test_stream_anthropic_no_result_emits_error_event(self):
+        server = self._make_server(FakeStreamNoResultServer)
+        events = "".join(
+            server.stream_anthropic_events(
+                messages=[{"role": "user", "content": "empty"}],
+                max_tokens=16,
+                temperature=0.0,
+            )
+        )
+
+        self.assertIn("event: error", events)
+        self.assertIn("Generation completed without a final result", events)
+
     def test_streaming_generation_continues_after_action_only_text(self):
         server = self._make_server()
 
@@ -1117,6 +2030,7 @@ class LocalApiServerTests(unittest.TestCase):
                     "not finished",
                 ),
             ) as judge_mock,
+            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
         ):
             server._generation_worker(
                 queue,
@@ -1295,6 +2209,10 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertTrue(loaded["loaded"])
         self.assertFalse(after["loaded"])
         self.assertEqual(before["keep_alive_seconds"], 300)
+        self.assertEqual(
+            before["stream_result_timeout_seconds"],
+            local_api_server.STREAM_RESULT_TIMEOUT_SECONDS,
+        )
         self.assertEqual(before["response_history_limit"], server.response_history_limit)
         self.assertEqual(before["response_history_entries"], 0)
         self.assertEqual(before["active_generation_requests"], 0)
@@ -1548,6 +2466,7 @@ class LocalApiServerTests(unittest.TestCase):
                 return_value=local_api_server.FollowupJudgeDecision(False, "", "done"),
             ) as judge_mock,
             mock.patch.object(server, "_record_generation_metrics"),
+            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
         ):
             result = server.generate(
                 [{"role": "user", "content": "answer"}],

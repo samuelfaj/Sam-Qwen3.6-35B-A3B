@@ -154,6 +154,7 @@ def generate_ddtree(
     prefix_state: PromptPrefillState | None = None,
     capture_prefill_state: bool = False,
     target_turboquant_bits: float | None = None,
+    should_stop: Any = None,
 ) -> dict[str, Any]:
     (
         build_ddtree_tree_from_topk,
@@ -221,6 +222,15 @@ def generate_ddtree(
     }
     fast_path_count = 0
     stop_hit = False
+    cancelled = False
+
+    def stop_requested() -> bool:
+        if should_stop is None:
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:
+            return False
 
     current_block_size = max(
         1,
@@ -230,6 +240,9 @@ def generate_ddtree(
     eos_token_ids = set(getattr(tokenizer, "eos_token_ids", []) or [])
 
     while len(generated_token_ids) < max_new_tokens:
+        if stop_requested():
+            cancelled = True
+            break
         remaining = max_new_tokens - len(generated_token_ids)
         block_len = max(1, min(current_block_size, remaining))
         block_size_history.append(block_len)
@@ -350,7 +363,7 @@ def generate_ddtree(
 
     return {
         "text": text,
-        "finish_reason": "stop" if stop_hit else "length",
+        "finish_reason": "cancelled" if cancelled else ("stop" if stop_hit else "length"),
         "prompt_tokens": prompt_len,
         "prefill_seconds": prefill_seconds,
         "prompt_tps": prompt_tps,

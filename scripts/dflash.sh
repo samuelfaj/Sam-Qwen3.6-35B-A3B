@@ -65,8 +65,50 @@ cmd_status() {
     return 1
   fi
   echo "dflash: running (pid ${pid}, port ${PORT})"
-  if curl -fsS --max-time 2 "${HEALTH_URL}" >/dev/null 2>&1; then
+  local health_json
+  if health_json="$(curl -fsS --max-time 2 "${HEALTH_URL}" 2>/dev/null)"; then
     echo "health: ok (${HEALTH_URL})"
+    local metrics_json=""
+    metrics_json="$(curl -fsS --max-time 2 "${METRICS_URL}" 2>/dev/null || true)"
+    local python_bin="${REPO_ROOT}/.venv/bin/python"
+    if [[ ! -x "${python_bin}" ]]; then
+      python_bin="$(command -v python3 || true)"
+    fi
+    if [[ -n "${python_bin}" ]]; then
+      STATUS_HEALTH_JSON="${health_json}" STATUS_METRICS_JSON="${metrics_json}" "${python_bin}" - <<'PY' || true
+import json
+import os
+
+health = json.loads(os.environ.get("STATUS_HEALTH_JSON") or "{}")
+try:
+    metrics = json.loads(os.environ.get("STATUS_METRICS_JSON") or "{}")
+except json.JSONDecodeError:
+    metrics = {}
+
+def show(label, value):
+    if value is None:
+        return
+    print(f"{label}: {value}")
+
+show("profile", health.get("profile"))
+show("model", health.get("model"))
+show("model_path", health.get("model_path"))
+show("draft_path", health.get("draft_path"))
+show("loaded", health.get("loaded"))
+show("engine", health.get("generation_engine"))
+show("context", f"{health.get('context_window')} reserve={health.get('context_reserve')} max_tokens={health.get('max_tokens_limit')} max_tool_turn={health.get('max_tool_turn_tokens')}")
+show("keep_alive_seconds", health.get("keep_alive_seconds"))
+show("thinking_disabled", health.get("disable_thinking"))
+show("temperature", f"default={health.get('default_temperature')} tools={health.get('default_temperature_with_tools')} clamp=[{health.get('min_temperature_with_tools')},{health.get('max_temperature_with_tools')}]")
+show("ddtree", f"tree_budget={health.get('ddtree_tree_budget')} target_turboquant_bits={health.get('ddtree_target_turboquant_bits')} fallback={health.get('ddtree_fallback_to_dflash')} retry_no_turboquant={health.get('ddtree_retry_without_turboquant')}")
+show("turboquant", f"target={health.get('target_turboquant_bits')} draft={health.get('draft_turboquant_bits')}")
+show("adaptive_block", f"enabled={health.get('adaptive_block_size')} range={health.get('adaptive_block_size_min')}-{health.get('adaptive_block_size_max')}")
+show("prefix_cache", f"global_entries={health.get('global_prefix_cache_entries')} hits={health.get('global_prefix_cache_hits')} misses={health.get('global_prefix_cache_misses')}")
+if metrics:
+    show("requests", metrics.get("dflash_request_metrics_entries"))
+    show("last_tool_metrics", f"tool_calls={metrics.get('dflash_last_request_tool_call_count', 0)} no_tool_retries={metrics.get('dflash_last_request_protocol_no_tool_retries', 0)} malformed_retries={metrics.get('dflash_last_request_protocol_malformed_tool_retries', 0)} final_with_tools={metrics.get('dflash_last_request_protocol_final_with_tools', 0)}")
+PY
+    fi
     return 0
   fi
   echo "health: NOT responding at ${HEALTH_URL}"
@@ -186,6 +228,7 @@ cmd_restart() {
 }
 
 apply_profile_114() {
+  export LOCAL_DFLASH_PROFILE=codex-agentic
   export LOCAL_DFLASH_BLOCK_SIZE=8
   export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE=1
   export LOCAL_DFLASH_ADAPTIVE_BLOCK_SIZE_MIN=4
@@ -203,12 +246,14 @@ apply_profile_114() {
   export LOCAL_DFLASH_DDTREE_NO_FALLBACK=0
   export LOCAL_DFLASH_DDTREE_NO_TURBOQUANT_RETRY=0
   export LOCAL_DFLASH_DEFAULT_TEMPERATURE=0.6
-  export LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS=0.3
+  export LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS=0.0
   export LOCAL_DFLASH_MIN_TEMPERATURE_WITH_TOOLS=0
+  export LOCAL_DFLASH_MAX_TEMPERATURE_WITH_TOOLS=0.2
   export LOCAL_DFLASH_DISABLE_THINKING=0
+  export LOCAL_DFLASH_MAX_TOKENS=8192
   export LOCAL_DFLASH_CONTEXT_WINDOW=32768
   export LOCAL_DFLASH_SLIDING_WINDOW_SIZE=32768
-  export LOCAL_DFLASH_KEEP_ALIVE=60
+  export LOCAL_DFLASH_KEEP_ALIVE=600
 }
 
 prepare_profile_114_args() {
