@@ -9,7 +9,7 @@ import importlib.util
 import json
 import logging
 import os
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
 import re
@@ -153,7 +153,6 @@ GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CA
 MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
 MAX_TOOL_TURN_TOKENS = _env_positive_int("LOCAL_DFLASH_MAX_TOOL_TURN_TOKENS", 4096)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 15)
-REPEATED_OBSERVATION_LIMIT = _env_positive_int("LOCAL_DFLASH_REPEATED_OBSERVATION_LIMIT", 3)
 ALLOW_APPLY_PATCH_TOOL = _env_bool("LOCAL_DFLASH_ALLOW_APPLY_PATCH_TOOL", False)
 PROTOCOL_TOOL_RETRY_PROMPT = (
     "[System protocol retry: the previous assistant turn was discarded because "
@@ -161,13 +160,6 @@ PROTOCOL_TOOL_RETRY_PROMPT = (
     "tool call. Do not continue, summarize, refer to discarded text, plan in "
     "prose, output markdown code blocks, or return a final answer on this retry. "
     "Output exactly one valid tool call now using the declared format.]"
-)
-PROTOCOL_REPEATED_TOOL_RETRY_PROMPT = (
-    "[System protocol retry: the previous assistant turn repeated a recent "
-    "tool-call pattern. This retry accepts only one valid tool call with a "
-    "different tool name or different arguments, or a final answer if no new "
-    "tool call is needed. Do not repeat the same recent tool-call sequence or "
-    "the same recent tool observation.]"
 )
 TOOL_CALLING_RULES_TEMPLATE = """Tool-calling rules (strict):
 - Function calls MUST use the Qwen XML format exactly:
@@ -1206,175 +1198,6 @@ def _tool_call_signature(name: Any, arguments: Any) -> tuple[str, str]:
     return (name_text, _canonical_tool_arguments(normalized_arguments))
 
 
-def _output_tool_call_signatures(
-    output_items: list[dict[str, Any]],
-    *,
-    include_status_tools: bool = True,
-) -> set[tuple[str, str]]:
-    signatures: set[tuple[str, str]] = set()
-    for item in output_items:
-        if item.get("type") == "function_call":
-            if not include_status_tools and item.get("name") in STATUS_ONLY_TOOL_NAMES:
-                continue
-            signatures.add(_tool_call_signature(item.get("name"), item.get("arguments")))
-        elif item.get("type") == "custom_tool_call":
-            if not include_status_tools and item.get("name") in STATUS_ONLY_TOOL_NAMES:
-                continue
-            signatures.add(_tool_call_signature(item.get("name"), {"input": item.get("input")}))
-    return signatures
-
-
-def _last_assistant_tool_call_signatures(
-    messages: list[dict[str, Any]],
-    *,
-    include_status_tools: bool = True,
-) -> set[tuple[str, str]]:
-    for message in reversed(messages):
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list) or not tool_calls:
-            continue
-        signatures: set[tuple[str, str]] = set()
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function_payload = tool_call.get("function")
-            if isinstance(function_payload, dict):
-                tool_name = function_payload.get("name") or tool_call.get("name")
-            else:
-                tool_name = tool_call.get("name")
-            if not include_status_tools and tool_name in STATUS_ONLY_TOOL_NAMES:
-                continue
-            if isinstance(function_payload, dict):
-                signatures.add(
-                    _tool_call_signature(
-                        tool_name,
-                        function_payload.get("arguments") or {},
-                    )
-                )
-            else:
-                signatures.add(_tool_call_signature(tool_name, tool_call.get("arguments") or {}))
-        if signatures:
-            return signatures
-    return set()
-
-
-def _assistant_tool_call_signature_sequence(
-    messages: list[dict[str, Any]],
-    *,
-    limit: int = 12,
-    include_status_tools: bool = True,
-) -> list[frozenset[tuple[str, str]]]:
-    sequence: list[frozenset[tuple[str, str]]] = []
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        signatures = _last_assistant_tool_call_signatures(
-            [message],
-            include_status_tools=include_status_tools,
-        )
-        if signatures:
-            sequence.append(frozenset(signatures))
-    return sequence[-limit:]
-
-
-def _normalize_tool_observation(content: Any) -> str:
-    text = _extract_text_from_content(content).strip()
-    if not text:
-        return ""
-    return "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
-
-
-def _recent_external_tool_observations(
-    messages: list[dict[str, Any]],
-    *,
-    limit: int = 12,
-) -> list[str]:
-    external_call_ids: set[str] = set()
-    observations: list[str] = []
-    for message in messages:
-        role = message.get("role")
-        if role == "assistant":
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                function_payload = tool_call.get("function")
-                if isinstance(function_payload, dict):
-                    tool_name = function_payload.get("name") or tool_call.get("name")
-                else:
-                    tool_name = tool_call.get("name")
-                if tool_name in STATUS_ONLY_TOOL_NAMES:
-                    continue
-                call_id = _coerce_text(tool_call.get("id") or tool_call.get("call_id") or tool_call.get("tool_call_id"))
-                if call_id:
-                    external_call_ids.add(call_id)
-            continue
-        if role != "tool":
-            continue
-        tool_name = message.get("name")
-        call_id = _coerce_text(message.get("tool_call_id") or message.get("call_id") or message.get("id"))
-        if tool_name in STATUS_ONLY_TOOL_NAMES:
-            continue
-        if call_id and call_id not in external_call_ids and not tool_name:
-            continue
-        observation = _normalize_tool_observation(message.get("content"))
-        if observation:
-            observations.append(observation)
-    return observations[-limit:]
-
-
-def _repeats_recent_tool_observation(
-    messages: list[dict[str, Any]],
-    output_items: list[dict[str, Any]],
-) -> bool:
-    if not _output_tool_call_signatures(output_items, include_status_tools=False):
-        return False
-    observations = _recent_external_tool_observations(messages)
-    if len(observations) < REPEATED_OBSERVATION_LIMIT:
-        return False
-    latest = observations[-1]
-    if not latest:
-        return False
-    return Counter(observations)[latest] >= REPEATED_OBSERVATION_LIMIT
-
-
-def _repeats_recent_tool_call_pattern(
-    messages: list[dict[str, Any]],
-    output_items: list[dict[str, Any]],
-    *,
-    max_period: int = 4,
-) -> bool:
-    latest = frozenset(_output_tool_call_signatures(output_items, include_status_tools=False))
-    if not latest:
-        return False
-    sequence = [
-        *_assistant_tool_call_signature_sequence(messages, include_status_tools=False),
-        latest,
-    ]
-    if len(sequence) < 2:
-        return False
-    max_period = max(1, min(max_period, len(sequence) // 2))
-    for period in range(1, max_period + 1):
-        suffix = sequence[-(period * 2) :]
-        if suffix[:period] == suffix[period:]:
-            return True
-    return False
-
-
-def _repeats_last_tool_call(
-    messages: list[dict[str, Any]],
-    output_items: list[dict[str, Any]],
-) -> bool:
-    return _repeats_recent_tool_call_pattern(messages, output_items) or _repeats_recent_tool_observation(
-        messages,
-        output_items,
-    )
-
-
 def _protocol_error_tool_call_text(
     tools: list[dict[str, Any]] | None,
     reason: str,
@@ -1429,37 +1252,6 @@ def _protocol_error_tool_call_result(
         "engine": "protocol",
         "protocol_timeout_tool_call": 1,
     }
-
-
-def _protocol_final_message_result(reason: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    text = f"LOCAL_DFLASH_PROTOCOL_ERROR: {reason}"
-    result = {
-        "text": text,
-        "finish_reason": "stop",
-        "prompt_tokens": 0,
-        "prefill_seconds": 0.0,
-        "prompt_tps": 0.0,
-        "reused_prefix_tokens": 0,
-        "decode_seconds": 0.0,
-        "generation_tps": 0.0,
-        "generated_tokens": 0,
-        "speculative_steps": 0,
-        "proposed_tokens": 0,
-        "accepted_tokens": 0,
-        "avg_acceptance_length": 0.0,
-        "avg_acceptance_ratio": 0.0,
-        "acceptance_lengths": [],
-        "acceptance_ratios": [],
-        "block_size_history": [],
-        "adaptive_block_size": False,
-        "prefix_cache_source": "none",
-        "peak_memory_gb": 0.0,
-        "elapsed": 0.0,
-        "prompt_cache_state": None,
-        "engine": "protocol",
-        "protocol_final_message": 1,
-    }
-    return result, [_make_message_item(text)]
 
 
 def _should_protocol_retry_without_tool(
@@ -2010,7 +1802,6 @@ def _hash_json_payload(payload: Any) -> str:
 
 
 SHELL_TOOL_NAMES = {"shell_command", "local_shell", "exec", "exec_command"}
-STATUS_ONLY_TOOL_NAMES = {"update_plan"}
 
 
 def _augment_shell_tool_parameters(name: str, parameters: Any) -> Any:
@@ -3796,15 +3587,6 @@ class LocalModelServer:
                     break
                 visible_text, tool_calls = _parse_tool_calls(iteration_text)
                 if tool_calls:
-                    output_items = _build_output_items(iteration_text)
-                    output_items = _convert_items_for_custom_tools(output_items, tools)
-                    if _repeats_last_tool_call(current_messages, output_items):
-                        protocol_no_tool_retries += 1
-                        current_messages = [
-                            *current_messages,
-                            {"role": "user", "content": PROTOCOL_REPEATED_TOOL_RETRY_PROMPT},
-                        ]
-                        continue
                     text_parts.extend(iteration_parts)
                     result["text"] = "".join(text_parts)
                     break
@@ -3884,14 +3666,6 @@ class LocalModelServer:
                         break
                     visible_text, tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
                     if tool_calls:
-                        output_items = _build_output_items(_coerce_text(result.get("text", "")))
-                        output_items = _convert_items_for_custom_tools(output_items, tools)
-                        if _repeats_last_tool_call(current_messages, output_items):
-                            current_messages = [
-                                *current_messages,
-                                {"role": "user", "content": PROTOCOL_REPEATED_TOOL_RETRY_PROMPT},
-                            ]
-                            continue
                         break
                     output_items = _build_output_items(_coerce_text(result.get("text", "")))
                     output_items = _convert_items_for_custom_tools(output_items, tools)
@@ -3930,7 +3704,6 @@ class LocalModelServer:
         remaining_max_tokens = max(1, int(requested_max_tokens))
         protocol_no_tool_retries = 0
         protocol_malformed_tool_retries = 0
-        repeated_tool_retries = 0
 
         def finalize(
             final_result: dict[str, Any],
@@ -3968,23 +3741,6 @@ class LocalModelServer:
             output_items = _build_output_items(result["text"])
             output_items = _convert_items_for_custom_tools(output_items, tools)
             if _has_tool_call_item(output_items):
-                if _repeats_last_tool_call(current_messages, output_items):
-                    protocol_no_tool_retries += 1
-                    repeated_tool_retries += 1
-                    if repeated_tool_retries >= 3:
-                        loop_result, loop_items = _protocol_final_message_result(
-                            "repeated tool-call loop detected; the assistant kept requesting tools after repeated equivalent observations"
-                        )
-                        return finalize(loop_result, loop_items)
-                    current_messages = [
-                        *current_messages,
-                        {
-                            "role": "user",
-                            "content": PROTOCOL_REPEATED_TOOL_RETRY_PROMPT,
-                        },
-                    ]
-                    current_previous_response_id = None
-                    continue
                 return finalize(result, output_items)
             if remaining_max_tokens <= 0:
                 return finalize(result, output_items)

@@ -37,26 +37,11 @@ Source inputs:
     Jinja, and remaining semantic wrapper/schema guidance was removed. Shell
     argument sanitation only normalizes Codex contract aliases such as `cmd` to
     `command`; it no longer blocks or rewrites model-chosen commands.
-  - Current patch after TUI loop report: repeated-tool guard now detects
-    structural call cycles such as `A,B,A,B`, not only immediate `A,A`
-    repeats. This is signature-based only; it does not inspect command
-    semantics or special-case React/npm/build/test behavior.
-  - Current patch after second TUI loop report: `update_plan` is treated as a
-    status-only Codex tool for loop detection, so changing plan text no longer
-    masks repetition of the same external tool call. This remains structural:
-    tool name + arguments only, no command/domain interpretation.
-  - Current patch after third TUI loop report: repeated-observation guard now
-    detects when different external tool calls keep returning the same recent
-    output. This is still structural: exact tool-output observation repetition,
-    ignoring status-only tools, with no React/npm/build/test special cases.
-    After repeated protocol retries, the server now returns a final protocol
-    error message instead of letting Codex execute another equivalent tool
-    request forever.
   - Latest contract audit: removed the dormant follow-up judge runtime path and
     its tests. The server no longer has a model-judged continuation mechanism or
     phrase-block list; continuation is driven only by Codex protocol facts
     (tool call present, no valid tool call, malformed/incomplete tool call,
-    repeated structural tool loop, timeout).
+    timeout).
   - Latest contract audit: shell alias normalization is now scoped to shell
     tools only. Non-shell tools keep their literal argument schema untouched.
     Shell loop signatures canonicalize `cmd`/`script` aliases to `command` while
@@ -67,7 +52,12 @@ Source inputs:
     The server no longer forces a synthetic protocol-error tool call just
     because the model chose not to call a tool. Retries remain only for
     objective protocol failures such as empty output, incomplete tool markup,
-    token-limit truncation, timeout, or structural repeated tool loops.
+    token-limit truncation, or timeout.
+  - Latest contract audit after TUI protocol-error report: removed repeated
+    tool-call / repeated-observation loop guards from the runtime path. These
+    guards were model-behavior heuristics, not Codex CLI contract. A valid tool
+    call now passes through to Codex even when similar calls or outputs appeared
+    earlier in the conversation.
   - Latest smoke `artifacts/codex-smoke/20260424-142736`: project scaffold,
     app source, and test files were created, but Codex entered a repeated
     explanatory loop before adding the test script or running verification.
@@ -239,8 +229,7 @@ The dflash server is a Codex CLI protocol adapter, not an autonomy judge.
 When the local model returns a valid final message, dflash returns it. When the
 local model emits supported tool-call markup, dflash converts it to exact Codex
 tool-call events. When the protocol is objectively broken (malformed/truncated
-tool markup, timeout, repeated structural loop), dflash reports or retries at
-the protocol layer only.
+tool markup or timeout), dflash reports or retries at the protocol layer only.
 
 Observed failure modes:
 - Qwen writes "Let me verify..." or explanatory text instead of emitting a tool

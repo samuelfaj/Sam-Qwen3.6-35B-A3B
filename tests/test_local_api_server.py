@@ -1343,30 +1343,25 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(generate_locked_mock.call_args_list[0].args[1], 256)
         self.assertEqual(generate_locked_mock.call_args_list[1].args[1], 256)
 
-    def test_generate_response_retries_repeated_identical_tool_call(self):
+    def test_generate_response_returns_repeated_tool_call_without_loop_guard(self):
         server = self._make_server()
         tools = [{"type": "function", "function": {"name": "shell_command"}}]
         messages = [
-            {"role": "user", "content": "Create app."},
+            {"role": "user", "content": "Verify."},
             {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
                     local_api_server._make_internal_tool_call(
                         "shell_command",
-                        {"cmd": "cat vitest.config.ts", "workdir": "/repo"},
+                        {"command": "npm list vite", "workdir": "/repo"},
                     )
                 ],
             },
-            {"role": "tool", "content": "NOT FOUND", "tool_call_id": "call_1"},
+            {"role": "tool", "content": "vite@8.0.10", "tool_call_id": "call_1"},
         ]
         repeated = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"cat vitest.config.ts","workdir":"/repo"}}</tool_call>',
-            "finish_reason": "stop",
-            "generated_tokens": 12,
-        }
-        advanced = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"python3 -c \\"print(1)\\"","workdir":"/repo"}}</tool_call>',
+            "text": '<tool_call>{"name":"shell_command","arguments":{"command":"npm list vite","workdir":"/repo"}}</tool_call>',
             "finish_reason": "stop",
             "generated_tokens": 12,
         }
@@ -1374,10 +1369,7 @@ class LocalApiServerTests(unittest.TestCase):
         with mock.patch.object(
             server,
             "_generate_locked",
-            side_effect=[
-                (["repeat"], repeated),
-                (["advance"], advanced),
-            ],
+            return_value=(["repeat"], repeated),
         ) as generate_locked_mock:
             result, output_items = server._generate_response_locked(
                 messages,
@@ -1385,263 +1377,10 @@ class LocalApiServerTests(unittest.TestCase):
                 tools=tools,
             )
 
-        self.assertIs(result, advanced)
+        self.assertIs(result, repeated)
+        self.assertEqual(generate_locked_mock.call_count, 1)
         self.assertEqual(output_items[0]["type"], "function_call")
-        self.assertEqual(generate_locked_mock.call_count, 2)
-        second_messages = generate_locked_mock.call_args_list[1].args[0]
-        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_REPEATED_TOOL_RETRY_PROMPT)
-
-    def test_generate_response_retries_repeated_tool_call_cycle(self):
-        server = self._make_server()
-        tools = [{"type": "function", "function": {"name": "shell_command"}}]
-
-        def assistant_call(command: str) -> dict[str, Any]:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {"command": command, "workdir": "/repo"},
-                    )
-                ],
-            }
-
-        node_command = 'node -e "console.log(require(\'react\').version)"'
-        messages = [
-            {"role": "user", "content": "Inspect versions."},
-            assistant_call("npm list react react-dom"),
-            {"role": "tool", "content": "react@19.2.5", "tool_call_id": "call_1"},
-            assistant_call(node_command),
-            {"role": "tool", "content": "19.2.5", "tool_call_id": "call_2"},
-            assistant_call("npm list react react-dom"),
-            {"role": "tool", "content": "react@19.2.5", "tool_call_id": "call_3"},
-        ]
-        repeated_cycle = {
-            "text": "<tool_call>"
-            + json.dumps(
-                {
-                    "name": "shell_command",
-                    "arguments": {"command": node_command, "workdir": "/repo"},
-                }
-            )
-            + "</tool_call>",
-            "finish_reason": "stop",
-            "generated_tokens": 12,
-        }
-        advanced = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"command":"sed -n \\"1,120p\\" package.json","workdir":"/repo"}}</tool_call>',
-            "finish_reason": "stop",
-            "generated_tokens": 12,
-        }
-
-        with mock.patch.object(
-            server,
-            "_generate_locked",
-            side_effect=[
-                (["repeat-cycle"], repeated_cycle),
-                (["advance"], advanced),
-            ],
-        ) as generate_locked_mock:
-            result, output_items = server._generate_response_locked(
-                messages,
-                256,
-                tools=tools,
-            )
-
-        self.assertIs(result, advanced)
-        self.assertEqual(output_items[0]["type"], "function_call")
-        self.assertEqual(generate_locked_mock.call_count, 2)
-        second_messages = generate_locked_mock.call_args_list[1].args[0]
-        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_REPEATED_TOOL_RETRY_PROMPT)
-
-    def test_repeated_shell_call_ignores_intervening_update_plan(self):
-        def assistant_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        name,
-                        arguments,
-                    )
-                ],
-            }
-
-        messages = [
-            {"role": "user", "content": "Verify packages."},
-            assistant_call(
-                "shell_command",
-                {"command": "npm list react react-dom", "workdir": "/repo"},
-            ),
-            {"role": "tool", "content": "react@19.2.5", "tool_call_id": "call_1"},
-            assistant_call(
-                "update_plan",
-                {
-                    "plan": [
-                        {"step": "Verify installation", "status": "completed"},
-                        {"step": "Final final check", "status": "completed"},
-                    ]
-                },
-            ),
-            {"role": "tool", "content": "plan updated", "tool_call_id": "call_2"},
-        ]
-        output_items = local_api_server._build_output_items(
-            '<tool_call>{"name":"shell_command","arguments":{"command":"npm list react react-dom","workdir":"/repo"}}</tool_call>'
-        )
-
-        self.assertTrue(local_api_server._repeats_last_tool_call(messages, output_items))
-
-    def test_repeated_external_observation_blocks_variant_tool_call(self):
-        def assistant_call(command: str, call_id: str) -> dict[str, Any]:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {"command": command, "workdir": "/repo"},
-                        call_id=call_id,
-                    )
-                ],
-            }
-
-        same_observation = "React: 19.2.5\nReact DOM: 19.2.5"
-        messages = [
-            {"role": "user", "content": "Verify packages."},
-            assistant_call("npm list react react-dom", "call_1"),
-            {"role": "tool", "content": same_observation, "tool_call_id": "call_1"},
-            assistant_call("node -e \"console.log(require('react/package.json').version)\"", "call_2"),
-            {"role": "tool", "content": same_observation, "tool_call_id": "call_2"},
-            assistant_call("node -e \"console.log(require('/repo/node_modules/react/package.json').version)\"", "call_3"),
-            {"role": "tool", "content": same_observation, "tool_call_id": "call_3"},
-        ]
-        output_items = local_api_server._build_output_items(
-            '<tool_call>{"name":"shell_command","arguments":{"command":"node -e \\"console.log(1)\\"","workdir":"/repo"}}</tool_call>'
-        )
-
-        self.assertTrue(local_api_server._repeats_last_tool_call(messages, output_items))
-
-    def test_repeated_external_observation_ignores_status_tool_outputs(self):
-        def assistant_call(name: str, arguments: dict[str, Any], call_id: str) -> dict[str, Any]:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        name,
-                        arguments,
-                        call_id=call_id,
-                    )
-                ],
-            }
-
-        messages = [
-            {"role": "user", "content": "Plan."},
-            assistant_call("update_plan", {"plan": [{"step": "A", "status": "completed"}]}, "call_1"),
-            {"role": "tool", "content": "plan updated", "tool_call_id": "call_1", "name": "update_plan"},
-            assistant_call("update_plan", {"plan": [{"step": "B", "status": "completed"}]}, "call_2"),
-            {"role": "tool", "content": "plan updated", "tool_call_id": "call_2", "name": "update_plan"},
-            assistant_call("update_plan", {"plan": [{"step": "C", "status": "completed"}]}, "call_3"),
-            {"role": "tool", "content": "plan updated", "tool_call_id": "call_3", "name": "update_plan"},
-        ]
-        output_items = local_api_server._build_output_items(
-            '<tool_call>{"name":"shell_command","arguments":{"command":"pwd","workdir":"/repo"}}</tool_call>'
-        )
-
-        self.assertFalse(local_api_server._repeats_last_tool_call(messages, output_items))
-
-    def test_generate_response_stops_after_repeated_tool_loop_retries(self):
-        server = self._make_server()
-        tools = [{"type": "function", "function": {"name": "shell_command"}}]
-        messages = [
-            {"role": "user", "content": "Verify packages."},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {"command": "npm list react react-dom", "workdir": "/repo"},
-                        call_id="call_1",
-                    )
-                ],
-            },
-            {"role": "tool", "content": "React: 19.2.5", "tool_call_id": "call_1"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {"command": "node -e one", "workdir": "/repo"},
-                        call_id="call_2",
-                    )
-                ],
-            },
-            {"role": "tool", "content": "React: 19.2.5", "tool_call_id": "call_2"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {"command": "node -e two", "workdir": "/repo"},
-                        call_id="call_3",
-                    )
-                ],
-            },
-            {"role": "tool", "content": "React: 19.2.5", "tool_call_id": "call_3"},
-        ]
-        repeated = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"command":"node -e three","workdir":"/repo"}}</tool_call>',
-            "finish_reason": "stop",
-            "generated_tokens": 1,
-        }
-
-        with mock.patch.object(
-            server,
-            "_generate_locked",
-            side_effect=[
-                (["repeat"], repeated),
-                (["repeat"], repeated),
-                (["repeat"], repeated),
-            ],
-        ):
-            result, output_items = server._generate_response_locked(
-                messages,
-                256,
-                tools=tools,
-            )
-
-        self.assertEqual(output_items[0]["type"], "message")
-        self.assertIn("repeated tool-call loop detected", result["text"])
-        self.assertEqual(result["protocol_final_message"], 1)
-
-    def test_recent_tool_call_pattern_allows_non_cycle_repeat(self):
-        def assistant_call(command: str) -> dict[str, Any]:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    local_api_server._make_internal_tool_call(
-                        "shell_command",
-                        {"command": command, "workdir": "/repo"},
-                    )
-                ],
-            }
-
-        messages = [
-            {"role": "user", "content": "Work."},
-            assistant_call("npm test"),
-            assistant_call("python3 fix.py"),
-            assistant_call("npm run build"),
-        ]
-        output_items = local_api_server._build_output_items(
-            '<tool_call>{"name":"shell_command","arguments":{"command":"npm test","workdir":"/repo"}}</tool_call>'
-        )
-
-        self.assertFalse(local_api_server._repeats_last_tool_call(messages, output_items))
+        self.assertNotIn("protocol_final_message", result)
 
     def test_generate_response_returns_no_tool_stop_without_forced_tool(self):
         server = self._make_server()
