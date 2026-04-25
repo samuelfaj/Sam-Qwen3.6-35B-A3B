@@ -467,7 +467,7 @@ class LocalApiServerTests(unittest.TestCase):
                 {"type": "message", "role": "user", "content": "continue"},
                 {
                     "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": "continue thought process"}],
+                    "summary": [{"type": "summary_text", "text": "reasoning summary"}],
                 },
             ],
         )
@@ -582,72 +582,6 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertTrue(observed["capture_prefill_state"])
         self.assertIs(result["prompt_cache_state"], chunk.prefill_state)
-
-    def test_build_followup_judge_messages_uses_protocol_only(self):
-        server = self._make_server()
-        messages = [
-            {"role": "user", "content": "Do task."},
-            {"role": "assistant", "content": "I need another step."},
-            {"role": "tool", "content": "tool result", "tool_call_id": "call_1"},
-        ]
-        tools = [{"type": "function", "function": {"name": "shell_command"}}]
-
-        judge_messages = server._build_followup_judge_messages(
-            messages,
-            "I need another step.",
-            tools,
-        )
-        payload = json.loads(judge_messages[1]["content"])
-
-        self.assertEqual(judge_messages[0]["role"], "system")
-        self.assertEqual(
-            judge_messages[0]["content"],
-            local_api_server.FOLLOWUP_JUDGE_SYSTEM_PROMPT,
-        )
-        self.assertEqual(payload["available_tools"], ["shell_command"])
-        self.assertEqual(payload["conversation"], messages)
-        self.assertEqual(payload["latest_assistant_response"], "I need another step.")
-        self.assertEqual(payload["last_tool_result"], messages[-1])
-
-    def test_parse_followup_judge_decision_accepts_continue_and_final(self):
-        continue_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
-            {
-                "verdict": "continue",
-                "continue_message": "Continue from judge.",
-                "reason": "not finished",
-            }
-        )
-        final_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
-            {"verdict": "final", "continue_message": "ignored", "reason": "done"}
-        )
-        invalid_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
-            {"verdict": "continue", "continue_message": "", "reason": "missing"}
-        )
-        reasoning_decision = local_api_server.LocalModelServer._parse_followup_judge_decision(
-            {
-                "verdict": "continue",
-                "continue_message": "Continue the thought process from where it stopped.",
-                "reason": "not finished",
-            }
-        )
-
-        self.assertIsNotNone(continue_decision)
-        self.assertTrue(continue_decision.should_continue)
-        self.assertEqual(continue_decision.continue_message, "Continue from judge.")
-        self.assertIsNotNone(final_decision)
-        self.assertFalse(final_decision.should_continue)
-        self.assertEqual(final_decision.continue_message, "")
-        self.assertIsNone(invalid_decision)
-        self.assertIsNone(reasoning_decision)
-
-    def test_parse_followup_judge_output_accepts_internal_tool_call(self):
-        decision = local_api_server.LocalModelServer._parse_followup_judge_output(
-            '<tool_call>{"name":"judge_decision","arguments":{"verdict":"continue","continue_message":"Run the next observable step.","reason":"not done"}}</tool_call>'
-        )
-
-        self.assertIsNotNone(decision)
-        self.assertTrue(decision.should_continue)
-        self.assertEqual(decision.continue_message, "Run the next observable step.")
 
     def test_tool_calling_rules_prompt_omits_apply_patch_when_tool_absent(self):
         tools = [
@@ -1026,6 +960,24 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(sanitized["workdir"], "/tmp/app")
         self.assertEqual(sanitized["timeout_ms"], 120000)
 
+    def test_non_shell_tool_arguments_do_not_get_command_alias(self):
+        sanitized = local_api_server._sanitize_function_call_arguments(
+            "custom_tool",
+            {"cmd": "literal user field", "path": "file.txt"},
+        )
+
+        self.assertEqual(sanitized, {"cmd": "literal user field", "path": "file.txt"})
+        self.assertNotIn("command", sanitized)
+
+    def test_shell_tool_argument_aliases_normalize_to_command(self):
+        sanitized = local_api_server._sanitize_function_call_arguments(
+            "exec",
+            {"bash_command": "pwd", "workdir": "/tmp/app", "timeout_ms": 120000},
+        )
+
+        self.assertEqual(sanitized["command"], "pwd")
+        self.assertNotIn("bash_command", sanitized)
+
     def test_exec_tool_schema_requires_command_workdir_and_timeout(self):
         normalized = local_api_server._normalize_tool_schemas(
             [
@@ -1075,6 +1027,23 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(alias["command"], "npm run dev")
         self.assertNotIn("LOCAL_DFLASH_PROTOCOL_ERROR", background["command"])
         self.assertNotIn("LOCAL_DFLASH_PROTOCOL_ERROR", alias["command"])
+
+    def test_shell_tool_call_signature_preserves_workdir_and_canonicalizes_aliases(self):
+        from_command = local_api_server._tool_call_signature(
+            "shell_command",
+            {"command": "pwd", "workdir": "/repo/a"},
+        )
+        from_alias = local_api_server._tool_call_signature(
+            "shell_command",
+            {"cmd": "pwd", "workdir": "/repo/a"},
+        )
+        different_workdir = local_api_server._tool_call_signature(
+            "shell_command",
+            {"command": "pwd", "workdir": "/repo/b"},
+        )
+
+        self.assertEqual(from_command, from_alias)
+        self.assertNotEqual(from_command, different_workdir)
 
     def test_ddtree_generation_receives_cooperative_stop_callback(self):
         server = self._make_server()
@@ -1252,7 +1221,7 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("*** Begin Patch", delta["delta"])
         self.assertEqual(done["input"], delta["delta"])
 
-    def test_generate_response_auto_continues_after_action_only_stop(self):
+    def test_generate_response_returns_no_tool_stop_as_final(self):
         server = self._make_server()
         tools = [
             {
@@ -1287,50 +1256,12 @@ class LocalApiServerTests(unittest.TestCase):
             "elapsed": 0.2,
             "prompt_cache_state": None,
         }
-        tool_result = {
-            "text": '<function_call>{"name":"edit","arguments":{"filePath":"tests.js","oldString":"../index.js","newString":"./index.js"}}</function_call>',
-            "finish_reason": "stop",
-            "prompt_tokens": 24,
-            "prefill_seconds": 0.1,
-            "prompt_tps": 10.0,
-            "reused_prefix_tokens": 0,
-            "decode_seconds": 0.2,
-            "generation_tps": 9.0,
-            "generated_tokens": 8,
-            "speculative_steps": 1,
-            "proposed_tokens": 8,
-            "accepted_tokens": 8,
-            "avg_acceptance_length": 8.0,
-            "avg_acceptance_ratio": 1.0,
-            "acceptance_lengths": [8],
-            "acceptance_ratios": [1.0],
-            "block_size_history": [8],
-            "adaptive_block_size": False,
-            "prefix_cache_source": "none",
-            "peak_memory_gb": 1.0,
-            "elapsed": 0.2,
-            "prompt_cache_state": None,
-        }
-
         with (
             mock.patch.object(
                 server,
                 "_generate_locked",
-                side_effect=[
-                    (["The test file has a module resolution issue."], planning_result),
-                    (['<function_call>{"name":"edit"}</function_call>'], tool_result),
-                ],
+                return_value=(["The test file has a module resolution issue."], planning_result),
             ) as generate_locked_mock,
-            mock.patch.object(
-                server,
-                "_judge_turn_completion",
-                return_value=local_api_server.FollowupJudgeDecision(
-                    True,
-                    "Continue from judge.",
-                    "not finished",
-                ),
-            ) as judge_mock,
-            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
         ):
             result, output_items = server.generate_response(
                 messages=[{"role": "user", "content": "Fix until all tests pass."}],
@@ -1342,24 +1273,15 @@ class LocalApiServerTests(unittest.TestCase):
                 capture_prompt_cache_state=True,
             )
 
-        self.assertEqual(generate_locked_mock.call_count, 2)
-        judge_mock.assert_called_once()
+        self.assertIs(result, planning_result)
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertEqual(generate_locked_mock.call_count, 1)
         first_call = generate_locked_mock.call_args_list[0]
-        second_call = generate_locked_mock.call_args_list[1]
         self.assertEqual(first_call.kwargs["previous_response_id"], "resp_1")
-        self.assertIsNone(second_call.kwargs["previous_response_id"])
         self.assertEqual(first_call.args[1], 128)
-        self.assertEqual(second_call.args[1], 120)
-        second_messages = second_call.args[0]
-        self.assertEqual(second_messages[-2]["role"], "assistant")
-        self.assertEqual(
-            second_messages[-2]["content"],
-            "The test file has a module resolution issue. Let me fix the import path and run the tests again.",
-        )
-        self.assertEqual(second_messages[-1]["role"], "user")
-        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
+        self.assertEqual(result["protocol_no_tool_retries"], 0)
 
-    def test_generate_response_protocol_retries_no_tool_text_when_judge_disabled(self):
+    def test_generate_response_returns_no_tool_text_as_final(self):
         server = self._make_server()
         tools = [{"type": "function", "function": {"name": "shell_command"}}]
         text_result = {
@@ -1367,23 +1289,12 @@ class LocalApiServerTests(unittest.TestCase):
             "finish_reason": "stop",
             "generated_tokens": 9,
         }
-        tool_result = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"ls -la"}}</tool_call>',
-            "finish_reason": "stop",
-            "generated_tokens": 4,
-        }
-
         with (
             mock.patch.object(
                 server,
                 "_generate_locked",
-                side_effect=[
-                    (["The command timed out."], text_result),
-                    (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
-                ],
+                return_value=(["The command timed out."], text_result),
             ) as generate_locked_mock,
-            mock.patch.object(server, "_judge_turn_completion") as judge_mock,
-            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", False),
         ):
             result, output_items = server._generate_response_locked(
                 [{"role": "user", "content": "Create Snake."}],
@@ -1391,15 +1302,10 @@ class LocalApiServerTests(unittest.TestCase):
                 tools=tools,
             )
 
-        self.assertIs(result, tool_result)
-        self.assertEqual(generate_locked_mock.call_count, 2)
-        judge_mock.assert_not_called()
-        second_messages = generate_locked_mock.call_args_list[1].args[0]
-        self.assertEqual(len(second_messages), 2)
-        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_TOOL_RETRY_PROMPT)
-        self.assertEqual(second_messages[-1]["role"], "user")
-        self.assertEqual(output_items[0]["type"], "function_call")
-        self.assertEqual(result["protocol_no_tool_retries"], 1)
+        self.assertIs(result, text_result)
+        self.assertEqual(generate_locked_mock.call_count, 1)
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertEqual(result["protocol_no_tool_retries"], 0)
 
     def test_tool_turn_generation_is_capped_but_total_budget_remains(self):
         server = self._make_server()
@@ -1425,7 +1331,6 @@ class LocalApiServerTests(unittest.TestCase):
                     (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
                 ],
             ) as generate_locked_mock,
-            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", False),
         ):
             result, output_items = server._generate_response_locked(
                 [{"role": "user", "content": "Create app."}],
@@ -1456,7 +1361,7 @@ class LocalApiServerTests(unittest.TestCase):
             {"role": "tool", "content": "NOT FOUND", "tool_call_id": "call_1"},
         ]
         repeated = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"cat vitest.config.ts","workdir":"/different"}}</tool_call>',
+            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"cat vitest.config.ts","workdir":"/repo"}}</tool_call>',
             "finish_reason": "stop",
             "generated_tokens": 12,
         }
@@ -1587,6 +1492,132 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertTrue(local_api_server._repeats_last_tool_call(messages, output_items))
 
+    def test_repeated_external_observation_blocks_variant_tool_call(self):
+        def assistant_call(command: str, call_id: str) -> dict[str, Any]:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "shell_command",
+                        {"command": command, "workdir": "/repo"},
+                        call_id=call_id,
+                    )
+                ],
+            }
+
+        same_observation = "React: 19.2.5\nReact DOM: 19.2.5"
+        messages = [
+            {"role": "user", "content": "Verify packages."},
+            assistant_call("npm list react react-dom", "call_1"),
+            {"role": "tool", "content": same_observation, "tool_call_id": "call_1"},
+            assistant_call("node -e \"console.log(require('react/package.json').version)\"", "call_2"),
+            {"role": "tool", "content": same_observation, "tool_call_id": "call_2"},
+            assistant_call("node -e \"console.log(require('/repo/node_modules/react/package.json').version)\"", "call_3"),
+            {"role": "tool", "content": same_observation, "tool_call_id": "call_3"},
+        ]
+        output_items = local_api_server._build_output_items(
+            '<tool_call>{"name":"shell_command","arguments":{"command":"node -e \\"console.log(1)\\"","workdir":"/repo"}}</tool_call>'
+        )
+
+        self.assertTrue(local_api_server._repeats_last_tool_call(messages, output_items))
+
+    def test_repeated_external_observation_ignores_status_tool_outputs(self):
+        def assistant_call(name: str, arguments: dict[str, Any], call_id: str) -> dict[str, Any]:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        name,
+                        arguments,
+                        call_id=call_id,
+                    )
+                ],
+            }
+
+        messages = [
+            {"role": "user", "content": "Plan."},
+            assistant_call("update_plan", {"plan": [{"step": "A", "status": "completed"}]}, "call_1"),
+            {"role": "tool", "content": "plan updated", "tool_call_id": "call_1", "name": "update_plan"},
+            assistant_call("update_plan", {"plan": [{"step": "B", "status": "completed"}]}, "call_2"),
+            {"role": "tool", "content": "plan updated", "tool_call_id": "call_2", "name": "update_plan"},
+            assistant_call("update_plan", {"plan": [{"step": "C", "status": "completed"}]}, "call_3"),
+            {"role": "tool", "content": "plan updated", "tool_call_id": "call_3", "name": "update_plan"},
+        ]
+        output_items = local_api_server._build_output_items(
+            '<tool_call>{"name":"shell_command","arguments":{"command":"pwd","workdir":"/repo"}}</tool_call>'
+        )
+
+        self.assertFalse(local_api_server._repeats_last_tool_call(messages, output_items))
+
+    def test_generate_response_stops_after_repeated_tool_loop_retries(self):
+        server = self._make_server()
+        tools = [{"type": "function", "function": {"name": "shell_command"}}]
+        messages = [
+            {"role": "user", "content": "Verify packages."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "shell_command",
+                        {"command": "npm list react react-dom", "workdir": "/repo"},
+                        call_id="call_1",
+                    )
+                ],
+            },
+            {"role": "tool", "content": "React: 19.2.5", "tool_call_id": "call_1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "shell_command",
+                        {"command": "node -e one", "workdir": "/repo"},
+                        call_id="call_2",
+                    )
+                ],
+            },
+            {"role": "tool", "content": "React: 19.2.5", "tool_call_id": "call_2"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    local_api_server._make_internal_tool_call(
+                        "shell_command",
+                        {"command": "node -e two", "workdir": "/repo"},
+                        call_id="call_3",
+                    )
+                ],
+            },
+            {"role": "tool", "content": "React: 19.2.5", "tool_call_id": "call_3"},
+        ]
+        repeated = {
+            "text": '<tool_call>{"name":"shell_command","arguments":{"command":"node -e three","workdir":"/repo"}}</tool_call>',
+            "finish_reason": "stop",
+            "generated_tokens": 1,
+        }
+
+        with mock.patch.object(
+            server,
+            "_generate_locked",
+            side_effect=[
+                (["repeat"], repeated),
+                (["repeat"], repeated),
+                (["repeat"], repeated),
+            ],
+        ):
+            result, output_items = server._generate_response_locked(
+                messages,
+                256,
+                tools=tools,
+            )
+
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertIn("repeated tool-call loop detected", result["text"])
+        self.assertEqual(result["protocol_final_message"], 1)
+
     def test_recent_tool_call_pattern_allows_non_cycle_repeat(self):
         def assistant_call(command: str) -> dict[str, Any]:
             return {
@@ -1612,7 +1643,7 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertFalse(local_api_server._repeats_last_tool_call(messages, output_items))
 
-    def test_generate_response_forces_protocol_error_tool_after_no_tool_exhaustion(self):
+    def test_generate_response_returns_no_tool_stop_without_forced_tool(self):
         server = self._make_server()
         tools = [{"type": "function", "function": {"name": "shell_command"}}]
         no_tool = {
@@ -1631,11 +1662,11 @@ class LocalApiServerTests(unittest.TestCase):
                 tools=tools,
             )
 
-        self.assertIn("LOCAL_DFLASH_PROTOCOL_ERROR", result["text"])
-        self.assertEqual(output_items[0]["type"], "function_call")
-        self.assertEqual(output_items[0]["name"], "shell_command")
+        self.assertIs(result, no_tool)
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertEqual(output_items[0]["content"][0]["text"], no_tool["text"])
 
-    def test_generate_auto_continues_chat_action_only_stop(self):
+    def test_generate_returns_chat_no_tool_stop_as_final(self):
         server = self._make_server()
         tools = [
             {
@@ -1651,32 +1682,13 @@ class LocalApiServerTests(unittest.TestCase):
             "finish_reason": "stop",
             "generated_tokens": 8,
         }
-        tool_result = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"find . -maxdepth 2 -type f"}}</tool_call>',
-            "finish_reason": "stop",
-            "generated_tokens": 4,
-        }
-
         with (
             mock.patch.object(
                 server,
                 "_generate_locked",
-                side_effect=[
-                    (["Now let me explore."], planning_result),
-                    (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
-                ],
+                return_value=(["Now let me explore."], planning_result),
             ) as generate_locked_mock,
             mock.patch.object(server, "_record_generation_metrics"),
-            mock.patch.object(
-                server,
-                "_judge_turn_completion",
-                return_value=local_api_server.FollowupJudgeDecision(
-                    True,
-                    "Continue from judge.",
-                    "not finished",
-                ),
-            ) as judge_mock,
-            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
         ):
             result = server.generate(
                 messages=[{"role": "user", "content": "Create Snake."}],
@@ -1685,14 +1697,8 @@ class LocalApiServerTests(unittest.TestCase):
                 tools=tools,
             )
 
-        self.assertIs(result, tool_result)
-        self.assertEqual(generate_locked_mock.call_count, 2)
-        judge_mock.assert_called_once()
-        second_messages = generate_locked_mock.call_args_list[1].args[0]
-        self.assertEqual(second_messages[-2]["role"], "assistant")
-        self.assertEqual(second_messages[-2]["content"], planning_result["text"])
-        self.assertEqual(second_messages[-1]["role"], "user")
-        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
+        self.assertIs(result, planning_result)
+        self.assertEqual(generate_locked_mock.call_count, 1)
 
     def test_generate_response_auto_continues_after_empty_stop(self):
         server = self._make_server()
@@ -1759,15 +1765,6 @@ class LocalApiServerTests(unittest.TestCase):
                 "_generate_locked",
                 side_effect=[(None, empty_result), (None, tool_result)],
             ) as generate_locked,
-            mock.patch.object(
-                server,
-                "_judge_turn_completion",
-                return_value=local_api_server.FollowupJudgeDecision(
-                    True,
-                    "Continue from judge.",
-                    "empty response",
-                ),
-            ) as judge_mock,
         ):
             result, output_items = server.generate_response(
                 [{"role": "user", "content": "create app"}],
@@ -1778,7 +1775,6 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIs(result, tool_result)
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(generate_locked.call_count, 2)
-        judge_mock.assert_not_called()
         second_messages = generate_locked.call_args_list[1].args[0]
         self.assertEqual(len(second_messages), 2)
         self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_TOOL_RETRY_PROMPT)
@@ -2073,7 +2069,7 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("event: error", events)
         self.assertIn("Generation completed without a final result", events)
 
-    def test_streaming_generation_continues_after_action_only_text(self):
+    def test_streaming_generation_returns_no_tool_text_as_final(self):
         server = self._make_server()
 
         def chunk(text: str, tokens: int) -> SimpleNamespace:
@@ -2114,49 +2110,22 @@ class LocalApiServerTests(unittest.TestCase):
             mock.patch.object(
                 server,
                 "_stream_generate_locked",
-                side_effect=[
-                    (
-                        iter(
-                            [
-                                chunk(
-                                    "Let me rewrite the Snake game and add tests.",
-                                    9,
-                                )
-                            ]
-                        ),
-                        10,
-                        1.0,
-                        None,
-                        (),
-                        "none",
+                return_value=(
+                    iter(
+                        [
+                            chunk(
+                                "Let me rewrite the Snake game and add tests.",
+                                9,
+                            )
+                        ]
                     ),
-                    (
-                        iter(
-                            [
-                                chunk(
-                                    '<tool_call>{"name":"shell_command","arguments":{"cmd":"echo ok"}}</tool_call>',
-                                    7,
-                                )
-                            ]
-                        ),
-                        12,
-                        2.0,
-                        None,
-                        (),
-                        "none",
-                    ),
-                ],
-            ) as stream_mock,
-            mock.patch.object(
-                server,
-                "_judge_turn_completion",
-                return_value=local_api_server.FollowupJudgeDecision(
-                    True,
-                    "Continue from judge.",
-                    "not finished",
+                    10,
+                    1.0,
+                    None,
+                    (),
+                    "none",
                 ),
-            ) as judge_mock,
-            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
+            ) as stream_mock,
         ):
             server._generation_worker(
                 queue,
@@ -2170,23 +2139,13 @@ class LocalApiServerTests(unittest.TestCase):
         while not queue.empty():
             events.append(queue.get())
 
-        self.assertEqual(stream_mock.call_count, 2)
-        judge_mock.assert_called_once()
-        second_messages = stream_mock.call_args_list[1].args[0]
-        self.assertEqual(second_messages[-1]["content"], "Continue from judge.")
-        self.assertNotIn(
+        self.assertEqual(stream_mock.call_count, 1)
+        self.assertIn(
             ("text", "Let me rewrite the Snake game and add tests."),
             events,
         )
-        self.assertTrue(
-            any(
-                kind == "text" and "tool_call" in payload
-                for kind, payload in events
-            )
-        )
         result = next(payload for kind, payload in events if kind == "result")
-        self.assertNotIn("Let me rewrite", result["text"])
-        self.assertIn("tool_call", result["text"])
+        self.assertEqual(result["text"], "Let me rewrite the Snake game and add tests.")
 
     def test_incremental_visible_text_stream_matches_full_visible_output(self):
         stream = local_api_server._IncrementalVisibleTextStream(strip_edges=False)
@@ -2550,7 +2509,7 @@ class LocalApiServerTests(unittest.TestCase):
         )
         self.assertEqual(merged_tools, tools)
 
-    def test_generate_response_with_tool_call_does_not_call_judge(self):
+    def test_generate_response_with_tool_call_returns_tool_call(self):
         server = self._make_server()
         tools = [{"type": "function", "function": {"name": "edit"}}]
         tool_result = {
@@ -2561,7 +2520,6 @@ class LocalApiServerTests(unittest.TestCase):
 
         with (
             mock.patch.object(server, "_generate_locked", return_value=(None, tool_result)) as generate_locked,
-            mock.patch.object(server, "_judge_turn_completion") as judge_mock,
             mock.patch.object(server, "_record_generation_metrics"),
         ):
             result, output_items = server.generate_response(
@@ -2572,65 +2530,8 @@ class LocalApiServerTests(unittest.TestCase):
 
         self.assertIs(result, tool_result)
         self.assertEqual(generate_locked.call_count, 1)
-        judge_mock.assert_not_called()
         self.assertEqual(output_items[0]["type"], "function_call")
         self.assertEqual(output_items[0]["name"], "edit")
-
-    def test_generate_returns_when_judge_says_final(self):
-        server = self._make_server()
-        final_result = {
-            "text": "Done.",
-            "finish_reason": "stop",
-            "generated_tokens": 4,
-        }
-
-        with (
-            mock.patch.object(server, "_generate_locked", return_value=(None, final_result)) as generate_locked,
-            mock.patch.object(
-                server,
-                "_judge_turn_completion",
-                return_value=local_api_server.FollowupJudgeDecision(False, "", "done"),
-            ) as judge_mock,
-            mock.patch.object(server, "_record_generation_metrics"),
-            mock.patch.object(local_api_server, "FOLLOWUP_JUDGE_ENABLED", True),
-        ):
-            result = server.generate(
-                [{"role": "user", "content": "answer"}],
-                64,
-                tools=[{"type": "function", "function": {"name": "shell_command"}}],
-            )
-
-        self.assertIs(result, final_result)
-        self.assertEqual(generate_locked.call_count, 1)
-        judge_mock.assert_called_once()
-
-    def test_judge_turn_completion_invalid_json_returns_final_without_continuation_fallback(self):
-        server = self._make_server()
-        invalid_result = {
-            "text": "not json",
-            "finish_reason": "stop",
-            "generated_tokens": 4,
-        }
-
-        with mock.patch.object(
-            server,
-            "_generate_locked",
-            side_effect=[(None, invalid_result), (None, invalid_result)],
-        ) as generate_locked:
-            decision = server._judge_turn_completion(
-                [{"role": "user", "content": "answer"}],
-                "No tool call.",
-                [{"type": "function", "function": {"name": "shell_command"}}],
-            )
-
-        self.assertEqual(generate_locked.call_count, 2)
-        self.assertFalse(decision.should_continue)
-        self.assertEqual(decision.reason, "follow-up judge returned invalid JSON")
-        retry_messages = generate_locked.call_args_list[1].args[0]
-        self.assertEqual(
-            retry_messages[-1]["content"],
-            local_api_server.FOLLOWUP_JUDGE_RETRY_PROMPT,
-        )
 
     def test_stable_prefix_tokens_are_disabled_when_global_cache_limit_is_zero(self):
         server = self._make_server()
@@ -2743,11 +2644,6 @@ class LocalApiServerTests(unittest.TestCase):
             mock.patch.object(local_api_server, "load_draft", return_value="draft-1"),
             mock.patch.object(local_api_server, "tokenize_prompt", return_value=local_api_server.mx.array([10, 20, 30])),
             mock.patch.object(local_api_server, "stream_generate", side_effect=fake_stream_generate),
-            mock.patch.object(
-                server,
-                "_judge_turn_completion",
-                return_value=local_api_server.FollowupJudgeDecision(False, "", "done"),
-            ),
         ):
             result = server.generate(
                 messages=[{"role": "user", "content": "Continue"}],

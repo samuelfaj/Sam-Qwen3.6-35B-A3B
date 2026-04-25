@@ -32,7 +32,7 @@ Source inputs:
 - [x] P5 - Streaming robustness.
 - [x] P6 - Sampling, thinking, and agentic behavior.
 - [x] P7 - Performance and env contract.
-- [ ] P8 - Test and smoke harness. **In progress**
+- [x] P8 - Test and smoke harness. **Contract audit complete**
   - Current patch: tool-contract prompt now renders from normalized schemas with
     Jinja, and remaining semantic wrapper/schema guidance was removed. Shell
     argument sanitation only normalizes Codex contract aliases such as `cmd` to
@@ -45,6 +45,29 @@ Source inputs:
     status-only Codex tool for loop detection, so changing plan text no longer
     masks repetition of the same external tool call. This remains structural:
     tool name + arguments only, no command/domain interpretation.
+  - Current patch after third TUI loop report: repeated-observation guard now
+    detects when different external tool calls keep returning the same recent
+    output. This is still structural: exact tool-output observation repetition,
+    ignoring status-only tools, with no React/npm/build/test special cases.
+    After repeated protocol retries, the server now returns a final protocol
+    error message instead of letting Codex execute another equivalent tool
+    request forever.
+  - Latest contract audit: removed the dormant follow-up judge runtime path and
+    its tests. The server no longer has a model-judged continuation mechanism or
+    phrase-block list; continuation is driven only by Codex protocol facts
+    (tool call present, no valid tool call, malformed/incomplete tool call,
+    repeated structural tool loop, timeout).
+  - Latest contract audit: shell alias normalization is now scoped to shell
+    tools only. Non-shell tools keep their literal argument schema untouched.
+    Shell loop signatures canonicalize `cmd`/`script` aliases to `command` while
+    preserving other Codex arguments such as `workdir` and `timeout_ms`, so a
+    valid same command in another directory is not misclassified as identical.
+  - Latest contract audit: non-empty assistant text with `finish_reason=stop`
+    is now returned as a normal final message even when tools are available.
+    The server no longer forces a synthetic protocol-error tool call just
+    because the model chose not to call a tool. Retries remain only for
+    objective protocol failures such as empty output, incomplete tool markup,
+    token-limit truncation, timeout, or structural repeated tool loops.
   - Latest smoke `artifacts/codex-smoke/20260424-142736`: project scaffold,
     app source, and test files were created, but Codex entered a repeated
     explanatory loop before adding the test script or running verification.
@@ -207,12 +230,17 @@ Source inputs:
     app/test files were written and `npm test` ran, failing because Vitest did
     not have a jsdom environment (`window is not defined`). Waiting for Codex to
     edit config/package and rerun finite tests/build.
-- [ ] P9 - Rollout order and final definition of done.
+- [x] P9 - Rollout order and final definition of done.
 
 ## Current Diagnosis
 
-Qwen is not failing because it is incapable of agentic behavior. It is failing
-because the contract between model, dflash server, and Codex CLI is ambiguous.
+Latest hard rule: do not compensate for model-quality limits in server code.
+The dflash server is a Codex CLI protocol adapter, not an autonomy judge.
+When the local model returns a valid final message, dflash returns it. When the
+local model emits supported tool-call markup, dflash converts it to exact Codex
+tool-call events. When the protocol is objectively broken (malformed/truncated
+tool markup, timeout, repeated structural loop), dflash reports or retries at
+the protocol layer only.
 
 Observed failure modes:
 - Qwen writes "Let me verify..." or explanatory text instead of emitting a tool
@@ -226,23 +254,25 @@ Observed failure modes:
   events.
 - Codex can only continue reliably when it receives structured Responses events
   and matching tool result IDs.
-- The follow-up judge is a workaround and can itself produce invalid JSON or
-  bad continuation messages.
+- A follow-up judge is not part of the Codex CLI contract and has been removed
+  from the runtime path.
 
 Target state:
-- No judge on the default Codex path.
+- No judge on any Codex runtime path.
 - One canonical tool schema normalizer.
 - One canonical tool-call parser.
 - One protocol adapter per API surface: Responses, Chat Completions,
   Anthropic Messages.
 - Strict structured tool events for Codex CLI.
-- Agentic behavior driven by prompt/template/tool_choice/tool events, not by
-  semantic regexes or task-specific heuristics.
+- Agentic behavior driven by the model plus prompt/template/tool_choice/tool
+  events, not by server-side semantic regexes, phrase lists, task-specific
+  heuristics, or forced tool calls for valid final text.
 
 ## Non-Negotiable Contract
 
-1. If tools are available and work remains, the model must emit a structured
-   tool call, not prose about future work.
+1. If tools are available and work remains, the tool contract presented to the
+   model must make structured tool calls available and unambiguous. The server
+   must not guess from prose whether work remains.
 2. If the model emits any supported tool-call markup, dflash must convert it to
    the exact protocol event shape expected by the client.
 3. If a tool call is malformed or truncated, dflash must not silently clean it
@@ -253,8 +283,8 @@ Target state:
 5. Codex path should use `wire_api = "responses"` as the primary contract.
 6. Chat and Anthropic paths should still be correct, but Codex compatibility is
    the first release gate.
-7. Judge may remain only as an opt-in debug fallback. It must not be required
-   for normal Codex autonomy.
+7. Judge must not exist on the Codex runtime path. No continuation decision is
+   made by semantic text interpretation.
 
 ## P0 - Make Codex Responses Contract Exact
 

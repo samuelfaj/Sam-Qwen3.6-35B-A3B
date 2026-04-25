@@ -9,7 +9,7 @@ import importlib.util
 import json
 import logging
 import os
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
 import re
@@ -153,11 +153,8 @@ GLOBAL_PREFIX_CACHE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_GLOBAL_PREFIX_CA
 MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE_MAX_TOKENS", 8192)
 MAX_TOOL_TURN_TOKENS = _env_positive_int("LOCAL_DFLASH_MAX_TOOL_TURN_TOKENS", 4096)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 15)
+REPEATED_OBSERVATION_LIMIT = _env_positive_int("LOCAL_DFLASH_REPEATED_OBSERVATION_LIMIT", 3)
 ALLOW_APPLY_PATCH_TOOL = _env_bool("LOCAL_DFLASH_ALLOW_APPLY_PATCH_TOOL", False)
-FOLLOWUP_JUDGE_ENABLED = _env_bool("LOCAL_DFLASH_FOLLOWUP_JUDGE", False)
-RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS = _env_positive_int(
-    "LOCAL_DFLASH_FOLLOWUP_JUDGE_MAX_TOKENS", 256
-)
 PROTOCOL_TOOL_RETRY_PROMPT = (
     "[System protocol retry: the previous assistant turn was discarded because "
     "it did not contain a valid tool call. This retry accepts only one valid "
@@ -168,48 +165,10 @@ PROTOCOL_TOOL_RETRY_PROMPT = (
 PROTOCOL_REPEATED_TOOL_RETRY_PROMPT = (
     "[System protocol retry: the previous assistant turn repeated a recent "
     "tool-call pattern. This retry accepts only one valid tool call with a "
-    "different tool name or different arguments. Do not repeat the same recent "
-    "tool-call sequence.]"
+    "different tool name or different arguments, or a final answer if no new "
+    "tool call is needed. Do not repeat the same recent tool-call sequence or "
+    "the same recent tool observation.]"
 )
-FOLLOWUP_JUDGE_SYSTEM_PROMPT = (
-    "Return only compact JSON. No prose. No markdown. No reasoning. "
-    "Schema: {\"verdict\":\"continue|final\",\"continue_message\":\"string\",\"reason\":\"string\"}. "
-    "Decide whether the latest assistant response should be returned to the client or whether one more assistant turn should run. "
-    "Use only the JSON payload: conversation, latest_assistant_response, available_tools, last_tool_result. "
-    "Infer completion criteria from the user request and evidence in conversation/tool results. "
-    "Use verdict=continue only when another assistant turn is needed; continue_message must be the exact next user message. "
-    "continue_message must request an observable action or answer, not hidden reasoning or thought process. "
-    "Use verdict=final when the latest response can be returned, asks a needed question, or reports a blocker."
-)
-FOLLOWUP_JUDGE_RETRY_PROMPT = (
-    "Invalid. Return only JSON matching the schema. No prose."
-)
-FOLLOWUP_JUDGE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "judge_decision",
-        "description": "Return the turn-completion decision for the agent orchestrator.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "verdict": {
-                    "type": "string",
-                    "enum": ["continue", "final"],
-                },
-                "continue_message": {
-                    "type": "string",
-                    "description": "Exact next user message when verdict is continue; empty when final.",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Short reason for the decision.",
-                },
-            },
-            "required": ["verdict", "continue_message", "reason"],
-            "additionalProperties": False,
-        },
-    },
-}
 TOOL_CALLING_RULES_TEMPLATE = """Tool-calling rules (strict):
 - Function calls MUST use the Qwen XML format exactly:
   <tool_call><function=tool_name><parameter=param_name>value</parameter></function></tool_call>
@@ -580,22 +539,18 @@ def _normalize_tool_argument_literals(value: Any) -> Any:
 
 def _sanitize_function_call_arguments(name: str, arguments: Any) -> dict[str, Any]:
     coerced = _coerce_tool_arguments(arguments)
-    if isinstance(coerced, dict) and "command" not in coerced:
-        for alias in ("cmd", "script", "shell_command", "bash_command"):
-            if alias in coerced:
-                coerced = dict(coerced)
-                coerced["command"] = coerced[alias]
-                break
     if name in SHELL_TOOL_NAMES:
         coerced = dict(coerced)
         if "command" not in coerced:
-            for alias in ("cmd", "script"):
+            for alias in ("cmd", "script", "shell_command", "bash_command"):
                 if alias in coerced:
                     coerced["command"] = coerced[alias]
                     break
         if name == "exec":
             coerced.pop("cmd", None)
             coerced.pop("script", None)
+            coerced.pop("shell_command", None)
+            coerced.pop("bash_command", None)
         if coerced.get("sandbox_permissions") == "require_escalated":
             coerced.pop("sandbox_permissions", None)
             coerced.pop("justification", None)
@@ -1239,11 +1194,15 @@ def _tool_call_signature(name: Any, arguments: Any) -> tuple[str, str]:
     name_text = _coerce_text(name or "tool")
     normalized_arguments = _coerce_tool_arguments(arguments)
     if name_text in SHELL_TOOL_NAMES:
-        for command_key in ("cmd", "command", "script"):
-            command = normalized_arguments.get(command_key)
-            if isinstance(command, str):
-                normalized_arguments = {command_key: command}
-                break
+        normalized_arguments = dict(normalized_arguments)
+        if "command" not in normalized_arguments:
+            for command_key in ("cmd", "script", "shell_command", "bash_command"):
+                command = normalized_arguments.get(command_key)
+                if isinstance(command, str):
+                    normalized_arguments["command"] = command
+                    break
+        for command_key in ("cmd", "script", "shell_command", "bash_command"):
+            normalized_arguments.pop(command_key, None)
     return (name_text, _canonical_tool_arguments(normalized_arguments))
 
 
@@ -1320,6 +1279,69 @@ def _assistant_tool_call_signature_sequence(
     return sequence[-limit:]
 
 
+def _normalize_tool_observation(content: Any) -> str:
+    text = _extract_text_from_content(content).strip()
+    if not text:
+        return ""
+    return "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
+
+
+def _recent_external_tool_observations(
+    messages: list[dict[str, Any]],
+    *,
+    limit: int = 12,
+) -> list[str]:
+    external_call_ids: set[str] = set()
+    observations: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function_payload = tool_call.get("function")
+                if isinstance(function_payload, dict):
+                    tool_name = function_payload.get("name") or tool_call.get("name")
+                else:
+                    tool_name = tool_call.get("name")
+                if tool_name in STATUS_ONLY_TOOL_NAMES:
+                    continue
+                call_id = _coerce_text(tool_call.get("id") or tool_call.get("call_id") or tool_call.get("tool_call_id"))
+                if call_id:
+                    external_call_ids.add(call_id)
+            continue
+        if role != "tool":
+            continue
+        tool_name = message.get("name")
+        call_id = _coerce_text(message.get("tool_call_id") or message.get("call_id") or message.get("id"))
+        if tool_name in STATUS_ONLY_TOOL_NAMES:
+            continue
+        if call_id and call_id not in external_call_ids and not tool_name:
+            continue
+        observation = _normalize_tool_observation(message.get("content"))
+        if observation:
+            observations.append(observation)
+    return observations[-limit:]
+
+
+def _repeats_recent_tool_observation(
+    messages: list[dict[str, Any]],
+    output_items: list[dict[str, Any]],
+) -> bool:
+    if not _output_tool_call_signatures(output_items, include_status_tools=False):
+        return False
+    observations = _recent_external_tool_observations(messages)
+    if len(observations) < REPEATED_OBSERVATION_LIMIT:
+        return False
+    latest = observations[-1]
+    if not latest:
+        return False
+    return Counter(observations)[latest] >= REPEATED_OBSERVATION_LIMIT
+
+
 def _repeats_recent_tool_call_pattern(
     messages: list[dict[str, Any]],
     output_items: list[dict[str, Any]],
@@ -1347,7 +1369,10 @@ def _repeats_last_tool_call(
     messages: list[dict[str, Any]],
     output_items: list[dict[str, Any]],
 ) -> bool:
-    return _repeats_recent_tool_call_pattern(messages, output_items)
+    return _repeats_recent_tool_call_pattern(messages, output_items) or _repeats_recent_tool_observation(
+        messages,
+        output_items,
+    )
 
 
 def _protocol_error_tool_call_text(
@@ -1406,19 +1431,35 @@ def _protocol_error_tool_call_result(
     }
 
 
-def _force_protocol_error_tool_call_if_needed(
-    result: dict[str, Any],
-    output_items: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if not tools or _has_tool_call_item(output_items):
-        return result, output_items
-    forced = _protocol_error_tool_call_result(
-        tools,
-        "assistant returned prose or markdown instead of the required tool call; write files or run commands through tools",
-    )
-    forced.update({key: value for key, value in result.items() if key != "text"})
-    return forced, _build_output_items(forced["text"])
+def _protocol_final_message_result(reason: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    text = f"LOCAL_DFLASH_PROTOCOL_ERROR: {reason}"
+    result = {
+        "text": text,
+        "finish_reason": "stop",
+        "prompt_tokens": 0,
+        "prefill_seconds": 0.0,
+        "prompt_tps": 0.0,
+        "reused_prefix_tokens": 0,
+        "decode_seconds": 0.0,
+        "generation_tps": 0.0,
+        "generated_tokens": 0,
+        "speculative_steps": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "avg_acceptance_length": 0.0,
+        "avg_acceptance_ratio": 0.0,
+        "acceptance_lengths": [],
+        "acceptance_ratios": [],
+        "block_size_history": [],
+        "adaptive_block_size": False,
+        "prefix_cache_source": "none",
+        "peak_memory_gb": 0.0,
+        "elapsed": 0.0,
+        "prompt_cache_state": None,
+        "engine": "protocol",
+        "protocol_final_message": 1,
+    }
+    return result, [_make_message_item(text)]
 
 
 def _should_protocol_retry_without_tool(
@@ -1428,8 +1469,6 @@ def _should_protocol_retry_without_tool(
 ) -> bool:
     if not tools or _has_tool_call_item(output_items):
         return False
-    if not FOLLOWUP_JUDGE_ENABLED:
-        return True
     raw_text = _coerce_text(result.get("text", ""))
     visible_text = _output_text_from_items(output_items).strip()
     finish_reason = _coerce_text(result.get("finish_reason")).strip().lower()
@@ -1502,13 +1541,6 @@ def _last_tool_result_message(messages: list[dict[str, Any]]) -> dict[str, Any] 
         if message.get("role") == "tool":
             return message
     return None
-
-
-@dataclass
-class FollowupJudgeDecision:
-    should_continue: bool
-    continue_message: str
-    reason: str
 
 
 def _summarize_tool_names(tools: list[dict[str, Any]] | None) -> str:
@@ -3139,8 +3171,8 @@ class LocalModelServer:
         preserve_thinking = not bool(tools)
         # `preserve_thinking=True` keeps the last assistant `<think>` block on
         # non-tool Qwen3 thinking-mode templates. Tool turns intentionally drop
-        # preserved thinking so Codex reasoning summaries cannot trigger
-        # "continue thought process" loops.
+        # preserved thinking so Codex reasoning summaries do not re-enter the
+        # executable tool-call contract.
         try:
             return self._tokenizer.apply_chat_template(
                 messages,
@@ -3787,25 +3819,12 @@ class LocalModelServer:
                         {"role": "user", "content": PROTOCOL_TOOL_RETRY_PROMPT},
                     ]
                     continue
-                if FOLLOWUP_JUDGE_ENABLED:
-                    judge_decision = self._judge_turn_completion(
-                        current_messages, visible_text, tools
-                    )
-                    if judge_decision.should_continue:
-                        current_messages = [
-                            *current_messages,
-                            {"role": "assistant", "content": visible_text},
-                            {"role": "user", "content": judge_decision.continue_message},
-                        ]
-                        continue
                 text_parts.extend(iteration_parts)
                 result["text"] = "".join(text_parts)
                 break
 
             if result is None:
                 raise RuntimeError("Model returned no output")
-            final_items = _build_output_items(_coerce_text(result.get("text", "")))
-            result, _ = _force_protocol_error_tool_call_if_needed(result, final_items, tools)
             _annotate_agentic_metrics(
                 result,
                 tools=tools,
@@ -3882,17 +3901,6 @@ class LocalModelServer:
                             {"role": "user", "content": PROTOCOL_TOOL_RETRY_PROMPT},
                         ]
                         continue
-                    if FOLLOWUP_JUDGE_ENABLED:
-                        judge_decision = self._judge_turn_completion(
-                            current_messages, visible_text, tools
-                        )
-                        if judge_decision.should_continue:
-                            current_messages = [
-                                *current_messages,
-                                {"role": "assistant", "content": visible_text},
-                                {"role": "user", "content": judge_decision.continue_message},
-                            ]
-                            continue
                     break
             if result is None:
                 raise RuntimeError("Model returned no output")
@@ -3922,16 +3930,12 @@ class LocalModelServer:
         remaining_max_tokens = max(1, int(requested_max_tokens))
         protocol_no_tool_retries = 0
         protocol_malformed_tool_retries = 0
+        repeated_tool_retries = 0
 
         def finalize(
             final_result: dict[str, Any],
             final_output_items: list[dict[str, Any]],
         ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-            final_result, final_output_items = _force_protocol_error_tool_call_if_needed(
-                final_result,
-                final_output_items,
-                tools,
-            )
             _annotate_agentic_metrics(
                 final_result,
                 tools=tools,
@@ -3966,6 +3970,12 @@ class LocalModelServer:
             if _has_tool_call_item(output_items):
                 if _repeats_last_tool_call(current_messages, output_items):
                     protocol_no_tool_retries += 1
+                    repeated_tool_retries += 1
+                    if repeated_tool_retries >= 3:
+                        loop_result, loop_items = _protocol_final_message_result(
+                            "repeated tool-call loop detected; the assistant kept requesting tools after repeated equivalent observations"
+                        )
+                        return finalize(loop_result, loop_items)
                     current_messages = [
                         *current_messages,
                         {
@@ -3994,157 +4004,9 @@ class LocalModelServer:
                 current_previous_response_id = None
                 continue
 
-            if FOLLOWUP_JUDGE_ENABLED:
-                judge_decision = self._judge_turn_completion(
-                    current_messages, assistant_text, tools
-                )
-                if judge_decision.should_continue:
-                    current_messages = [
-                        *current_messages,
-                        *_messages_from_output_items(output_items),
-                        {
-                            "role": "user",
-                            "content": judge_decision.continue_message,
-                        },
-                    ]
-                    current_previous_response_id = None
-                    continue
-
             return finalize(result, output_items)
 
         return finalize(result, output_items)
-
-    def _judge_turn_completion(
-        self,
-        messages: list[dict[str, Any]],
-        assistant_text: str,
-        tools: list[dict[str, Any]] | None,
-    ) -> FollowupJudgeDecision:
-        judge_messages = self._build_followup_judge_messages(
-            messages, assistant_text, tools
-        )
-        for attempt in range(2):
-            original_engine = self.generation_engine
-            original_disable_thinking = self.disable_thinking
-            self.generation_engine = "dflash"
-            self.disable_thinking = True
-            try:
-                _, judge_result = self._generate_locked(
-                    judge_messages,
-                    RESPONSES_FOLLOWUP_JUDGE_MAX_TOKENS,
-                    SamplingParams(
-                        temperature=0.0,
-                        top_p=1.0,
-                        top_k=0,
-                        min_p=0.0,
-                        presence_penalty=0.0,
-                        repetition_penalty=0.0,
-                        frequency_penalty=0.0,
-                    ),
-                    tools=[FOLLOWUP_JUDGE_TOOL],
-                )
-            finally:
-                self.generation_engine = original_engine
-                self.disable_thinking = original_disable_thinking
-            raw = _coerce_text(judge_result.get("text", ""))
-            decision = self._parse_followup_judge_output(raw)
-            if decision is not None:
-                return decision
-            _, visible = _strip_reasoning_blocks(raw)
-            _logger.warning(
-                "follow-up judge returned invalid output on attempt %s: %r",
-                attempt + 1,
-                visible[:1000],
-            )
-            if attempt == 0:
-                judge_messages = [
-                    *self._build_followup_judge_messages(messages, assistant_text, tools),
-                    {
-                        "role": "user",
-                        "content": FOLLOWUP_JUDGE_RETRY_PROMPT,
-                    },
-                ]
-        _logger.error("follow-up judge returned invalid JSON; returning latest assistant response")
-        return FollowupJudgeDecision(False, "", "follow-up judge returned invalid JSON")
-
-    @classmethod
-    def _parse_followup_judge_output(cls, raw: str) -> FollowupJudgeDecision | None:
-        _, visible = _strip_reasoning_blocks(raw)
-        _, tool_calls = _parse_tool_calls(visible)
-        for tool_call in tool_calls:
-            if str(tool_call.get("name") or "") != "judge_decision":
-                continue
-            arguments = tool_call.get("arguments")
-            if isinstance(arguments, str):
-                try:
-                    parsed_arguments = json.loads(arguments) if arguments.strip() else {}
-                except json.JSONDecodeError:
-                    continue
-            elif isinstance(arguments, dict):
-                parsed_arguments = arguments
-            else:
-                continue
-            decision = cls._parse_followup_judge_decision(parsed_arguments)
-            if decision is not None:
-                return decision
-
-        return cls._parse_followup_judge_decision(_extract_json_object(visible))
-
-    def _build_followup_judge_messages(
-        self,
-        messages: list[dict[str, Any]],
-        assistant_text: str,
-        tools: list[dict[str, Any]] | None,
-    ) -> list[dict[str, Any]]:
-        recent_messages = messages[-12:]
-        return [
-            {"role": "system", "content": FOLLOWUP_JUDGE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "available_tools": sorted(_available_tool_names(tools)),
-                        "conversation": recent_messages,
-                        "latest_assistant_response": assistant_text,
-                        "last_tool_result": _last_tool_result_message(recent_messages),
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ]
-
-    @staticmethod
-    def _parse_followup_judge_decision(
-        parsed: dict[str, Any] | None,
-    ) -> FollowupJudgeDecision | None:
-        if not isinstance(parsed, dict):
-            return None
-        verdict = str(parsed.get("verdict") or "").strip().lower()
-        continue_message = _coerce_text(parsed.get("continue_message")).strip()
-        reason = _coerce_text(parsed.get("reason")).strip()
-        if verdict == "final":
-            return FollowupJudgeDecision(False, "", reason)
-        if (
-            verdict == "continue"
-            and continue_message
-            and LocalModelServer._is_valid_followup_continue_message(continue_message)
-        ):
-            return FollowupJudgeDecision(True, continue_message, reason)
-        return None
-
-    @staticmethod
-    def _is_valid_followup_continue_message(message: str) -> bool:
-        normalized = " ".join(message.lower().split())
-        blocked_fragments = (
-            "thought process",
-            "chain of thought",
-            "internal reasoning",
-            "hidden reasoning",
-            "continue reasoning",
-            "continue the reasoning",
-        )
-        return not any(fragment in normalized for fragment in blocked_fragments)
 
     def _responses_generation_worker(
         self,
