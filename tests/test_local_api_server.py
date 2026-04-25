@@ -999,19 +999,6 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIn("workdir", parameters["required"])
         self.assertIn("timeout_ms", parameters["required"])
 
-    def test_protocol_error_tool_call_uses_exec_command_field(self):
-        text = local_api_server._protocol_error_tool_call_text(
-            [{"type": "function", "function": {"name": "exec", "parameters": {"type": "object"}}}],
-            "timeout",
-        )
-        _, tool_calls = local_api_server._parse_tool_calls(text)
-        args = json.loads(tool_calls[0]["arguments"])
-
-        self.assertEqual(tool_calls[0]["name"], "exec")
-        self.assertIn("command", args)
-        self.assertNotIn("cmd", args)
-        self.assertIn("LOCAL_DFLASH_PROTOCOL_ERROR", args["command"])
-
     def test_shell_command_sanitizer_preserves_model_command_semantics(self):
         background = local_api_server._sanitize_function_call_arguments(
             "shell_command",
@@ -1025,8 +1012,6 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(background["command"], "npm run test 2>&1 &")
         self.assertEqual(background["timeout_ms"], 120000)
         self.assertEqual(alias["command"], "npm run dev")
-        self.assertNotIn("LOCAL_DFLASH_PROTOCOL_ERROR", background["command"])
-        self.assertNotIn("LOCAL_DFLASH_PROTOCOL_ERROR", alias["command"])
 
     def test_shell_tool_call_signature_preserves_workdir_and_canonicalizes_aliases(self):
         from_command = local_api_server._tool_call_signature(
@@ -1139,7 +1124,7 @@ class LocalApiServerTests(unittest.TestCase):
         positions = [names.index(name) for name in expected_order]
         self.assertEqual(positions, sorted(positions))
 
-    def test_stream_response_events_timeout_returns_protocol_error_tool_call(self):
+    def test_stream_response_events_timeout_returns_failed_response(self):
         server = self._make_server(FakeHangingResponsesServer)
 
         with (
@@ -1164,10 +1149,9 @@ class LocalApiServerTests(unittest.TestCase):
                 )
             )
 
-        self.assertNotIn("event: response.failed", events)
-        self.assertIn("event: response.function_call_arguments.delta", events)
-        self.assertIn("event: response.completed", events)
-        self.assertIn("LOCAL_DFLASH_PROTOCOL_ERROR", events)
+        self.assertIn("event: response.failed", events)
+        self.assertNotIn("event: response.function_call_arguments.delta", events)
+        self.assertNotIn("event: response.completed", events)
         self.assertIn("timed out before producing a protocol result", events)
 
     def test_responses_custom_apply_patch_outputs_non_empty_custom_tool_call(self):
@@ -1307,7 +1291,7 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(output_items[0]["type"], "message")
         self.assertEqual(result["protocol_no_tool_retries"], 0)
 
-    def test_tool_turn_generation_is_capped_but_total_budget_remains(self):
+    def test_tool_turn_generation_is_capped_without_forced_followup(self):
         server = self._make_server()
         tools = [{"type": "function", "function": {"name": "shell_command"}}]
         text_result = {
@@ -1315,21 +1299,13 @@ class LocalApiServerTests(unittest.TestCase):
             "finish_reason": "length",
             "generated_tokens": 256,
         }
-        tool_result = {
-            "text": '<tool_call>{"name":"shell_command","arguments":{"cmd":"pwd"}}</tool_call>',
-            "finish_reason": "stop",
-            "generated_tokens": 8,
-        }
 
         with (
             mock.patch.object(local_api_server, "MAX_TOOL_TURN_TOKENS", 256),
             mock.patch.object(
                 server,
                 "_generate_locked",
-                side_effect=[
-                    (["I will keep working."], text_result),
-                    (['<tool_call>{"name":"shell_command"}</tool_call>'], tool_result),
-                ],
+                return_value=(["I will keep working."], text_result),
             ) as generate_locked_mock,
         ):
             result, output_items = server._generate_response_locked(
@@ -1338,10 +1314,10 @@ class LocalApiServerTests(unittest.TestCase):
                 tools=tools,
             )
 
-        self.assertIs(result, tool_result)
-        self.assertEqual(output_items[0]["type"], "function_call")
+        self.assertIs(result, text_result)
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertEqual(generate_locked_mock.call_count, 1)
         self.assertEqual(generate_locked_mock.call_args_list[0].args[1], 256)
-        self.assertEqual(generate_locked_mock.call_args_list[1].args[1], 256)
 
     def test_generate_response_returns_repeated_tool_call_without_loop_guard(self):
         server = self._make_server()
@@ -1439,7 +1415,7 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertIs(result, planning_result)
         self.assertEqual(generate_locked_mock.call_count, 1)
 
-    def test_generate_response_auto_continues_after_empty_stop(self):
+    def test_generate_response_returns_empty_stop_without_forced_followup(self):
         server = self._make_server()
         tools = [
             {
@@ -1474,35 +1450,11 @@ class LocalApiServerTests(unittest.TestCase):
             "elapsed": 1.01,
             "prompt_cache_state": None,
         }
-        tool_result = {
-            "text": '<function_call>{"name":"edit","arguments":{"filePath":"src/App.jsx","oldString":"todo","newString":"done"}}</function_call>',
-            "finish_reason": "stop",
-            "prompt_tokens": 12100,
-            "prefill_seconds": 1.0,
-            "prompt_tps": 2000.0,
-            "reused_prefix_tokens": 0,
-            "decode_seconds": 0.2,
-            "generation_tps": 50.0,
-            "generated_tokens": 10,
-            "speculative_steps": 1,
-            "proposed_tokens": 10,
-            "accepted_tokens": 8,
-            "avg_acceptance_length": 8.0,
-            "avg_acceptance_ratio": 0.8,
-            "acceptance_lengths": [8],
-            "acceptance_ratios": [0.8],
-            "block_size_history": [8],
-            "adaptive_block_size": True,
-            "prefix_cache_source": "global",
-            "peak_memory_gb": 1.0,
-            "elapsed": 1.2,
-            "prompt_cache_state": None,
-        }
         with (
             mock.patch.object(
                 server,
                 "_generate_locked",
-                side_effect=[(None, empty_result), (None, tool_result)],
+                return_value=(None, empty_result),
             ) as generate_locked,
         ):
             result, output_items = server.generate_response(
@@ -1511,16 +1463,10 @@ class LocalApiServerTests(unittest.TestCase):
                 tools=tools,
             )
 
-        self.assertIs(result, tool_result)
-        self.assertEqual(output_items[0]["type"], "function_call")
-        self.assertEqual(generate_locked.call_count, 2)
-        second_messages = generate_locked.call_args_list[1].args[0]
-        self.assertEqual(len(second_messages), 2)
-        self.assertEqual(second_messages[-1]["content"], local_api_server.PROTOCOL_TOOL_RETRY_PROMPT)
-        self.assertEqual(second_messages[-1]["role"], "user")
-        self.assertEqual(result["text"], tool_result["text"])
-        self.assertEqual(output_items[0]["type"], "function_call")
-        self.assertEqual(output_items[0]["name"], "edit")
+        self.assertIs(result, empty_result)
+        self.assertEqual(output_items[0]["type"], "message")
+        self.assertEqual(generate_locked.call_count, 1)
+        self.assertEqual(result["text"], empty_result["text"])
 
     def test_stream_response_events_do_not_leak_reasoning_text(self):
         server = self._make_server(FakeReasoningResponsesServer)

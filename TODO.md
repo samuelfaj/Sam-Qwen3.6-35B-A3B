@@ -1,758 +1,993 @@
-# TODO - Qwen Local + Codex CLI Perfect Contract
+# TODO: Rapid-MLX Performance Gap Analysis for DFlash MLX
 
-Goal: make the local Qwen model and Codex CLI communicate with a precise,
-lossless agentic protocol. The model should act through structured tool calls
-when work remains, Codex should receive exactly the events it expects, and the
-server should not need a semantic judge to decide whether a task is complete.
+This document captures what Rapid-MLX appears to do for speed, what this repo
+already does, what is missing here, and the concrete implementation plan to
+close the gap.
 
-Source inputs:
-- `FUTURE-TODO.md`
-- 6 focused subagent reviews: protocol/config, tool calling, agentic behavior,
-  streaming/protocol, QA harness, performance/env.
+Scope:
 
-## Live Execution Status
+- Local repo: `/Users/samuelfajreldines/dev/dflash`
+- Local serving path: `scripts/local_api_server.py`
+- Local model path: `dflash/model_mlx.py`
+- Local DDTree path: `dflash/ddtree_engine.py`
+- External reference: <https://github.com/raullenchai/Rapid-MLX>
+- Main question: what Rapid-MLX does to be faster that this repo is not using
+  yet.
 
-- Current hard rule: do not encode workarounds for model-quality limitations.
-  Server fixes must be Codex CLI integration/contract only: schemas, tool-call
-  parsing, event shape, streaming, timeouts, env/config, and prompt rendering.
-  No semantic blocking or rewriting for dev servers, background commands,
-  missing scripts, scaffold choices, test strategy, or app implementation style.
-- [x] S0 - Consolidate plan from `FUTURE-TODO.md` and subagents.
-- [x] P0.1 - Fix Codex provider/config contract.
-- [x] P0.2 - Finish Responses tool-call event sequence.
-- [x] P0.3 - Fix `type:"custom"` / `apply_patch` path.
-- [x] P1.1 - Make tool calling mandatory through prompt/template contract.
-- [x] P1.2 - Implement protocol-level retry-on-no-tool, not semantic judge.
-- [x] P1.3 - Honor `tool_choice`.
-- [x] P2.1 - Replace per-protocol tool schema code with one normalizer.
-- [x] P2.2 - Expand request message models for agentic multi-turn.
-- [x] P2.3 - Make `_parse_tool_calls` the only parser.
-- [x] P3 - Implement Chat Completions tool calling correctly.
-- [x] P4 - Implement Anthropic Messages tool use correctly.
-- [x] P5 - Streaming robustness.
-- [x] P6 - Sampling, thinking, and agentic behavior.
-- [x] P7 - Performance and env contract.
-- [x] P8 - Test and smoke harness. **Contract audit complete**
-  - Current patch: tool-contract prompt now renders from normalized schemas with
-    Jinja, and remaining semantic wrapper/schema guidance was removed. Shell
-    argument sanitation only normalizes Codex contract aliases such as `cmd` to
-    `command`; it no longer blocks or rewrites model-chosen commands.
-  - Latest contract audit: removed the dormant follow-up judge runtime path and
-    its tests. The server no longer has a model-judged continuation mechanism or
-    phrase-block list; continuation is driven only by Codex protocol facts
-    (tool call present, no valid tool call, malformed/incomplete tool call,
-    timeout).
-  - Latest contract audit: shell alias normalization is now scoped to shell
-    tools only. Non-shell tools keep their literal argument schema untouched.
-    Shell loop signatures canonicalize `cmd`/`script` aliases to `command` while
-    preserving other Codex arguments such as `workdir` and `timeout_ms`, so a
-    valid same command in another directory is not misclassified as identical.
-  - Latest contract audit: non-empty assistant text with `finish_reason=stop`
-    is now returned as a normal final message even when tools are available.
-    The server no longer forces a synthetic protocol-error tool call just
-    because the model chose not to call a tool. Retries remain only for
-    objective protocol failures such as empty output, incomplete tool markup,
-    token-limit truncation, or timeout.
-  - Latest contract audit after TUI protocol-error report: removed repeated
-    tool-call / repeated-observation loop guards from the runtime path. These
-    guards were model-behavior heuristics, not Codex CLI contract. A valid tool
-    call now passes through to Codex even when similar calls or outputs appeared
-    earlier in the conversation.
-  - Latest smoke `artifacts/codex-smoke/20260424-142736`: project scaffold,
-    app source, and test files were created, but Codex entered a repeated
-    explanatory loop before adding the test script or running verification.
-    Applied fix: protocol retry no longer feeds failed assistant prose back into
-    the prompt; smoke validation now checks implementation across `src/**/*.ts*`
-    while still requiring non-template `App.tsx`, runnable tests, and build.
-  - Latest smoke `artifacts/codex-smoke/20260424-144827`: Codex scaffolded the
-    project, then a no-tool response consumed the full output budget after
-    "Now let me create the game logic hook". Applied fix: tool-enabled
-    generations now use a per-turn token cap while preserving the larger total
-    response budget for retries/actions.
-  - Additional hardening: protocol retries now require a tool call, retry budget
-    increased inside the same response budget, and successful tool-call turns
-    drop surrounding prose/reasoning before returning to Codex.
-  - Latest smoke `artifacts/codex-smoke/20260424-150443`: model created app and
-    tests, then hung after `npm run test` reported missing script. Root cause
-    found in server normalization: Codex Responses `reasoning` items were being
-    replayed as `<think>...</think>` and `preserve_thinking=True` was still
-    enabled on tool turns. Applied fix: tool-enabled Responses drops reasoning
-    items and passes `preserve_thinking=False`.
-  - Latest smoke `artifacts/codex-smoke/20260424-152415`: reasoning loop stayed
-    hidden after dependency install. Applied fix: reduce max tool-turn tokens to
-    2048 and increase protocol retry count to 7 so bad no-tool turns end faster
-    while total Codex output budget remains high.
-  - Latest smoke `artifacts/codex-smoke/20260424-153456`: model used `cat <<EOF`
-    for source writes. The escaped `!` display in Codex logs is shell quoting,
-    not proof of file corruption. Reverted sanitizer block because it caused a
-    dead-end; prompt now strongly prefers Python/pathlib and requires verifying
-    file contents after shell-quoted writes.
-  - Latest smoke `artifacts/codex-smoke/20260424-154957`: model wasted context
-    reading template SVG/assets. Applied fix: tool prompt requires focused
-    source/config exploration and Codex tool output limit reduced to 12000.
-  - Latest smoke `artifacts/codex-smoke/20260424-155701`: model repeated the
-    identical `vitest.config.ts` read command after receiving the same `NOT
-    FOUND` result. Applied fix: protocol detects immediate identical tool-call
-    repetition and retries internally with a "different tool call" directive.
-  - Latest smoke `artifacts/codex-smoke/20260424-160427`: after focused
-    exploration, a no-tool generation stayed silent too long. Applied fix: max
-    tool-turn tokens reduced to 1024 and protocol retry budget raised to 15 so
-    bad no-tool turns recover faster inside the same overall Codex run.
-  - Latest smoke `artifacts/codex-smoke/20260424-161258`: total token budget was
-    exhausted after scaffold/exploration and `mkdir`, before source writes.
-    Applied fix: local Codex catalog now has non-empty base instructions and
-    instruction template that explicitly require end-to-end tool work, focused
-    exploration, no identical command repeats, and finite verification.
-  - Latest smoke `artifacts/codex-smoke/20260424-161857`: model repeated the
-    same absolute-path `types.ts` write while changing only `workdir`. Applied
-    fix: repeated-tool detection compares shell command text independently from
-    `workdir`.
-  - Latest smoke `artifacts/codex-smoke/20260424-162451`: model emitted
-    replacement source as markdown/prose instead of a tool call after retries.
-    Applied fix: local server tool rules and Codex catalog now explicitly
-    prohibit markdown source/replacement output when tools are available.
-    Exhausted no-tool retries now return a protocol-error shell tool call
-    instead of a final incomplete prose response, so Codex continues the loop.
-  - Latest smoke `artifacts/codex-smoke/20260424-164104`: after writing
-    `types.ts`, tool-turn generation went silent for several minutes. Applied
-    fix: tool-turn default temperature is now 0.0 to reduce drift and loops.
-  - Latest smoke `artifacts/codex-smoke/20260424-165353`: model used Python as
-    the game runtime instead of a file-writing helper and never wrote the `.ts`
-    file. Applied fix: prompt and catalog state that Python shell helpers may
-    only create/write/maintain files, not implement the requested app/runtime.
-  - Active smoke `artifacts/codex-smoke/20260424-165942`: scaffold, install,
-    focused listing, `src/hooks` creation, and template `App.tsx` read have
-    completed, then the next model generation stayed silent for more than two
-    minutes with one active server request and no tool retry/failure metric yet.
-    Smoke was stopped manually after no progress. Failure class: stream request
-    can heartbeat indefinitely while a generation worker is silent. Applying a
-    protocol timeout so Codex gets a failed response instead of a stuck TUI.
-    Applied fix: stream result timeout now emits `generation_timeout`, `/health`
-    exposes the timeout, and DDTree generation receives the cooperative stop
-    callback so timeout/client disconnect can unwind the active generation slot.
-  - Verification after timeout fix: Python compile, shell syntax, and
-    `pytest tests/test_local_api_server.py tests/test_codex_contract.py -q`
-    pass.
-  - Restart validation exposed a process-control bug: `dflash.sh` set
-    `DFLASH_NO_CAFFEINATE=1` for background starts, but
-    `start_local_wrapper.sh` ignored it and still exec'd `caffeinate`. Applied
-    fix: wrapper now honors `DFLASH_NO_CAFFEINATE` and exports the stream result
-    timeout env.
-  - Local tool-runner note: standalone `dflash.sh start` checks in this Codex
-    session cannot prove long-lived background survival because the exec tool
-    cleans child processes when the command ends. The smoke harness remains valid
-    because it starts dflash and runs Codex inside one long-lived shell process.
-  - Profile 114 also now uses `LOCAL_DFLASH_DEFAULT_TEMPERATURE_WITH_TOOLS=0.0`,
-    matching the agentic tool-turn stability fix.
-  - Active smoke `artifacts/codex-smoke/20260424-173138`: running after timeout,
-    DDTree stop, wrapper, and profile-temperature fixes.
-  - Smoke `artifacts/codex-smoke/20260424-173138` failed: stream timeout was
-    surfaced as `response.failed`, causing Codex to reconnect 3/3 times and hang
-    without source writes. Applied fix: when tools are available, stream timeout
-    now returns a completed synthetic protocol-error tool call instead of
-    disconnecting the Responses stream.
-  - Verification after synthetic timeout tool-call fix: Python compile, shell
-    syntax, and `pytest tests/test_local_api_server.py tests/test_codex_contract.py
-    -q` pass.
-  - Active smoke `artifacts/codex-smoke/20260424-174646`: running with stream
-    timeout mapped to synthetic protocol-error tool call.
-  - Smoke `artifacts/codex-smoke/20260424-174646` exposed malformed Codex exec
-    arguments: model/server emitted shell args without required `command`, and
-    Codex logged `missing field command`. Applied fix: `exec` tool calls now
-    normalize `cmd`/`script` aliases to `command`, synthetic protocol-error tool
-    calls use `command` for Codex exec, and catalog/tool prompts state the exact
-    shell argument contract.
-    Follow-up hardening: normalized shell schemas now explicitly require the
-    command field (`command` for Codex `exec`, `cmd` for local shell tools), and
-    smoke exports `LOCAL_DFLASH_TRACE_FILE` into the artifact directory for raw
-    request/response diagnosis.
-  - Verification after shell schema hardening: Python compile, shell syntax, and
-    `pytest tests/test_local_api_server.py tests/test_codex_contract.py -q`
-    pass.
-  - Verification after `exec.command` fix: Python compile, shell syntax, and
-    `pytest tests/test_local_api_server.py tests/test_codex_contract.py -q`
-    pass.
-  - Active smoke `artifacts/codex-smoke/20260424-175825`: running with Codex
-    `exec.command` normalization.
-  - Active smoke `artifacts/codex-smoke/20260424-180619`: running with shell
-    schema hardening and trace capture.
-  - Smoke `artifacts/codex-smoke/20260424-180619` trace found exact root cause:
-    the first model call emitted `<parameter=command>`, but server sanitation for
-    `shell_command` converted it to `cmd`, and Codex requires `command`. Applied
-    fix: every shell-family tool now preserves/emits/requires `command`; only
-    `exec` strips alias fields after filling `command`.
-  - Verification after shell `command` unification: Python compile, shell syntax,
-    and `pytest tests/test_local_api_server.py tests/test_codex_contract.py -q`
-    pass.
-  - Active smoke `artifacts/codex-smoke/20260424-183316`: running with unified
-    shell `command` schema.
-  - Smoke `artifacts/codex-smoke/20260424-183316` showed Qwen needed more time
-    and output room for multi-file source writes: it installed dependencies, read
-    `App.tsx`, then timed out/repeated a small heredoc write before creating the
-    actual game/test files. Applied fix: stream result timeout increased to 600s,
-    max tool-turn tokens increased to 4096, and prompts/catalog now require
-    Python `pathlib.write_text` helpers for multi-line source writes instead of
-    shell heredocs.
-  - Verification after long tool-turn/write-helper tuning: Python compile, shell
-    syntax, and `pytest tests/test_local_api_server.py tests/test_codex_contract.py
-    -q` pass.
-  - Active smoke `artifacts/codex-smoke/20260424-185314`: running with 600s stream
-    result timeout, 4096 max tool-turn tokens, and pathlib write guidance.
-  - Smoke `artifacts/codex-smoke/20260424-185314` reached real app/test file
-    creation with pathlib, then failed on missing `test` script and drifted into
-    `npm run dev &` / background commands instead of editing `package.json`.
-    Applied fix: shell sanitizer blocks background commands and dev-server
-    verification with a protocol error; prompts/catalog now require editing
-    project config when a finite test/build script is missing.
-  - Verification after dev/background/script-missing fix: Python compile, shell
-    syntax, and `pytest tests/test_local_api_server.py tests/test_codex_contract.py
-    -q` pass.
-  - Active smoke `artifacts/codex-smoke/20260424-190724`: running with dev-server
-    and background command block.
-  - Design note from live debugging: Jinja should replace duplicated
-    hardcoded prompt fragments for the tool-contract text. The server should
-    render tool instructions from the actual normalized tool schema (for
-    example the real shell command field, required fields, custom/freeform
-    tools, and unavailable tools). Jinja does not replace the protocol adapter,
-    parser, ID preservation, stream timeout, or sanitizer; it prevents prompt
-    drift from those technical contracts.
-  - Active smoke `artifacts/codex-smoke/20260424-190724` progressed farther:
-    app/test files were written and `npm test` ran, failing because Vitest did
-    not have a jsdom environment (`window is not defined`). Waiting for Codex to
-    edit config/package and rerun finite tests/build.
-- [x] P9 - Rollout order and final definition of done.
+## Executive Summary
 
-## Current Diagnosis
+The biggest missing Rapid-MLX-style speed feature in this repo is not
+TurboQuant or speculative decoding. This repo already has those ideas in some
+form. The biggest gap is server architecture:
 
-Latest hard rule: do not compensate for model-quality limits in server code.
-The dflash server is a Codex CLI protocol adapter, not an autonomy judge.
-When the local model returns a valid final message, dflash returns it. When the
-local model emits supported tool-call markup, dflash converts it to exact Codex
-tool-call events. When the protocol is objectively broken (malformed/truncated
-tool markup or timeout), dflash reports or retries at the protocol layer only.
+1. Continuous batching.
+2. More general memory-aware/paged prompt cache.
+3. Chunked prefill with mid-prefill snapshots.
+4. Generic KV cache quantization for stored prefix entries.
+5. Tool-call logits bias and recovery to reduce agent retries.
 
-Observed failure modes:
-- Qwen writes "Let me verify..." or explanatory text instead of emitting a tool
-  call.
-- Tool-call rules are stricter in Responses than in Chat/Anthropic paths.
-- Qwen chat template and dflash tool rules disagree on canonical tool-call
-  format: XML-style `<function=...><parameter=...>` versus JSON
-  `{name, arguments}`.
-- Chat and Anthropic paths do not fully preserve or emit structured tool calls.
-- Streaming can hide `<tool_call>` markup without converting it into protocol
-  events.
-- Codex can only continue reliably when it receives structured Responses events
-  and matching tool result IDs.
-- A follow-up judge is not part of the Codex CLI contract and has been removed
-  from the runtime path.
+This repo already has:
 
-Target state:
-- No judge on any Codex runtime path.
-- One canonical tool schema normalizer.
-- One canonical tool-call parser.
-- One protocol adapter per API surface: Responses, Chat Completions,
-  Anthropic Messages.
-- Strict structured tool events for Codex CLI.
-- Agentic behavior driven by the model plus prompt/template/tool_choice/tool
-  events, not by server-side semantic regexes, phrase lists, task-specific
-  heuristics, or forced tool calls for valid final text.
+- DFlash speculative generation.
+- Experimental DDTree MLX generation.
+- TurboQuant support for compatible target cache layers.
+- Global/stable prefix cache.
+- GatedDeltaNet/GDN state capture and rollback helpers.
+- Streaming wrapper behavior and heartbeat-oriented serving.
 
-## Non-Negotiable Contract
+But the local server currently serializes generation turns one request at a
+time. That means it can be fast for one request but will waste throughput under
+concurrent agent load. Rapid-MLX uses a vLLM-like engine/scheduler on top of
+MLX BatchGenerator, so multiple active requests can share decode steps.
 
-1. If tools are available and work remains, the tool contract presented to the
-   model must make structured tool calls available and unambiguous. The server
-   must not guess from prose whether work remains.
-2. If the model emits any supported tool-call markup, dflash must convert it to
-   the exact protocol event shape expected by the client.
-3. If a tool call is malformed or truncated, dflash must not silently clean it
-   into normal prose. It must mark the generation incomplete/truncated or
-   reprompt via a protocol-level retry.
-4. Tool result IDs must round-trip exactly: `call_id`, `tool_call_id`, `id`,
-   `name`, `is_error`, and raw content must be preserved.
-5. Codex path should use `wire_api = "responses"` as the primary contract.
-6. Chat and Anthropic paths should still be correct, but Codex compatibility is
-   the first release gate.
-7. Judge must not exist on the Codex runtime path. No continuation decision is
-   made by semantic text interpretation.
+Highest-value roadmap:
 
-## P0 - Make Codex Responses Contract Exact
+1. Add continuous batching for the non-DDTree path.
+2. Add chunked prefill and mid-prefill cache snapshots.
+3. Replace/augment current global prefix cache with memory-aware exact/partial
+   prefix matching.
+4. Add optional paged cache/COW after cache semantics are proven.
+5. Add tool logits bias/recovery as an agent-workflow accelerator.
 
-### P0.1 Fix Codex provider/config contract
+## Current Local State
 
-Files:
-- `scripts/run_codex_local.sh`
-- generated `/tmp/codex-local-dflash/config.toml`
-- generated `/tmp/codex-local-dflash/catalog.json`
+### Local DFlash Generation
 
-Tasks:
-- Keep Codex on `wire_api = "responses"` and treat Responses as the canonical
-  Codex protocol.
-- Add tests that generated config contains:
-  - `model_provider = "localdflash"`
-  - `wire_api = "responses"`
-  - `approval_policy = "never"`
-  - `sandbox_mode = "danger-full-access"`
-  - expected model name and base URL.
-- Align catalog `default_reasoning_level`, config `model_reasoning_effort`, and
-  profile `model_reasoning_effort`. Pick one policy and remove contradictions.
-- Align Codex advertised context and server context:
-  - Codex currently advertises `65536`.
-  - server profile defaults to `32768`.
-  - choose one contract, then update `run_codex_local.sh`,
-    `start_local_wrapper.sh`, and `dflash.sh`.
-- Align `truncation_policy.limit` with actual context and auto-compact limit.
-- Decide canonical config source:
-  - generated template in `run_codex_local.sh`, or
-  - committed sample/template file.
-  Avoid humans inspecting stale/empty config.
+Main file:
 
-Definition of done:
-- `dflash codex --version` does not start server.
-- `dflash start` starts server with env matching generated Codex config.
-- Config generation test passes.
+- `dflash/model_mlx.py`
 
-### P0.2 Finish Responses tool-call event sequence
+Relevant symbols:
 
-Files:
-- `scripts/local_api_server.py`
-- functions around `stream_response_events`, `_stream_response_events_body`,
-  `_build_output_items`, `_convert_items_for_custom_tools`,
-  `_normalize_responses_input`, `resolve_responses_context`
+- `stream_generate(...)`
+  - Single-request generation loop.
+  - Calls `prefill_prompt(...)`.
+  - Uses DFlash draft model to propose tokens.
+  - Verifies proposals through target model.
+  - Computes accepted token prefix.
+  - Trims or rolls back target cache after acceptance.
+  - Supports adaptive block size.
+  - Yields metrics with accepted/proposed token counts.
 
-Tasks:
-- Validate exact Codex event order for function calls:
-  - `response.created`
-  - `response.output_item.added`
-  - `response.function_call_arguments.delta`
-  - `response.function_call_arguments.done`
-  - `response.output_item.done`
-  - `response.completed`
-- Validate exact Codex event order for custom tools:
-  - `response.output_item.added`
-  - `response.custom_tool_call_input.delta`
-  - `response.custom_tool_call_input.done`
-  - `response.output_item.done`
-  - `response.completed`
-- Ensure `finish_reason` / status maps to Codex expectations.
-- Preserve `previous_response_id` and every tool result item across turns.
-- Preserve `call_id` 1:1 between model output and tool result input.
-- Never emit empty custom tool input for `apply_patch`.
+- `prefill_prompt(...)`
+  - Builds/reuses target cache.
+  - If prefix cache state matches, prefill only suffix.
+  - If no reusable prefix, runs target model over full prompt.
+  - Does not implement scheduler-level chunked prefill.
+  - Does not save mid-prefill snapshots.
 
-Definition of done:
-- Golden stream tests compare event type order exactly.
-- Codex receives tool calls without deserialization errors.
+- `PromptPrefillState`
+  - Stores prompt tokens, target cache, hidden states, logits, and memory stats.
+  - Used for prefix reuse.
 
-### P0.3 Fix `type:"custom"` / `apply_patch` path
+- `derive_prefill_prefix_state(...)`
+  - Trims a prefill state down to a prefix.
+  - Useful for prefix cache reuse.
 
-Files:
-- `scripts/local_api_server.py`
-- `scripts/run_codex_local.sh`
+- `_match_reusable_prefix(...)`
+  - Matches cached prefix tokens against current prompt tokens.
 
-Tasks:
-- Decide whether `LOCAL_DFLASH_CODEX_INCLUDE_APPLY_PATCH_TOOL` should default
-  to true for maximum Codex autonomy.
-- If true, fully support Codex custom/freeform apply_patch:
-  - convert function-style model output into `custom_tool_call`;
-  - preserve raw patch text as `input`;
-  - do not JSON-wrap freeform patches unless Codex expects it;
-  - stream custom input deltas and done events correctly.
-- If false, document why shell-based editing is the expected path and test that
-  shell editing remains sufficient.
+- `AdaptiveBlockSizeConfig`
+  - Grows/shrinks speculative block size based on acceptance ratio.
 
-Definition of done:
-- Test: model output for apply_patch becomes non-empty `custom_tool_call.input`.
-- Test: stream emits custom tool call input delta/done.
-- Real smoke does not fail on invalid apply_patch payload.
+### Local DDTree Generation
 
-## P1 - Remove Judge From Default Agentic Loop
+Main file:
 
-### P1.1 Make tool calling mandatory through prompt/template contract
+- `dflash/ddtree_engine.py`
 
-Files:
-- `scripts/local_api_server.py`
-- Qwen chat template at
-  `/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit/chat_template.jinja`
+Relevant behavior:
 
-Tasks:
-- Define one canonical tool-call format for model prompting.
-- Align `TOOL_CALLING_RULES_PROMPT` with Qwen template.
-- Parser may accept multiple formats, but prompt should ask for one.
-- Inject the tool contract into all relevant paths:
-  - Responses
-  - Chat Completions
-  - Anthropic Messages
-- Add strong protocol rule:
-  - if task is not complete and a tool exists, next assistant output must be a
-    tool call only;
-  - no prose before or after tool call;
-  - no "I will..." action narration.
-- Insert the agentic contract before `apply_chat_template` in `build_prompt`,
-  so it survives client prompt variation.
-
-Definition of done:
-- Unit test shows tool rules are present in prompt for Responses, Chat, and
-  Anthropic when tools exist.
-- Golden prompt fixture matches Qwen template expected format.
-
-### P1.2 Implement protocol-level retry-on-no-tool, not semantic judge
-
-Files:
-- `scripts/local_api_server.py`
-- generation loops around `generate`, `_generate_response_locked`,
-  `_generation_worker`
-
-Tasks:
-- Remove default judge dependency from Codex Responses path.
-- Add a small protocol retry loop only when:
-  - tools are present;
-  - output has no visible final answer and no complete tool call;
-  - output is empty/action-only/truncated/malformed tool call.
-- Retry message must be protocol-level, not task-specific:
-  - "Emit the next required tool call using the declared tool-call format, or
-    return a final answer only if the task is complete."
-- Keep this opt-in/configurable for Chat/Anthropic while Responses is hardened.
-- Keep existing judge only behind an env flag for debugging.
-
-Definition of done:
-- Tests prove default Codex path does not call `_judge_turn_completion`.
-- Tests prove empty/action-only output with tools triggers protocol retry.
-- No task words like npm, Vite, build, test, scaffold appear in retry logic.
-
-### P1.3 Honor `tool_choice`
-
-Files:
-- `scripts/local_api_server.py`
-- request models for OpenAI Chat, Responses, Anthropic
-
-Tasks:
-- Parse and preserve `tool_choice`.
-- Support:
-  - `none`
-  - `auto`
-  - `required` / `any`
-  - specific tool name
-- If tool_choice requires a tool, do not accept final prose without tool call.
-- Implement prompt enforcement first; add decode/prefill enforcement later if
+- Builds a tree from draft logits.
+- Verifies candidate tree against target model.
+- Commits accepted path through tree-aware cache commit when possible.
+- Falls back to slow snapshot/rollback commit when tree-aware commit is not
   available.
+- Tracks acceptance ratio, tree node count, emitted tokens, cache strategy, and
+  prompt prefix reuse.
 
-Definition of done:
-- Tests for `tool_choice=none`, `auto`, `required`, and named tool.
+This is already a meaningful speculative algorithm. It is not the Rapid-MLX
+continuous batching architecture.
 
-## P2 - Make Tool Schema Normalization Single-Source
+### Local Serving Path
 
-### P2.1 Replace per-protocol tool schema code with one normalizer
+Main file:
 
-Files:
-- `scripts/local_api_server.py`
-- existing `_normalize_anthropic_tools`
-- existing Responses/OpenAI tool handling
-
-Tasks:
-- Create `_normalize_tool_schemas()`.
-- Accept:
-  - OpenAI nested `{"type":"function","function":{...}}`
-  - Anthropic flat `{name,input_schema}`
-  - Responses flat/function/custom tools
-  - Codex `custom` tools
-- Normalize before `_filter_disabled_tools()`.
-- Preserve enough original metadata to emit the correct protocol output.
-
-Definition of done:
-- Tests for OpenAI, Anthropic, Responses, and custom tool schemas.
-
-### P2.2 Expand request message models for agentic multi-turn
-
-Files:
-- `scripts/local_api_server.py`
-- `OpenAIMessage`
-- Anthropic message normalization
-- Responses input normalization
-
-Tasks:
-- `OpenAIMessage` must accept:
-  - `content: null`
-  - `content` as list
-  - `tool_calls`
-  - `tool_call_id`
-  - `name`
-  - `function_call`
-  - `role: developer`
-- Chat handler should use `_normalize_openai_messages()` instead of raw
-  `model_dump()` where appropriate.
-- Anthropic and Chat should synthesize orphan tool results like Responses does.
-- Preserve raw tool output and `is_error`.
-
-Definition of done:
-- Multi-turn transcript with assistant tool_call + tool result normalizes
-  without 422 and without losing IDs.
-
-### P2.3 Make `_parse_tool_calls` the only parser
-
-Files:
-- `scripts/local_api_server.py`
-- `_parse_tool_calls`
-- `_tool_call_items_from_payload`
-- `_coerce_tool_arguments`
-
-Tasks:
-- Support and test:
-  - Qwen XML `<tool_call><function=...><parameter=...>`
-  - JSON body inside `<tool_call>`
-  - Hermes-style JSON
-  - fenced tool call blocks
-  - multiple calls
-  - custom/freeform input
-  - malformed and truncated calls
-- Return structured parse state:
-  - visible text
-  - complete tool calls
-  - incomplete/truncated marker
-- Never silently discard a partial tool call and return clean prose.
-
-Definition of done:
-- Parser tests cover every accepted format and every malformed case.
-
-## P3 - Implement Chat Completions Tool Calling Correctly
-
-Files:
-- `scripts/local_api_server.py`
-- `chat_completions`
-- `stream_chat_completions`
-
-Tasks:
-- Pass `tools` to `build_prompt` in both non-stream and stream.
-- Non-stream:
-  - call `_parse_tool_calls()`;
-  - fill `message.tool_calls`;
-  - set `message.content = null` when only tool calls exist;
-  - set `finish_reason = "tool_calls"`.
-- Stream:
-  - replace `_IncrementalVisibleTextStream` with an incremental parser that
-    can emit `delta.tool_calls[]`;
-  - do not leak tool markup as text;
-  - do not hide tool markup without converting it to tool-call deltas;
-  - end with `finish_reason = "tool_calls"`.
-- Support `stream_options.include_usage`.
-
-Definition of done:
-- Golden Chat non-stream fixture matches OpenAI tool-call response shape.
-- Golden Chat stream fixture matches OpenAI `delta.tool_calls` shape.
-
-## P4 - Implement Anthropic Messages Tool Use Correctly
-
-Files:
-- `scripts/local_api_server.py`
-- `anthropic_messages`
-- `stream_anthropic_events`
-- `_build_anthropic_content_blocks`
-
-Tasks:
-- Support `tool_use` content blocks in non-stream.
-- Support streaming `tool_use`:
-  - `content_block_start` with `type:"tool_use"`
-  - `input_json_delta`
-  - `content_block_stop`
-  - `message_delta` with `stop_reason:"tool_use"`
-- Use `toolu_` prefix for Anthropic tool IDs.
-- Implement chunked `input_json_delta`.
-- Preserve `tool_result` blocks and IDs.
-- Remove extra `raw_text`/`metrics` fields in strict mode.
-
-Definition of done:
-- Claude-compatible stream fixture passes.
-
-## P5 - Streaming Robustness
-
-Files:
-- `scripts/local_api_server.py`
-- `_IncrementalVisibleTextStream`
-- `_IncrementalVisibleTextExtractor`
-- stream workers and queue helpers
-
-Tasks:
-- Replace text-only hidden-marker filter with an incremental mode parser:
-  - mode `text`
-  - mode `thinking`
-  - mode `tool_call`
-  - mode `partial_marker`
-- Buffer partial markers until mode is known.
-- Do not emit candidate text before protocol decision when auto-followup/retry
-  may happen.
-- Heartbeats should be based on wall-clock time, not parser churn.
-- Worker cleanup:
-  - always send terminal `done`;
-  - propagate errors in protocol-valid shape;
-  - review `stop_event` and `worker.join(timeout=30)`.
-- If worker dies before result, client must receive valid error event and
-  `[DONE]`.
-
-Definition of done:
-- Tests for partial markers split across chunks.
-- Tests for worker error and disconnect cleanup.
-- No TUI hangs on malformed stream.
-
-## P6 - Sampling, Thinking, and Agentic Behavior
-
-Files:
-- `scripts/local_api_server.py`
-- `SamplingParams.for_request`
-- `build_prompt`
-- `scripts/start_local_wrapper.sh`
-- `scripts/run_codex_local.sh`
-
-Tasks:
-- For tool turns, use lower temperature by default:
-  - target range `0.0` to `0.2`.
-- Decide thinking policy:
-  - for tool turns, prefer thinking off or hidden;
-  - final user-visible output must never expose thinking;
-  - when unfinished, first visible output should be tool markup.
-- Keep reasoning settings consistent across:
-  - model catalog
-  - Codex config
-  - profile
-  - server env
-- Add metrics for:
-  - no-tool retries;
-  - malformed tool-call retries;
-  - final-with-tools cases;
-  - tool-call parse format used.
-
-Definition of done:
-- No visible chain-of-thought or "continue thought process" in TUI.
-- Tool-call rate improves in smoke loop.
-
-## P7 - Performance and Env Contract
-
-Files:
-- `scripts/dflash.sh`
-- `scripts/start_local_wrapper.sh`
-- `scripts/run_codex_local.sh`
 - `scripts/local_api_server.py`
 
-Tasks:
-- Keep `restart-114` as performance model, but make `start` and `restart`
-  equivalent unless explicit args override.
-- Print or expose effective env in `status` or `metrics`:
-  - model path
-  - draft path
-  - engine
-  - context
+Relevant behavior:
+
+- `LocalModelServer` owns model/draft loading and generation settings.
+- `_acquire_generation_turn(...)` serializes generation turns through a ticket
+  system and `Condition`.
+- Prefix cache fields exist:
+  - response prefix states
+  - global prefix states
+  - stable prefix token cache
+  - byte limits
+  - hit/miss counters
+  - pruning helpers
+- `_select_prefix_state_locked(...)` selects reusable prefix state.
+- `_remember_global_prefix_state_locked(...)` stores prefix state after
+  generation.
+- The server has many compatibility shims for OpenAI/Anthropic-style APIs,
+  tool parsing, event streaming, metrics, keep-alive, and memory settings.
+
+Key limitation:
+
+- Requests are protected by server-level generation turn control. This avoids
+  cache corruption and simplifies streaming, but it prevents throughput gains
+  from multi-request decode batching.
+
+## Rapid-MLX Speed Features
+
+Rapid-MLX claims/implements the following relevant speed mechanisms:
+
+- Continuous batching through `EngineCore` and `Scheduler`.
+- Use of `mlx_lm.generate.BatchGenerator`.
+- Prefix cache across requests.
+- Trie/LRU prefix cache with exact, shorter-prefix, and longer-prefix trimming.
+- Memory-aware prefix cache with memory-based eviction.
+- Paged cache with fixed token blocks, ref counts, COW, hash lookup, and
+  pinning.
+- Chunked prefill to prevent long prompt prefill from starving active decode.
+- Mid-prefill cache save so interrupted or repeated long prompts can reuse
+  partially computed cache.
+- DeltaNet/GatedDeltaNet state snapshots for hybrid RNN+attention models.
+- TurboQuant V-cache compression.
+- Generic KV cache quantization for prefix cache memory reduction.
+- Tool logits bias for structured tool-call tokens.
+- Tool-call recovery/parsers to convert broken text output back into structured
+  tool calls.
+- Optional cloud routing for requests where local prefill would be too slow.
+
+Important: not all of these are equally relevant to this repo. The local fork is
+focused on Qwen3.6/DFlash local serving, not a generic multimodal/cloud engine.
+
+## Gap Matrix
+
+| Area | Rapid-MLX | Local repo | Gap |
+| --- | --- | --- | --- |
+| Continuous batching | EngineCore + Scheduler + BatchGenerator | Server serializes generation turns | Major |
+| Decode throughput under concurrency | Multiple requests advance together | One active generation turn | Major |
+| Prompt cache lookup | Exact/shorter/longer match, trie/LRU | Custom global/stable prefix cache | Medium |
+| Memory-aware prefix cache | Memory limit, LRU eviction by bytes | Byte limits exist, custom state cache | Medium |
+| Paged cache | Block refcount/COW/hash/pinning | Not present | Medium/high |
+| Chunked prefill | Scheduler monkeypatch chunks large prefills | Prefix/suffix reuse only | Major for long prompts |
+| Mid-prefill snapshots | Saves cache during long prefill | Not present | Major for interrupted/repeated long prompts |
+| TurboQuant | Present | Present | No gap |
+| Generic KV quantization | Present for prefix cache | Not present | Medium |
+| GDN/DeltaNet snapshots | Present | GDN patch/rollback present | Partial gap: integration maturity |
+| Tool logits bias | Present | Not clearly present | Medium for agent reliability |
+| Tool recovery/parsers | Broad parser suite | Local parser stack exists, less broad | Medium |
+| MTP | Optional if model supports MTP head | Not present | Low/unknown |
+| Cloud routing | Present | Not present | Low/non-goal unless desired |
+
+## Priority 1: Continuous Batching
+
+### Problem
+
+Local serving currently serializes generation. This is simple and safe, but it
+throws away the core throughput advantage of batching active decode requests.
+
+Rapid-MLX uses a scheduler model:
+
+- waiting queue
+- running request set
+- request IDs mapped to BatchGenerator UIDs
+- one engine loop
+- scheduler step advances active requests
+- outputs are routed to per-request collectors
+
+This is the biggest likely source of speed difference under real agent traffic.
+
+### Current Local Evidence
+
+Local server:
+
+- `scripts/local_api_server.py`
+  - `LocalModelServer`
+  - `_acquire_generation_turn(...)`
+  - `_generation_turn`
+  - `_lock`
+
+Local generation:
+
+- `dflash/model_mlx.py`
+  - `stream_generate(...)` handles one prompt/request at a time.
+
+### Target Design
+
+Add a new batched generation engine that can run beside the current path.
+
+Possible module layout:
+
+- `dflash_mlx/batch_engine.py`
+- `dflash_mlx/scheduler.py`
+- `dflash_mlx/request.py`
+- `dflash_mlx/output.py`
+
+Initial goal:
+
+- Batch only the target model non-DDTree path.
+- Keep existing DFlash/DDTree path as default until batched path is proven.
+- Gate behind CLI/env:
+  - `--engine serial|batched`
+  - `LOCAL_DFLASH_ENGINE=serial|batched`
+
+Do not start by batching DDTree. DDTree has more complex cache commit semantics.
+Batching regular MLX generation first gives useful throughput learning with less
+risk.
+
+### Implementation Steps
+
+- [ ] Define `BatchedRequest`.
+  - request ID
+  - prompt token IDs
+  - sampling params
   - max tokens
-  - keepalive
-  - ddtree tree budget
-  - turboquant target
-  - adaptive block state
-  - cache hit/miss
-- Add profile `codex-agentic` if needed:
-  - explicit thinking policy
-  - coherent max tokens
-  - coherent context reserve
-  - longer keepalive for long TUI sessions.
-- Health should be green only after:
-  - model loaded;
-  - draft loaded;
-  - tokenizer loaded;
-  - one short warmup prompt succeeds.
-- Clamp `max_tokens` before generation and return HTTP 400 for invalid request
-  instead of hanging or OOM.
+  - stop tokens/sequences
+  - stream flag
+  - prefix boundary
+  - creation time
+  - output state
 
-Definition of done:
-- `bash scripts/dflash.sh start`, `restart`, and `restart-114` show same
-  effective performance profile.
-- `/health` and `/metrics` prove model is actually ready.
+- [ ] Define `BatchedOutput`.
+  - request ID
+  - token ID
+  - text delta
+  - finish reason
+  - usage counters
+  - cache metrics
 
-## P8 - Test and Smoke Harness
+- [ ] Create scheduler queues.
+  - waiting queue
+  - running dict
+  - finished set
+  - request ID to backend UID map
 
-Files:
-- `tests/test_local_api_server.py`
-- new `tests/test_codex_contract.py`
-- new `scripts/smoke_codex_snake.sh`
+- [ ] Use `mlx_lm.generate.BatchGenerator` where possible.
+  - This gives MLX-native batching semantics.
+  - It may not directly support DFlash draft verification.
+  - First milestone can batch target-model decode only.
 
-Unit tests:
-- generated Codex config contract.
-- Responses function call event order.
-- Responses custom tool call event order.
-- `apply_patch` custom tool input non-empty.
-- tool result ID round-trip.
-- no judge called by default on Codex Responses path.
-- protocol retry on empty/action-only/truncated tool output.
-- parser cases: XML, JSON, fenced, multi-call, malformed, truncated.
-- Chat non-stream `message.tool_calls`.
-- Chat stream `delta.tool_calls`.
-- Anthropic non-stream `tool_use`.
-- Anthropic stream `tool_use`.
-- `OpenAIMessage` accepts `content:null`, list content, tool fields.
-- `tool_choice` enforcement.
-- max_tokens clamp / HTTP 400.
+- [ ] Add per-request output collectors.
+  - Streaming endpoint needs low-latency per-request deltas.
+  - Non-stream endpoint can aggregate collector output until finish.
 
-Smoke script:
-- Create `scripts/smoke_codex_snake.sh`.
-- Use temp target dir.
-- Run:
-  - `bash scripts/dflash.sh start`
-  - `bash scripts/dflash.sh codex exec --cd <temp> "create the famous snake game. Use react, vite and typescript. Create tests to make sure it work."`
-- No watchdog.
-- Timeout high enough for real local model, e.g. 45 minutes.
-- Save artifacts:
-  - Codex stdout/stderr
-  - dflash log slice
-  - generated project tree
-  - package.json
-  - test/build output
-  - server metrics snapshot
+- [ ] Move server generation calls through engine abstraction.
+  - `SerialEngine`: existing behavior.
+  - `BatchedEngine`: new scheduler behavior.
 
-Smoke success criteria:
-- generated app exists.
-- React, Vite, TypeScript present.
-- Snake game has:
-  - snake state
-  - food
-  - collision
-  - score
-  - keyboard controls
-  - restart
-  - tests
-- `npm install` passes.
-- tests pass.
-- `npm run build` passes.
-- logs contain tool-call events and tool outputs.
-- logs do not contain:
-  - judge on default path
-  - watchdog
-  - repeated "thought process"
-  - repeated explanatory loop
-  - stream disconnected before completion.
+- [ ] Preserve current API compatibility.
+  - OpenAI chat completions.
+  - Anthropic messages.
+  - Responses API events.
+  - Streaming heartbeat behavior.
+  - Tool call normalization.
 
-Soak:
-- Run Snake smoke 5 times sequentially.
-- Server remains healthy.
-- Zero hangs.
-- Zero idle-timeout retries.
-- Tool-call success rate and malformed-call count recorded.
+- [ ] Add graceful abort.
+  - Client disconnect aborts request.
+  - Finished/aborted request releases cache/output collector state.
 
-## P9 - Rollout Order
+- [ ] Add memory pressure control.
+  - Periodically check MLX active memory.
+  - Clear MLX cache after completed requests or threshold breach.
 
-1. Lock Codex Responses config and add generated-config tests.
-2. Finish Responses function/custom tool event correctness.
-3. Normalize tool schemas and request messages.
-4. Align Qwen tool prompt with Qwen chat template.
-5. Disable judge by default for Codex path.
-6. Add protocol-level retry-on-no-tool.
-7. Implement Chat tool calling.
-8. Implement Anthropic tool use.
-9. Replace streaming text filter with incremental protocol parser.
-10. Add smoke/soak harness and run Snake loop.
+### Hard Parts
 
-## Definition of Done for the Whole Project
+- Different requests may use different sampling params.
+  - Option A: batch only requests with compatible sampler params.
+  - Option B: recreate BatchGenerator per sampler group.
+  - Option C: implement per-request samplers if backend supports it.
 
-The project is done when:
-- `bash scripts/dflash.sh start` starts the local server.
-- `bash scripts/dflash.sh codex` only opens Codex CLI and does not start server.
-- Codex TUI can complete multi-step coding tasks without watchdog.
-- Codex exec can create the Snake React/Vite/TypeScript app from scratch.
-- The default path does not require follow-up judge.
-- All tool calls and tool results round-trip structurally.
-- Streams never leak hidden reasoning or raw tool markup.
-- All unit tests pass.
-- Snake smoke passes 5 times in a row.
+- Tool-call constrained decoding may require per-request logits processors.
+
+- Prefix cache must be immutable or copied per request.
+
+- Streaming must not block scheduler progress.
+
+- Existing `RLock` and generation turn must be bypassed only for batched engine.
+
+### Acceptance Criteria
+
+- [ ] With one request, output parity with serial path for deterministic
+  temperature `0`.
+- [ ] With two concurrent requests, both make progress without waiting for the
+  other to finish.
+- [ ] p50/p95 latency does not regress badly for one request.
+- [ ] Aggregate tokens/sec improves under concurrency.
+- [ ] Streaming emits deltas for each request independently.
+- [ ] Client disconnect aborts only that request.
+- [ ] No cache corruption across 100 concurrent smoke tests.
+
+### Benchmarks
+
+Measure:
+
+- TTFT cold.
+- TTFT cached.
+- Decode tokens/sec single request.
+- Aggregate tokens/sec for 2, 4, 8 concurrent requests.
+- p50/p95 time-to-first-token.
+- p50/p95 full response latency.
+- active memory peak.
+- cache hit rate.
+- failed requests / cache corruption.
+
+Suggested benchmark scenarios:
+
+- short prompt, 128 output tokens
+- long prompt, 128 output tokens
+- multi-turn agent prompt with mostly stable prefix
+- concurrent Codex-like tool prompt workload
+
+## Priority 2: Chunked Prefill
+
+### Problem
+
+Long prefill can block the engine. In serial mode this just means one slow
+request. In batched mode it also means active decode requests can starve while a
+new large prompt is being processed.
+
+Rapid-MLX patches/uses BatchGenerator so large prompt prefills are split into
+chunks. Between chunks, generation requests can continue.
+
+### Current Local Behavior
+
+`prefill_prompt(...)` reuses prefix state if present. If no prefix state exists,
+or if there is a suffix after the cached prefix, it calls the model on that
+full remaining sequence.
+
+That is prefix/suffix reuse, not chunked prefill scheduling.
+
+### Target Design
+
+Add chunked prefill with explicit budget.
+
+New config:
+
+- `--prefill-step-size`
+- `LOCAL_DFLASH_PREFILL_STEP_SIZE`
+- default candidate: `2048`
+
+For serial engine:
+
+- Chunking can still help heartbeat responsiveness and memory pressure.
+
+For batched engine:
+
+- Chunking is required so decode steps can interleave with long prompt prefill.
+
+### Implementation Steps
+
+- [ ] Add config to server CLI/env.
+- [ ] Implement chunked prefill helper.
+  - input token range
+  - existing cache
+  - start offset
+  - step size
+  - callback after each chunk
+
+- [ ] Call target model chunk by chunk.
+  - ensure contiguous token arrays
+  - call `mx.eval(...)` or `mx.async_eval(...)` at safe points
+  - update cache
+  - capture hidden state if DFlash needs it
+
+- [ ] Keep hidden-state semantics correct.
+  - DFlash draft model needs target hidden states.
+  - If hidden states are captured via hooks, chunking must concatenate hidden
+    chunks in order.
+
+- [ ] Emit heartbeat between chunks.
+  - Streaming clients should not time out during huge prompts.
+
+- [ ] Add abort checks between chunks.
+  - If client disconnects, stop prefill and release temporary state.
+
+### Acceptance Criteria
+
+- [ ] Chunked and unchunked prefill produce same next-token logits for a fixed
+  prompt within acceptable numeric tolerance.
+- [ ] Long prompt streaming emits heartbeat while prefill is running.
+- [ ] Abort during prefill does not leak cache state.
+- [ ] Memory peak is not worse than unchunked prefill.
+- [ ] Batched engine can keep decode requests moving during another request's
+  large prefill.
+
+## Priority 3: Mid-Prefill Cache Snapshots
+
+### Problem
+
+Agent workflows often repeat a huge stable prefix and only change the final user
+message. If the first long request disconnects or times out mid-prefill, current
+work may be lost.
+
+Rapid-MLX stores intermediate prompt cache snapshots during chunked prefill.
+Later requests can reuse the already-prefilled prefix.
+
+### Current Local Behavior
+
+Local server stores prefix states after generation/prefill reaches stable
+points. It does not appear to save intermediate cache state during a large
+prefill loop, because no chunked prefill loop exists yet.
+
+### Target Design
+
+Save prefix cache snapshots while processing long prompts.
+
+New config:
+
+- `--mid-prefill-save-interval`
+- `LOCAL_DFLASH_MID_PREFILL_SAVE_INTERVAL`
+- default candidate: `8192`
+- `0` disables
+
+Save at:
+
+- every configured interval
+- known stable prefix boundary
+- after tool/schema/system section if detected
+- before final user suffix when safe
+
+### Implementation Steps
+
+- [ ] Add prompt boundary tracking.
+  - stable system prompt boundary
+  - tools schema boundary
+  - previous conversation boundary
+  - final user message boundary
+
+- [ ] Extract cache snapshots safely.
+  - Deep copy mutable cache metadata.
+  - Avoid storing cache objects that will be mutated by active generation.
+
+- [ ] Store snapshots keyed by token tuple and model/cache config.
+  - model ID
+  - target TurboQuant bits
+  - tokenizer identity/version
+  - prompt token tuple or block hash chain
+
+- [ ] Replace older intermediate snapshot for same request if it is only a
+  shorter prefix and memory pressure is high.
+
+- [ ] Expose metrics.
+  - mid-prefill snapshots saved
+  - mid-prefill cache bytes
+  - mid-prefill hit count
+  - tokens saved
+
+### Risks
+
+- GDN/DeltaNet layers may not be trivially trimmable.
+- Hidden state snapshots can be large.
+- Storing too many snapshots can increase memory pressure and hurt performance.
+- Snapshotting may force MLX evaluation and spike memory if done carelessly.
+
+### Acceptance Criteria
+
+- [ ] Long prefill interrupted at N tokens leaves a reusable prefix snapshot.
+- [ ] Next request with same prefix skips those N tokens.
+- [ ] Snapshot memory is counted and evicted under byte limits.
+- [ ] No corrupted output after 50 repeated interrupted-prefill tests.
+
+## Priority 4: Memory-Aware Prefix Cache
+
+### Problem
+
+The local global prefix cache is useful but custom and less general than
+Rapid-MLX's memory-aware prefix cache. It should become more explicit,
+measurable, and robust.
+
+Rapid-style cache supports:
+
+- exact prompt hit
+- shorter cached prefix hit
+- longer cached prefix trim
+- memory-based eviction
+- immutable/deep-copied fetch semantics
+- hit/miss/tokens-saved stats
+
+### Current Local Behavior
+
+Local server already has:
+
+- `_global_prefix_states`
+- `_global_prefix_order`
+- `_global_prefix_cache_bytes`
+- `_global_prefix_cache_hits`
+- `_global_prefix_cache_misses`
+- `_stable_prefix_tokens_by_key`
+- pruning helpers
+
+This should be preserved but made more general and testable.
+
+### Target Design
+
+Create a real prefix cache module instead of keeping all logic inside
+`scripts/local_api_server.py`.
+
+Possible module:
+
+- `dflash_mlx/prefix_cache.py`
+
+Core API:
+
+```python
+class PrefixCache:
+    def fetch(self, tokens: list[int], config: PrefixCacheConfig) -> PrefixHit | None:
+        ...
+
+    def store(self, tokens: list[int], state: PromptPrefillState, metadata: dict) -> bool:
+        ...
+
+    def prune(self) -> None:
+        ...
+
+    def stats(self) -> dict:
+        ...
+```
+
+`PrefixHit` should include:
+
+- matched token count
+- remaining tokens
+- cloned/trimmed `PromptPrefillState`
+- source: exact, shorter, longer-trimmed, stable, global, mid-prefill
+
+### Implementation Steps
+
+- [ ] Extract current global prefix logic into a dedicated module.
+- [ ] Keep current behavior behind compatibility wrapper.
+- [ ] Add exact/shorter/longer prefix matching.
+- [ ] Add stable token keying by token tuple/block hash, not only payload-level
+  JSON/stable message interpretation.
+- [ ] Track memory by MLX array shape/dtype metadata, not expensive `.nbytes`
+  when it forces evaluation.
+- [ ] Add byte-limit eviction with LRU order.
+- [ ] Add pinning for system/tool stable prefix.
+- [ ] Add tests for:
+  - exact hit
+  - shorter prefix hit
+  - longer prefix trim hit
+  - eviction
+  - memory stats
+  - mutation isolation after fetch
+
+### Acceptance Criteria
+
+- [ ] Cache fetch never returns a mutable object that corrupts stored state.
+- [ ] Cached prefix can be reused across multiple requests.
+- [ ] Byte limits are respected.
+- [ ] Longer cached entry can be trimmed to shorter prompt when safe.
+- [ ] Cache stats are visible in `/health` and `/metrics`.
+
+## Priority 5: Paged Cache / Block-Aware Cache
+
+### Problem
+
+Plain prefix state snapshots duplicate KV tensors across similar prompts.
+Paged/block cache can share blocks between requests and reduce memory.
+
+Rapid-style paged cache uses:
+
+- fixed token blocks, often 64 tokens
+- chain hash per block
+- ref counts
+- copy-on-write
+- LRU/LFU eviction
+- pinning for important prefixes
+- block table per request
+
+### Why This Is Not Priority 1
+
+Paged cache is more invasive than continuous batching and chunked prefill. It is
+best added after prefix cache semantics and metrics are solid.
+
+### Target Design
+
+Add a block-aware backend behind the prefix cache API.
+
+New config:
+
+- `--prefix-cache-backend=snapshot|paged`
+- `--paged-cache-block-size=64`
+- `--max-cache-blocks`
+
+### Implementation Steps
+
+- [ ] Define block metadata.
+  - block ID
+  - token count
+  - ref count
+  - block hash
+  - pinned flag
+  - last access
+  - cache data slices
+
+- [ ] Define block table per request.
+- [ ] Implement chain hashing.
+- [ ] Implement shared prefix lookup.
+- [ ] Implement COW when a request appends to shared prefix.
+- [ ] Implement cache reconstruction for MLX KV cache objects.
+- [ ] Add memory pressure eviction.
+- [ ] Add pin/unpin for stable system/tools prefix.
+
+### Risks
+
+- Reconstructing cache objects may break for non-standard cache layers.
+- GDN/DeltaNet/ArraysCache layers may need separate snapshot handling.
+- TurboQuant cache layers need custom accounting/reconstruction.
+- Debugging cache corruption is hard.
+
+### Acceptance Criteria
+
+- [ ] Same output as snapshot cache for deterministic prompts.
+- [ ] Memory usage drops on repeated shared-prefix requests.
+- [ ] Ref counts reach zero after request cleanup.
+- [ ] Pinned blocks are not evicted.
+- [ ] No stale blocks reused after model/config change.
+
+## Priority 6: Generic KV Cache Quantization
+
+### Problem
+
+This repo has TurboQuant support, but not generic KV cache quantization for
+stored prefix cache entries.
+
+Rapid-MLX supports:
+
+- TurboQuant V-cache compression.
+- Generic KV cache quantization for prefix cache memory reduction.
+
+Generic quantization is useful when:
+
+- cache memory is the bottleneck
+- many prompt prefixes are worth retaining
+- TurboQuant is not compatible with a cache layer
+
+### Target Design
+
+Add optional quantization for stored prefix cache entries.
+
+New config:
+
+- `--kv-cache-quantization`
+- `--kv-cache-quantization-bits`
+- `--kv-cache-quantization-group-size`
+- `--kv-cache-min-quantize-tokens`
+
+### Implementation Steps
+
+- [ ] Investigate MLX/MLX-LM cache quantization APIs available in current
+  dependency versions.
+- [ ] Implement cache-entry quantize/dequantize wrappers.
+- [ ] Apply only to stored prefix entries, not active generation cache at first.
+- [ ] Skip short prefixes by default.
+- [ ] Track memory saved.
+- [ ] Add quality/perf benchmark.
+
+### Risks
+
+- Dequantization overhead can hurt TTFT.
+- Quantization can degrade logits if too aggressive.
+- Not all cache layer types can be quantized safely.
+
+### Acceptance Criteria
+
+- [ ] Prefix cache memory drops for long prompts.
+- [ ] Cached TTFT remains better than cold TTFT.
+- [ ] Deterministic output remains stable enough for coding/tool prompts.
+- [ ] Feature can be disabled fully.
+
+## Priority 7: Tool Logits Bias and Tool Recovery
+
+### Problem
+
+Agent workflows lose time when a local model emits malformed tool calls. Even if
+raw decode tokens/sec is high, retries and parser failures make wall-clock task
+time worse.
+
+Rapid-MLX treats tool reliability as a speed feature:
+
+- Bias logits toward structured tool-call tokens.
+- Recover malformed text tool calls into structured `tool_calls`.
+- Support many parser formats.
+
+### Local State
+
+This repo has substantial API/tool compatibility code in
+`scripts/local_api_server.py`, including Anthropic/OpenAI normalization and tool
+block/event handling. But there is no clear Rapid-style tool logits processor in
+the local generation loop.
+
+### Target Design
+
+Add optional tool-mode logits processor.
+
+New config:
+
+- `--enable-tool-logits-bias`
+- `LOCAL_DFLASH_ENABLE_TOOL_LOGITS_BIAS`
+- optional strength:
+  - `--tool-logits-bias-strength`
+
+### Implementation Steps
+
+- [ ] Define token sequences for likely tool-call syntax for Qwen chat template.
+- [ ] Add logits processor hook to `stream_generate(...)`.
+- [ ] Bias only when tools are present and tool choice permits tool call.
+- [ ] Avoid bias during normal prose response.
+- [ ] Add recovery pass for malformed tool-call-like text.
+- [ ] Emit metrics:
+  - tool bias active
+  - tool recovery attempted
+  - tool recovery success/failure
+  - malformed tool output count
+
+### Risks
+
+- Over-bias can force tool calls when model should answer text.
+- Tokenization differs by model/template.
+- Bad recovery can invent tool calls.
+
+### Acceptance Criteria
+
+- [ ] Tool-call pass rate improves on local harness.
+- [ ] No regression for `tool_choice=none`.
+- [ ] Invalid JSON tool arguments decrease.
+- [ ] Recovery never runs silently; metrics/logs expose it.
+
+## Priority 8: GDN/DeltaNet Snapshot Maturity
+
+### Current Local State
+
+Local repo already has GDN state capture/rollback helpers in `dflash/model_mlx.py`.
+
+The remaining gap is likely not existence; it is integration maturity:
+
+- cache keying
+- snapshot timing
+- memory accounting
+- compatibility with chunked prefill
+- compatibility with batching
+- rollback correctness after speculative accept/reject
+
+### Implementation Steps
+
+- [ ] Add tests for GDN state clone/rollback under repeated prefix reuse.
+- [ ] Add tests for GDN state with chunked prefill.
+- [ ] Add tests for GDN state under abort/disconnect.
+- [ ] Add metrics:
+  - GDN snapshots created
+  - GDN snapshot bytes
+  - GDN rollback count
+  - GDN restore latency
+
+### Acceptance Criteria
+
+- [ ] Same deterministic output with and without prefix reuse.
+- [ ] No state leakage across requests.
+- [ ] Rollback after rejected speculative proposal is correct.
+
+## Priority 9: MTP Investigation
+
+### Problem
+
+Rapid-MLX has optional MTP support if a model exposes a multi-token prediction
+head. This repo uses DFlash draft model and DDTree instead.
+
+MTP may or may not matter for Qwen3.6-35B-A3B in this repo. Treat it as an
+investigation, not an immediate implementation.
+
+### Tasks
+
+- [ ] Check whether target model exposes MTP head in MLX object.
+- [ ] If present, benchmark MTP vs DFlash vs DDTree.
+- [ ] If absent, document as not applicable.
+- [ ] Do not mix MTP with DFlash until standalone behavior is measured.
+
+### Acceptance Criteria
+
+- [ ] Clear decision: implement, defer, or not applicable.
+
+## Priority 10: Cloud Routing
+
+### Problem
+
+Rapid-MLX can route large-context requests to a cloud model when local prefill
+would be slow.
+
+This repo appears intentionally focused on local serving. Cloud routing may be a
+non-goal.
+
+### Decision Needed
+
+- [ ] Decide if cloud routing belongs in this fork.
+- [ ] If yes, design explicit opt-in only.
+- [ ] Never silently route local/private prompts to cloud.
+
+### Acceptance Criteria If Implemented
+
+- [ ] Disabled by default.
+- [ ] Requires explicit model/provider config.
+- [ ] Logs routing decision.
+- [ ] Exposes routed token counts.
+- [ ] Redacts nothing silently; user owns privacy decision.
+
+## Benchmark Plan
+
+Benchmarks must compare current serial path against each new feature.
+
+### Required Metrics
+
+- Cold TTFT.
+- Cached TTFT.
+- Prompt tokens/sec.
+- Decode tokens/sec.
+- Aggregate tokens/sec under concurrency.
+- p50/p95 TTFT.
+- p50/p95 total latency.
+- Peak MLX active memory.
+- Prefix cache hit rate.
+- Prefix tokens saved.
+- Prefix cache bytes.
+- Mid-prefill snapshots saved.
+- Speculative acceptance ratio.
+- Generated tokens.
+- Tool-call success rate.
+- Invalid tool-call rate.
+- Abort cleanup success.
+
+### Scenarios
+
+1. Single short prompt.
+   - 256 prompt tokens.
+   - 128 output tokens.
+
+2. Single long prompt.
+   - 16k+ prompt tokens.
+   - 128 output tokens.
+
+3. Multi-turn stable prefix.
+   - Same system/tools/context.
+   - Different final user message.
+   - Measures prefix reuse.
+
+4. Concurrent short prompts.
+   - 2, 4, 8 concurrent requests.
+   - Measures batching throughput.
+
+5. Concurrent mixed workload.
+   - One long prefill.
+   - Several active short decodes.
+   - Measures chunked prefill fairness.
+
+6. Interrupted long prefill.
+   - Abort after partial prefill.
+   - Repeat with same prefix.
+   - Measures mid-prefill cache.
+
+7. Tool-call harness.
+   - Multiple tool schemas.
+   - Multi-turn tool loop.
+   - Measures tool bias/recovery impact.
+
+### Suggested Output Table
+
+| Engine | Cache | Chunked Prefill | Concurrency | TTFT p50 | TTFT p95 | Decode tok/s | Aggregate tok/s | Peak GB | Tool pass % |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| serial | current | no | 1 | | | | | | |
+| serial | memory-aware | yes | 1 | | | | | | |
+| batched | memory-aware | yes | 2 | | | | | | |
+| batched | memory-aware | yes | 4 | | | | | | |
+| batched | paged | yes | 4 | | | | | | |
+
+## Implementation Order
+
+### Phase 0: Baseline
+
+- [ ] Add or update benchmark script.
+- [ ] Capture current serial numbers.
+- [ ] Save baseline JSON reports.
+- [ ] Add `/health` cache/scheduler fields needed for comparison.
+
+### Phase 1: Engine Interface
+
+- [ ] Introduce `SerialEngine` wrapper around current generation.
+- [ ] Route existing server through engine abstraction.
+- [ ] Confirm no behavior change.
+
+### Phase 2: Batched Target Decode Prototype
+
+- [ ] Add `BatchedEngine`.
+- [ ] Use BatchGenerator for target-only decode.
+- [ ] Support non-stream and stream.
+- [ ] Gate behind env/CLI.
+- [ ] Benchmark concurrency.
+
+### Phase 3: Chunked Prefill
+
+- [ ] Add prefill step size config.
+- [ ] Implement chunk loop.
+- [ ] Add heartbeat/abort checks.
+- [ ] Validate logits/output parity.
+
+### Phase 4: Mid-Prefill Snapshots
+
+- [ ] Add save interval config.
+- [ ] Save safe prefix snapshots.
+- [ ] Reuse on repeated prefix.
+- [ ] Add memory accounting and pruning.
+
+### Phase 5: Prefix Cache Module
+
+- [ ] Extract cache from server.
+- [ ] Add exact/shorter/longer matching.
+- [ ] Add memory-aware eviction.
+- [ ] Add tests.
+
+### Phase 6: Paged Cache
+
+- [ ] Add block cache backend.
+- [ ] Add COW/refcount.
+- [ ] Add reconstruction.
+- [ ] Benchmark memory savings.
+
+### Phase 7: Agent Reliability Speedups
+
+- [ ] Add tool logits bias.
+- [ ] Add tool recovery metrics.
+- [ ] Run tool-call harness.
+
+## Non-Goals For Now
+
+- Replacing DFlash/DDTree immediately.
+- Batching DDTree before target-only batching works.
+- Enabling cloud routing by default.
+- Supporting every Rapid-MLX model/vision/audio feature.
+- Rewriting all server compatibility code during performance work.
+
+## Open Questions
+
+- Can `mlx_lm.generate.BatchGenerator` integrate with DFlash draft verification,
+  or should batched mode be target-only first?
+- Does Qwen3.6-35B-A3B expose any MTP head in the loaded MLX model?
+- Which cache layer types appear in the target model under TurboQuant enabled vs
+  disabled?
+- Which prompt boundary is safest for Codex/OpenCode tool-heavy prompts?
+- What cache snapshot size is acceptable on the target Mac memory profile?
+- Does generic KV quantization improve wall-clock TTFT after dequant overhead?
+- Should global prefix cache persist only in memory or optionally on disk?
+
+## Definition of Done
+
+This TODO is complete only when:
+
+- Batched engine exists behind a feature flag.
+- Benchmarks show improved aggregate throughput under concurrent requests.
+- Long prefill no longer starves active decode in batched mode.
+- Prefix cache hits are measurable, bounded by memory limits, and mutation-safe.
+- Tool-call reliability is measured before and after logits bias/recovery.
+- Existing serial DFlash/DDTree behavior remains available as fallback.

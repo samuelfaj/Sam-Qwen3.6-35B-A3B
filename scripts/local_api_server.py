@@ -144,6 +144,7 @@ STREAM_QUEUE_MAX_CHUNKS = _env_positive_int("LOCAL_DFLASH_STREAM_QUEUE_MAX_CHUNK
 STREAM_QUEUE_PUT_TIMEOUT_SECONDS = _env_positive_float("LOCAL_DFLASH_STREAM_QUEUE_PUT_TIMEOUT_SECONDS", 0.5)
 RESPONSE_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSE_HISTORY_LIMIT", 8)
 REQUEST_METRICS_HISTORY_LIMIT = _env_non_negative_int("LOCAL_DFLASH_REQUEST_METRICS_HISTORY_LIMIT", 50)
+REQUEST_MESSAGE_PREVIEW_CHARS = _env_positive_int("LOCAL_DFLASH_MESSAGE_PREVIEW_CHARS", 240)
 PREFIX_CACHE_STATE_LIMIT = _env_non_negative_int("LOCAL_DFLASH_PREFIX_CACHE_STATE_LIMIT", 1)
 PREFIX_CACHE_STATE_BYTE_LIMIT = _env_non_negative_int(
     "LOCAL_DFLASH_PREFIX_CACHE_STATE_BYTE_LIMIT",
@@ -154,13 +155,6 @@ MIN_TOOL_RESPONSE_MAX_TOKENS = _env_positive_int("LOCAL_DFLASH_MIN_TOOL_RESPONSE
 MAX_TOOL_TURN_TOKENS = _env_positive_int("LOCAL_DFLASH_MAX_TOOL_TURN_TOKENS", 4096)
 RESPONSES_ACTION_FOLLOWUP_LIMIT = _env_non_negative_int("LOCAL_DFLASH_RESPONSES_ACTION_FOLLOWUP_LIMIT", 15)
 ALLOW_APPLY_PATCH_TOOL = _env_bool("LOCAL_DFLASH_ALLOW_APPLY_PATCH_TOOL", False)
-PROTOCOL_TOOL_RETRY_PROMPT = (
-    "[System protocol retry: the previous assistant turn was discarded because "
-    "it did not contain a valid tool call. This retry accepts only one valid "
-    "tool call. Do not continue, summarize, refer to discarded text, plan in "
-    "prose, output markdown code blocks, or return a final answer on this retry. "
-    "Output exactly one valid tool call now using the declared format.]"
-)
 TOOL_CALLING_RULES_TEMPLATE = """Tool-calling rules (strict):
 - Function calls MUST use the Qwen XML format exactly:
   <tool_call><function=tool_name><parameter=param_name>value</parameter></function></tool_call>
@@ -740,6 +734,54 @@ def _strip_reasoning_blocks(text: str) -> tuple[str, str]:
     return "\n\n".join(reasoning_parts), _clean_output_text(visible)
 
 
+def _compact_preview(text: Any, limit: int = REQUEST_MESSAGE_PREVIEW_CHARS) -> str:
+    normalized = " ".join(_coerce_text(text).split())
+    if len(normalized) <= limit:
+        return normalized
+    if limit <= 3:
+        return normalized[:limit]
+    return normalized[: limit - 3] + "..."
+
+
+def _model_message_preview_fields(text: Any) -> dict[str, Any]:
+    raw_text = _clean_output_text(_coerce_text(text))
+    reasoning_text, visible_text = _strip_reasoning_blocks(raw_text)
+    preview_source = "visible"
+    preview_text = visible_text
+    if not preview_text and reasoning_text:
+        preview_source = "reasoning"
+        preview_text = reasoning_text
+    elif not preview_text:
+        preview_source = "raw"
+        preview_text = raw_text
+
+    fields: dict[str, Any] = {
+        "message_preview": _compact_preview(preview_text),
+        "message_preview_source": preview_source,
+        "message_chars": len(raw_text),
+    }
+    if reasoning_text:
+        fields["reasoning_preview"] = _compact_preview(reasoning_text)
+    return fields
+
+
+def _last_input_preview(messages: list[dict[str, Any]] | None) -> str:
+    for message in reversed(messages or []):
+        if isinstance(message, BaseModel):
+            message = message.model_dump(mode="json")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if content is None:
+            content = message.get("input")
+        text = _extract_text_from_content(content)
+        if not text:
+            continue
+        role = _coerce_text(message.get("role") or message.get("type") or "message")
+        return _compact_preview(f"{role}: {text}")
+    return ""
+
+
 def _make_function_call_item(
     name: str,
     arguments: Any,
@@ -1196,79 +1238,6 @@ def _tool_call_signature(name: Any, arguments: Any) -> tuple[str, str]:
         for command_key in ("cmd", "script", "shell_command", "bash_command"):
             normalized_arguments.pop(command_key, None)
     return (name_text, _canonical_tool_arguments(normalized_arguments))
-
-
-def _protocol_error_tool_call_text(
-    tools: list[dict[str, Any]] | None,
-    reason: str,
-) -> str:
-    tool_names = list(_available_tool_names(tools))
-    tool_name = next((name for name in tool_names if name in SHELL_TOOL_NAMES), None)
-    if tool_name is None:
-        tool_name = tool_names[0] if tool_names else "shell_command"
-    if tool_name in SHELL_TOOL_NAMES:
-        arguments: dict[str, Any] = {
-            "command": (
-                "printf '%s\\n' "
-                + json.dumps(f"LOCAL_DFLASH_PROTOCOL_ERROR: {reason}")
-                + " >&2; exit 2"
-            ),
-            "workdir": os.getcwd(),
-            "timeout_ms": 10000,
-        }
-    else:
-        arguments = {"input": f"LOCAL_DFLASH_PROTOCOL_ERROR: {reason}"}
-    payload = {"name": tool_name, "arguments": arguments}
-    return "<tool_call>" + json.dumps(payload, ensure_ascii=False) + "</tool_call>"
-
-
-def _protocol_error_tool_call_result(
-    tools: list[dict[str, Any]] | None,
-    reason: str,
-) -> dict[str, Any]:
-    return {
-        "text": _protocol_error_tool_call_text(tools, reason),
-        "finish_reason": "stop",
-        "prompt_tokens": 0,
-        "prefill_seconds": 0.0,
-        "prompt_tps": 0.0,
-        "reused_prefix_tokens": 0,
-        "decode_seconds": 0.0,
-        "generation_tps": 0.0,
-        "generated_tokens": 0,
-        "speculative_steps": 0,
-        "proposed_tokens": 0,
-        "accepted_tokens": 0,
-        "avg_acceptance_length": 0.0,
-        "avg_acceptance_ratio": 0.0,
-        "acceptance_lengths": [],
-        "acceptance_ratios": [],
-        "block_size_history": [],
-        "adaptive_block_size": False,
-        "prefix_cache_source": "none",
-        "peak_memory_gb": 0.0,
-        "elapsed": 0.0,
-        "prompt_cache_state": None,
-        "engine": "protocol",
-        "protocol_timeout_tool_call": 1,
-    }
-
-
-def _should_protocol_retry_without_tool(
-    result: dict[str, Any],
-    output_items: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-) -> bool:
-    if not tools or _has_tool_call_item(output_items):
-        return False
-    raw_text = _coerce_text(result.get("text", ""))
-    visible_text = _output_text_from_items(output_items).strip()
-    finish_reason = _coerce_text(result.get("finish_reason")).strip().lower()
-    if not visible_text:
-        return True
-    if _has_unterminated_tool_call_markup(raw_text):
-        return True
-    return finish_reason in {"length", "max_tokens", "max_output_tokens"}
 
 
 def _tool_iteration_max_tokens(remaining_max_tokens: int, tools: list[dict[str, Any]] | None) -> int:
@@ -2500,6 +2469,7 @@ class LocalModelServer:
         self._response_order: deque[str] = deque()
         self._request_metrics_order: deque[dict[str, Any]] = deque(maxlen=max(1, REQUEST_METRICS_HISTORY_LIMIT))
         self._last_request_metrics: dict[str, Any] | None = None
+        self._active_request_state: dict[str, Any] | None = None
         self._prefix_state_order: deque[str] = deque()
         self.response_history_limit = RESPONSE_HISTORY_LIMIT
         self.prefix_cache_state_limit = PREFIX_CACHE_STATE_LIMIT
@@ -2547,6 +2517,55 @@ class LocalModelServer:
                 self._active_generation_ticket = None
             self._generation_turn.notify_all()
 
+    def _begin_active_request(
+        self,
+        *,
+        surface: str,
+        messages: list[dict[str, Any]],
+        requested_max_tokens: int,
+    ) -> None:
+        now = time.time()
+        state = {
+            "surface": surface,
+            "phase": "starting",
+            "started_at": now,
+            "updated_at": now,
+            "requested_max_tokens": int(requested_max_tokens or 0),
+            "generated_tokens": 0,
+            "input_preview": _last_input_preview(messages),
+            "message_preview": "",
+            "message_preview_source": "none",
+            "message_chars": 0,
+        }
+        with self._lock:
+            self._active_request_state = state
+
+    def _update_active_request(self, **updates: Any) -> None:
+        with self._lock:
+            state = dict(self._active_request_state or {})
+            if not state:
+                state["started_at"] = time.time()
+            state.update(updates)
+            state["updated_at"] = time.time()
+            self._active_request_state = state
+
+    def _update_active_request_text(
+        self,
+        text: Any,
+        *,
+        generated_tokens: int | None = None,
+        phase: str = "generating",
+    ) -> None:
+        updates = _model_message_preview_fields(text)
+        updates["phase"] = phase
+        if generated_tokens is not None:
+            updates["generated_tokens"] = int(generated_tokens or 0)
+        self._update_active_request(**updates)
+
+    def _clear_active_request(self) -> None:
+        with self._lock:
+            self._active_request_state = None
+
     def _record_generation_metrics(self, result: dict[str, Any], *, surface: str) -> None:
         metrics = {
             "surface": surface,
@@ -2581,6 +2600,7 @@ class LocalModelServer:
             "protocol_malformed_tool_retries": int(result.get("protocol_malformed_tool_retries", 0) or 0),
             "protocol_final_with_tools": int(result.get("protocol_final_with_tools", 0) or 0),
         }
+        metrics.update(_model_message_preview_fields(result.get("text", "")))
         if "tool_call_parse_format" in result:
             metrics["tool_call_parse_format"] = str(result.get("tool_call_parse_format") or "none")
         phase_timings = result.get("ddtree_phase_timings_us") or {}
@@ -3210,6 +3230,12 @@ class LocalModelServer:
         last_error: Exception | None = None
         for engine_name, target_turboquant_bits in attempts:
             try:
+                self._update_active_request(
+                    phase=engine_name,
+                    prompt_tokens=prompt_tokens,
+                    requested_max_tokens=max_tokens,
+                    prefix_cache_source=prefix_cache_source,
+                )
                 result = generate_ddtree(
                     target_model=self._model,
                     draft_model=self._draft,
@@ -3237,6 +3263,11 @@ class LocalModelServer:
                         "prompt_cache_state": result.get("prompt_cache_state") if capture_prefill_state else None,
                         "elapsed": time.time() - started,
                     }
+                )
+                self._update_active_request_text(
+                    result.get("text", ""),
+                    generated_tokens=int(result.get("generated_tokens", 0) or 0),
+                    phase="complete",
                 )
                 if stable_prefix_tokens and result.get("prompt_cache_state") is not None:
                     self._remember_global_prefix_state_locked(
@@ -3342,6 +3373,12 @@ class LocalModelServer:
         text_parts: list[str] = []
         final = None
         started = time.time()
+        self._update_active_request(
+            phase="prefill",
+            prompt_tokens=prompt_tokens,
+            requested_max_tokens=max_tokens,
+            prefix_cache_source=prefix_cache_source,
+        )
         for chunk in stream_generate(
             self._model,
             self._draft,
@@ -3366,6 +3403,10 @@ class LocalModelServer:
         ):
             if chunk.text:
                 text_parts.append(chunk.text)
+                self._update_active_request_text(
+                    "".join(text_parts),
+                    generated_tokens=int(chunk.generation_tokens or 0),
+                )
             final = chunk
         if final is None:
             raise RuntimeError("Model returned no output")
@@ -3405,6 +3446,11 @@ class LocalModelServer:
             "prompt_cache_state": final.prefill_state if capture_prefill_state else None,
             "engine": "dflash",
         }
+        self._update_active_request_text(
+            result["text"],
+            generated_tokens=int(result.get("generated_tokens", 0) or 0),
+            phase="complete",
+        )
         return text_parts, result
 
     def _stream_generate_locked(
@@ -3457,6 +3503,12 @@ class LocalModelServer:
             previous_response_id,
             stable_prefix_key,
         )
+        self._update_active_request(
+            phase="prefill",
+            prompt_tokens=prompt_tokens,
+            requested_max_tokens=max_tokens,
+            prefix_cache_source=prefix_cache_source,
+        )
         iterator = stream_generate(
             self._model,
             self._draft,
@@ -3502,6 +3554,11 @@ class LocalModelServer:
         protocol_malformed_tool_retries = 0
         try:
             generation_ticket = self._acquire_generation_turn()
+            self._begin_active_request(
+                surface="stream",
+                messages=messages,
+                requested_max_tokens=requested_max_tokens,
+            )
             current_messages = list(messages)
             remaining_max_tokens = requested_max_tokens
             for _ in range(RESPONSES_ACTION_FOLLOWUP_LIMIT + 1):
@@ -3526,6 +3583,10 @@ class LocalModelServer:
                     for chunk in iterator:
                         if chunk.text:
                             iteration_parts.append(chunk.text)
+                            self._update_active_request_text(
+                                "".join([*text_parts, *iteration_parts]),
+                                generated_tokens=total_generated_tokens + int(chunk.generation_tokens or 0),
+                            )
                         final = chunk
 
                 if final is None:
@@ -3584,25 +3645,29 @@ class LocalModelServer:
                 if remaining_max_tokens <= 0:
                     text_parts.extend(iteration_parts)
                     result["text"] = "".join(text_parts)
+                    self._update_active_request_text(
+                        result["text"],
+                        generated_tokens=total_generated_tokens,
+                        phase="complete",
+                    )
                     break
                 visible_text, tool_calls = _parse_tool_calls(iteration_text)
                 if tool_calls:
                     text_parts.extend(iteration_parts)
                     result["text"] = "".join(text_parts)
+                    self._update_active_request_text(
+                        result["text"],
+                        generated_tokens=total_generated_tokens,
+                        phase="complete",
+                    )
                     break
-                output_items = _build_output_items(iteration_text)
-                output_items = _convert_items_for_custom_tools(output_items, tools)
-                if _should_protocol_retry_without_tool(result, output_items, tools):
-                    protocol_no_tool_retries += 1
-                    if _has_unterminated_tool_call_markup(iteration_text):
-                        protocol_malformed_tool_retries += 1
-                    current_messages = [
-                        *current_messages,
-                        {"role": "user", "content": PROTOCOL_TOOL_RETRY_PROMPT},
-                    ]
-                    continue
                 text_parts.extend(iteration_parts)
                 result["text"] = "".join(text_parts)
+                self._update_active_request_text(
+                    result["text"],
+                    generated_tokens=total_generated_tokens,
+                    phase="complete",
+                )
                 break
 
             if result is None:
@@ -3625,6 +3690,7 @@ class LocalModelServer:
             try:
                 self.finish_request(keep_alive_override)
             finally:
+                self._clear_active_request()
                 self._release_generation_turn(generation_ticket)
             _queue_put(queue, ("done", None), stop_event)
 
@@ -3643,6 +3709,11 @@ class LocalModelServer:
         sampling = _coerce_sampling_arg(sampling, temperature)
         generation_ticket = self._acquire_generation_turn()
         try:
+            self._begin_active_request(
+                surface="generate",
+                messages=messages,
+                requested_max_tokens=max_tokens,
+            )
             current_messages = list(messages)
             remaining_max_tokens = max_tokens
             result: dict[str, Any] | None = None
@@ -3667,14 +3738,6 @@ class LocalModelServer:
                     visible_text, tool_calls = _parse_tool_calls(_coerce_text(result.get("text", "")))
                     if tool_calls:
                         break
-                    output_items = _build_output_items(_coerce_text(result.get("text", "")))
-                    output_items = _convert_items_for_custom_tools(output_items, tools)
-                    if _should_protocol_retry_without_tool(result, output_items, tools):
-                        current_messages = [
-                            *current_messages,
-                            {"role": "user", "content": PROTOCOL_TOOL_RETRY_PROMPT},
-                        ]
-                        continue
                     break
             if result is None:
                 raise RuntimeError("Model returned no output")
@@ -3684,6 +3747,7 @@ class LocalModelServer:
             try:
                 self.finish_request(keep_alive_override)
             finally:
+                self._clear_active_request()
                 self._release_generation_turn(generation_ticket)
 
     def _generate_response_locked(
@@ -3745,21 +3809,6 @@ class LocalModelServer:
             if remaining_max_tokens <= 0:
                 return finalize(result, output_items)
 
-            assistant_text = _output_text_from_items(output_items).strip()
-            if _should_protocol_retry_without_tool(result, output_items, tools):
-                protocol_no_tool_retries += 1
-                if _has_unterminated_tool_call_markup(result["text"]):
-                    protocol_malformed_tool_retries += 1
-                current_messages = [
-                    *current_messages,
-                    {
-                        "role": "user",
-                        "content": PROTOCOL_TOOL_RETRY_PROMPT,
-                    },
-                ]
-                current_previous_response_id = None
-                continue
-
             return finalize(result, output_items)
 
         return finalize(result, output_items)
@@ -3809,6 +3858,11 @@ class LocalModelServer:
         sampling = _coerce_sampling_arg(sampling, temperature)
         generation_ticket = self._acquire_generation_turn()
         try:
+            self._begin_active_request(
+                surface="responses",
+                messages=messages,
+                requested_max_tokens=max_tokens,
+            )
             with self._lock:
                 result, output_items = self._generate_response_locked(
                     messages,
@@ -3825,6 +3879,7 @@ class LocalModelServer:
             try:
                 self.finish_request(keep_alive_override)
             finally:
+                self._clear_active_request()
                 self._release_generation_turn(generation_ticket)
 
     def stream_chat_completions(
@@ -4152,22 +4207,6 @@ class LocalModelServer:
             except Empty:
                 if _stream_result_timed_out(stream_started):
                     stop_event.set()
-                    if tools:
-                        result = _protocol_error_tool_call_result(
-                            tools,
-                            "model generation timed out before producing a protocol result; continue with a different tool call",
-                        )
-                        output_items = _build_output_items(result["text"])
-                        output_items = _convert_items_for_custom_tools(output_items, tools)
-                        _annotate_agentic_metrics(
-                            result,
-                            tools=tools,
-                            protocol_no_tool_retries=0,
-                            protocol_malformed_tool_retries=0,
-                        )
-                        self._record_generation_metrics(result, surface="responses_stream_timeout")
-                        done = True
-                        continue
                     err_message = _stream_result_timeout_message()
                     err_code = "generation_timeout"
                     yield _json_line(
@@ -4878,6 +4917,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, Any]:
         last_request_metrics = dict(server._last_request_metrics or {})
+        active_request = dict(server._active_request_state or {})
         return {
             "status": "ok",
             "profile": os.environ.get("LOCAL_DFLASH_PROFILE", "custom"),
@@ -4910,6 +4950,7 @@ def create_app(server: LocalModelServer) -> FastAPI:
             "response_history_entries": len(server._response_order),
             "active_generation_requests": 1 if server._active_generation_ticket is not None else 0,
             "queued_generation_requests": len(server._queued_generation_tickets),
+            "active_request": active_request,
             "prefix_cache_state_limit": server.prefix_cache_state_limit,
             "prefix_cache_state_byte_limit": server.prefix_cache_state_byte_limit,
             "prefix_cache_entries": len(server._prefix_state_order),
@@ -4943,9 +4984,14 @@ def create_app(server: LocalModelServer) -> FastAPI:
         """Time-series-friendly gauges for a watchdog / observability scraper.
         All values are numeric; no strings in values.
         """
+        now = time.time()
+        active_request = server._active_request_state or {}
+        active_started_at = float(active_request.get("started_at") or 0.0)
+        active_updated_at = float(active_request.get("updated_at") or 0.0)
         active_pid_age = 0.0
-        if server._active_generation_ticket is not None and server._last_used_at:
-            active_pid_age = max(0.0, time.time() - float(server._last_used_at))
+        if server._active_generation_ticket is not None and active_started_at:
+            active_pid_age = max(0.0, now - active_started_at)
+        active_stale_age = max(0.0, now - active_updated_at) if active_updated_at else 0.0
         cache_memory = 0.0
         try:
             cache_memory = float(mx.get_cache_memory())
@@ -4962,11 +5008,13 @@ def create_app(server: LocalModelServer) -> FastAPI:
         except Exception:
             pass
         return {
-            "dflash_uptime_seconds": time.time() - _server_started_at,
+            "dflash_uptime_seconds": now - _server_started_at,
             "dflash_model_loaded": 1 if server._model is not None else 0,
             "dflash_active_generation_requests": 1 if server._active_generation_ticket is not None else 0,
             "dflash_queued_generation_requests": len(server._queued_generation_tickets),
             "dflash_active_ticket_age_seconds": active_pid_age,
+            "dflash_active_request_age_seconds": active_pid_age,
+            "dflash_active_request_stale_seconds": active_stale_age,
             "dflash_response_history_entries": len(server._response_order),
             "dflash_prefix_cache_entries": len(server._prefix_state_order),
             "dflash_response_prefix_cache_bytes": server._response_prefix_cache_bytes,
@@ -5012,7 +5060,11 @@ def create_app(server: LocalModelServer) -> FastAPI:
     def request_metrics(limit: int = 20) -> dict[str, Any]:
         bounded_limit = max(1, min(int(limit), max(1, REQUEST_METRICS_HISTORY_LIMIT)))
         entries = list(server._request_metrics_order)[-bounded_limit:]
-        return {"count": len(entries), "entries": entries}
+        return {
+            "count": len(entries),
+            "entries": entries,
+            "active": dict(server._active_request_state or {}),
+        }
 
     @app.get("/runs")
     def runs(dir: str = "") -> dict[str, Any]:
