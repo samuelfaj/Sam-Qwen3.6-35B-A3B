@@ -857,6 +857,32 @@ class LocalApiServerTests(unittest.TestCase):
         self.assertEqual(result["protocol_malformed_tool_retries"], 1)
         self.assertEqual(result["protocol_final_with_tools"], 0)
 
+    def test_request_metrics_persist_input_previews(self):
+        server = self._make_server()
+        server._begin_active_request(
+            surface="responses",
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Rewrite the landing page design from scratch."},
+                {"role": "tool", "content": "wrote src/App.css"},
+            ],
+            requested_max_tokens=123,
+        )
+        result = dict(FakeStreamingServer._result())
+
+        server._record_generation_metrics(result, surface="responses")
+
+        metrics = server._last_request_metrics
+        self.assertIsNotNone(metrics)
+        assert metrics is not None
+        self.assertEqual(metrics["input_preview"], "tool: wrote src/App.css")
+        self.assertEqual(
+            metrics["user_input_preview"],
+            "user: Rewrite the landing page design from scratch.",
+        )
+        self.assertEqual(metrics["input_message_count"], 3)
+        self.assertEqual(metrics["requested_max_tokens"], 123)
+
     def test_responses_tool_choice_required_is_added_to_system_message(self):
         req = SimpleNamespace(
             model="local-test-model",

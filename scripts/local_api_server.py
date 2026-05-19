@@ -765,11 +765,14 @@ def _model_message_preview_fields(text: Any) -> dict[str, Any]:
     return fields
 
 
-def _last_input_preview(messages: list[dict[str, Any]] | None) -> str:
+def _last_input_preview(messages: list[dict[str, Any]] | None, *, role_filter: str | None = None) -> str:
     for message in reversed(messages or []):
         if isinstance(message, BaseModel):
             message = message.model_dump(mode="json")
         if not isinstance(message, dict):
+            continue
+        role = _coerce_text(message.get("role") or message.get("type") or "message")
+        if role_filter is not None and role != role_filter:
             continue
         content = message.get("content")
         if content is None:
@@ -777,7 +780,6 @@ def _last_input_preview(messages: list[dict[str, Any]] | None) -> str:
         text = _extract_text_from_content(content)
         if not text:
             continue
-        role = _coerce_text(message.get("role") or message.get("type") or "message")
         return _compact_preview(f"{role}: {text}")
     return ""
 
@@ -2532,7 +2534,9 @@ class LocalModelServer:
             "updated_at": now,
             "requested_max_tokens": int(requested_max_tokens or 0),
             "generated_tokens": 0,
+            "input_message_count": len(messages or []),
             "input_preview": _last_input_preview(messages),
+            "user_input_preview": _last_input_preview(messages, role_filter="user"),
             "message_preview": "",
             "message_preview_source": "none",
             "message_chars": 0,
@@ -2567,6 +2571,8 @@ class LocalModelServer:
             self._active_request_state = None
 
     def _record_generation_metrics(self, result: dict[str, Any], *, surface: str) -> None:
+        with self._lock:
+            active_request = dict(self._active_request_state or {})
         metrics = {
             "surface": surface,
             "finished_at": time.time(),
@@ -2600,6 +2606,14 @@ class LocalModelServer:
             "protocol_malformed_tool_retries": int(result.get("protocol_malformed_tool_retries", 0) or 0),
             "protocol_final_with_tools": int(result.get("protocol_final_with_tools", 0) or 0),
         }
+        for key in (
+            "input_preview",
+            "user_input_preview",
+            "input_message_count",
+            "requested_max_tokens",
+        ):
+            if key in active_request:
+                metrics[key] = active_request[key]
         metrics.update(_model_message_preview_fields(result.get("text", "")))
         if "tool_call_parse_format" in result:
             metrics["tool_call_parse_format"] = str(result.get("tool_call_parse_format") or "none")

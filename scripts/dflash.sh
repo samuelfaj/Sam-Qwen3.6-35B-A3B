@@ -727,7 +727,7 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
     rows.append(line(width))
 
     rows.append(c("bold", "Recent requests"))
-    last_message_reserved_rows = 8 + (5 if errors else 0)
+    last_message_reserved_rows = 14 + (5 if errors else 0)
     recent_limit = max(1, min(8, height - len(rows) - last_message_reserved_rows - 1))
     recent_entries = entries[-recent_limit:]
     if not recent_entries:
@@ -754,52 +754,57 @@ def build_screen(health: dict, metrics: dict, requests: dict, errors: list[str])
             rows.append(clamp_text(row, width))
 
     rows.append(line(width))
-    rows.append(c("bold", "Last message"))
+    rows.append(c("bold", "Last messages"))
     active_request = dict((requests or {}).get("active") or health.get("active_request") or {})
-    last_message = last or (entries[-1] if entries else {})
     now_ts = time.time()
+    message_rows: list[str] = []
     if active_request:
         started_at = num(active_request.get("started_at", 0.0))
         updated_at = num(active_request.get("updated_at", 0.0))
         age = now_ts - started_at if started_at else 0.0
         stale = now_ts - updated_at if updated_at else 0.0
-        meta = (
-            f"  active {active_request.get('surface', 'n/a')} "
-            f"{active_request.get('phase', 'active')} "
-            f"age {fmt_seconds(age)} updated {fmt_seconds(stale)} ago "
-            f"tokens {integer(active_request.get('generated_tokens', 0))}"
-        )
-        rows.append(c("dim", clamp_text(meta, width)))
         message_preview = str(active_request.get("message_preview") or "")
-        reasoning_preview = str(active_request.get("reasoning_preview") or "")
         input_preview = str(active_request.get("input_preview") or "")
         source = str(active_request.get("message_preview_source") or "output")
         if message_preview:
-            rows.append(clamp_text(f"  {source}: {message_preview}", width))
+            text = f"{source}: {message_preview}"
         elif input_preview:
-            rows.append(c("dim", clamp_text(f"  input: {input_preview}", width)))
-            rows.append(c("dim", "  no model text yet"))
+            text = f"input: {input_preview}"
         else:
-            rows.append(c("dim", "  no model text yet"))
-        if reasoning_preview and reasoning_preview != message_preview:
-            rows.append(c("dim", clamp_text(f"  reasoning: {reasoning_preview}", width)))
-    elif last_message.get("message_preview"):
-        finished_at = num(last_message.get("finished_at", 0.0))
-        age = now_ts - finished_at if finished_at else 0.0
-        source = str(last_message.get("message_preview_source") or "output")
-        meta = (
-            f"  completed {last_message.get('surface', 'n/a')} "
-            f"{fmt_seconds(age)} ago "
-            f"tokens {integer(last_message.get('generated_tokens', 0))} "
-            f"finish {last_message.get('finish_reason', 'n/a')}"
+            text = "no model text yet"
+        message_rows.append(
+            "  * active "
+            f"{active_request.get('surface', 'n/a')} "
+            f"{active_request.get('phase', 'active')} "
+            f"age {fmt_seconds(age)} stale {fmt_seconds(stale)} "
+            f"{integer(active_request.get('generated_tokens', 0))} tok | {text}"
         )
-        rows.append(c("dim", clamp_text(meta, width)))
-        rows.append(clamp_text(f"  {source}: {last_message.get('message_preview')}", width))
-        reasoning_preview = str(last_message.get("reasoning_preview") or "")
-        if reasoning_preview and reasoning_preview != str(last_message.get("message_preview") or ""):
-            rows.append(c("dim", clamp_text(f"  reasoning: {reasoning_preview}", width)))
+
+    for item in reversed(entries):
+        if len(message_rows) >= 10:
+            break
+        message_preview = str(item.get("message_preview") or "")
+        reasoning_preview = str(item.get("reasoning_preview") or "")
+        if not message_preview and reasoning_preview:
+            message_preview = reasoning_preview
+        if not message_preview:
+            continue
+        finished_at = num(item.get("finished_at", 0.0))
+        age = now_ts - finished_at if finished_at else 0.0
+        source = str(item.get("message_preview_source") or "output")
+        message_rows.append(
+            "  - "
+            f"{item.get('surface', 'n/a')} "
+            f"{fmt_seconds(age)} ago "
+            f"{integer(item.get('generated_tokens', 0))} tok "
+            f"{item.get('finish_reason', 'n/a')} | {source}: {message_preview}"
+        )
+
+    if message_rows:
+        for row in message_rows:
+            rows.append(clamp_text(row, width))
     else:
-        rows.append(c("dim", "  no model message yet"))
+        rows.append(c("dim", "  no model messages yet"))
 
     if errors:
         rows.append(line(width))
